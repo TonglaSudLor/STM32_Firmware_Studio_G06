@@ -1,0 +1,8 @@
+../Core/Src/modbus_bridge.c:60:13:motor_at_target	16	static
+../Core/Src/modbus_bridge.c:92:13:PnP_StateMachine	16	static
+../Core/Src/modbus_bridge.c:179:13:ModbusBridge_HandleCommands	24	static
+../Core/Src/modbus_bridge.c:285:6:ModbusBridge_Init	8	static
+../Core/Src/modbus_bridge.c:302:6:ModbusBridge_Process	8	static
+../Core/Src/modbus_bridge.c:314:6:ModbusBridge_UpdateRegisters	16	static
+../Core/Src/modbus_bridge.c:362:6:ModbusBridge_RxCallback	16	static
+../Core/Src/modbus_bridge.c:379:6:ModbusBridge_TimerCallback	8	static
