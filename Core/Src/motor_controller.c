@@ -29,7 +29,18 @@ volatile Motor_AutotuneStatus_t autotune_status = STATUS_IDLE;
 volatile int tuning_progress = 0;
 volatile Motor_TuningParams_t tuning;
 volatile bool is_joystick_connected = false;
-volatile bool emergency_stop = true; 
+volatile bool emergency_stop = true;
+/* When false, the outer position PID is bypassed and the velocity PID is fed
+ * the S-curve velocity setpoint directly. Use this to tune the inner loop
+ * in isolation. Trajectory generator (and so v_ref / a_ref feedforward) still runs. */
+volatile bool position_loop_enabled = true;
+
+/* Velocity-loop sine-wave test generator. Used only when position_loop_enabled == false.
+ * target_rpm = sine_amp_rpm * sin(2*pi*sine_freq_hz * t). */
+volatile bool  sine_test_enabled = false;
+volatile float sine_amp_rpm      = 30.0f;
+volatile float sine_freq_hz      = 0.5f;
+static   uint32_t sine_start_tick = 0;
 volatile SafetyConfig_t safety_config = {
     .stall_prevent = true,
     .encoder_check = true,
@@ -439,7 +450,8 @@ void Motor_Init(void)
     tuning.pos_Kp = DEFAULT_POS_KP; 
     tuning.pos_Ki = DEFAULT_POS_KI; 
     tuning.pos_Kd = DEFAULT_POS_KD;
-    tuning.speed_Kf = DEFAULT_SPEED_KF; 
+    tuning.K_vff    = DEFAULT_K_VFF;
+    tuning.K_aff    = DEFAULT_K_AFF;
     
     tuning.jog_speed_fine = JOG_SPEED_FINE; 
     tuning.move_speed_coarse = MOVE_SPEED_COARSE;
@@ -1020,41 +1032,54 @@ void Motor_ControlLoop(void)
     }
 
     // 2. Encoder Phase Inversion
-    if ((current_applied_pwm > ENCODER_FAULT_PWM_THRESHOLD && encoder.filtered_rpm < -ENCODER_INVERSION_RPM_LIMIT) ||
-        (current_applied_pwm < -ENCODER_FAULT_PWM_THRESHOLD && encoder.filtered_rpm > ENCODER_INVERSION_RPM_LIMIT)) {
+    bool encoder_inverted = (current_applied_pwm >  ENCODER_FAULT_PWM_THRESHOLD && encoder.filtered_rpm < -ENCODER_INVERSION_RPM_LIMIT) ||
+                            (current_applied_pwm < -ENCODER_FAULT_PWM_THRESHOLD && encoder.filtered_rpm >  ENCODER_INVERSION_RPM_LIMIT);
+
+    if (safety_config.encoder_check && encoder_inverted) {
         fault_code |= FAULT_ENCODER_ERROR;
-        if (safety_config.encoder_check) {
-            emergency_stop = true;
-            printf("CRITICAL: ENCODER INVERTED / PHASE ERROR\r\n");
-            PWM_Apply(0.0f);
-        }
+        emergency_stop = true;
+        printf("CRITICAL: ENCODER INVERTED / PHASE ERROR\r\n");
+        PWM_Apply(0.0f);
     }
 
     // 3. Encoder Signal Loss
-    if (fabsf(current_applied_pwm) > ENCODER_FAULT_PWM_THRESHOLD && 
+    bool encoder_signal_lost = false;
+    if (fabsf(current_applied_pwm) > ENCODER_FAULT_PWM_THRESHOLD &&
         fabsf(encoder.filtered_rpm) < STALL_VELOCITY_THRESHOLD &&
         encoder.absolute_counts == last_absolute_counts) {
-        
+
         if (encoder_fault_timer == 0) encoder_fault_timer = HAL_GetTick();
         else if (HAL_GetTick() - encoder_fault_timer >= 1000) {
-            fault_code |= FAULT_ENCODER_ERROR;
-            if (safety_config.encoder_check) {
-                emergency_stop = true;
-                printf("CRITICAL: ENCODER DISCONNECTED / NO SIGNAL\r\n");
-                PWM_Apply(0.0f);
-            }
+            encoder_signal_lost = true;
         }
     } else {
         encoder_fault_timer = 0;
         last_absolute_counts = encoder.absolute_counts;
     }
 
+    if (safety_config.encoder_check && encoder_signal_lost) {
+        fault_code |= FAULT_ENCODER_ERROR;
+        emergency_stop = true;
+        printf("CRITICAL: ENCODER DISCONNECTED / NO SIGNAL\r\n");
+        PWM_Apply(0.0f);
+    }
+
+    // Clear stale encoder fault when:
+    //  - the user disables the check (so the dashboard stops showing it), OR
+    //  - neither inversion nor signal-loss conditions are currently active
+    //    and the e-stop has been cleared (so a recovered link drops the fault).
+    if (!safety_config.encoder_check) {
+        fault_code &= ~FAULT_ENCODER_ERROR;
+    } else if (!encoder_inverted && !encoder_signal_lost && !emergency_stop) {
+        fault_code &= ~FAULT_ENCODER_ERROR;
+    }
+
     // Stall Timer
     if (stall_condition) {
         if (stall_timer == 0) stall_timer = HAL_GetTick();
         else if (HAL_GetTick() - stall_timer >= STALL_TIME_MS) {
-            fault_code |= FAULT_MOTOR_STALLED;
             if (safety_config.stall_prevent) {
+                fault_code |= FAULT_MOTOR_STALLED;
                 emergency_stop = true;
                 printf("CRITICAL: MOTOR STALLED\r\n");
                 PWM_Apply(0.0f);
@@ -1062,6 +1087,13 @@ void Motor_ControlLoop(void)
         }
     } else {
         stall_timer = 0;
+    }
+
+    // Clear stale stall fault when the check is disabled or condition has cleared and e-stop is released
+    if (!safety_config.stall_prevent) {
+        fault_code &= ~FAULT_MOTOR_STALLED;
+    } else if (!stall_condition && !emergency_stop) {
+        fault_code &= ~FAULT_MOTOR_STALLED;
     }
 
     // 4. Over-Rotation Protection (Virtual Wall Notification)
@@ -1224,12 +1256,21 @@ void Motor_ControlLoop(void)
             trajectory.target_vel = 0.0f;
         }
 
-        float ff = tuning.speed_Kf * trajectory.target_vel;
-        current_applied_pwm = PID_Compute(&pid_speed, trajectory.target_vel, encoder.filtered_rpm) + ff; 
+        /* Trajectory FF (cascade-control diagram).
+         *   v_ref [RPM]  -> rad/s ; * K_vff [V/(rad/s)]   -> Volts
+         *   a_ref [RPM/s]-> rad/s²; * K_aff [V/(rad/s^2)] -> Volts
+         *   Volts -> PWM% via (100 / SUPPLY_VOLTAGE).
+         * In pure SPEED mode there's no S-curve a_ref, so K_aff term is 0. */
+        const float RPM_TO_RADS = 0.10471975512f;       // 2*pi/60
+        const float V_TO_PWM    = 100.0f / SUPPLY_VOLTAGE;
+        float v_ref_rads = trajectory.target_vel * RPM_TO_RADS;
+        float ff_volts   = tuning.K_vff * v_ref_rads;
+        float ff = ff_volts * V_TO_PWM;
+        current_applied_pwm = PID_Compute(&pid_speed, trajectory.target_vel, encoder.filtered_rpm) + ff;
         PWM_Apply(current_applied_pwm);
-        trajectory.target_pos = encoder.current_position_deg; 
+        trajectory.target_pos = encoder.current_position_deg;
         trajectory.current_setpoint_pos = encoder.current_position_deg;
-    } 
+    }
     /* --- Position Loop --- */
     else if (current_mode == MOTOR_MODE_POSITION || current_mode == MOTOR_MODE_GHOST || current_mode == MOTOR_MODE_HOMING) {
         // VIRTUAL HARD STOPS: Clamp target position
@@ -1247,9 +1288,44 @@ void Motor_ControlLoop(void)
         
         // (Dynamic speed recovery removed — it was overwriting Live Expressions tuning)
 
-        float target_rpm = PID_Compute(&pid_position, trajectory.current_setpoint_pos, encoder.current_position_deg);
-        float ff = tuning.speed_Kf * target_rpm;
-        current_applied_pwm = PID_Compute(&pid_speed, target_rpm, encoder.filtered_rpm) + ff; 
+        float target_rpm;
+        float v_ref_rpm = trajectory.current_setpoint_vel;
+        float a_ref_rpmps = trajectory.current_setpoint_accel;
+
+        if (position_loop_enabled) {
+            target_rpm = PID_Compute(&pid_position,
+                                     trajectory.current_setpoint_pos,
+                                     encoder.current_position_deg);
+        } else {
+            /* Position loop bypassed — tune the velocity loop in isolation. */
+            if (sine_test_enabled) {
+                if (sine_start_tick == 0) sine_start_tick = HAL_GetTick();
+                float t  = (HAL_GetTick() - sine_start_tick) * 0.001f;
+                float w  = 2.0f * 3.14159265f * sine_freq_hz; // rad/s
+                target_rpm  = sine_amp_rpm * sinf(w * t);
+                /* Analytic derivatives of the sine command, so the trajectory
+                 * feedforward tracks the actual velocity command instead of
+                 * the (idle) S-curve outputs. */
+                v_ref_rpm   = target_rpm;                          // RPM
+                a_ref_rpmps = sine_amp_rpm * w * cosf(w * t);      // RPM/s
+            } else {
+                sine_start_tick = 0;
+                target_rpm = trajectory.current_setpoint_vel;
+            }
+            pid_position.integral   = 0.0f;
+            pid_position.error_prev = 0.0f;
+            pid_position.d_filt     = 0.0f;
+        }
+
+        /* Trajectory FF on velocity-PID output (matches cascade-control diagram). */
+        const float RPM_TO_RADS = 0.10471975512f;       // 2*pi/60
+        const float V_TO_PWM    = 100.0f / SUPPLY_VOLTAGE;
+        float v_ref_rads = v_ref_rpm   * RPM_TO_RADS;
+        float a_ref_rads = a_ref_rpmps * RPM_TO_RADS;
+        float ff_volts   = tuning.K_vff * v_ref_rads + tuning.K_aff * a_ref_rads;
+        float ff = ff_volts * V_TO_PWM;
+
+        current_applied_pwm = PID_Compute(&pid_speed, target_rpm, encoder.filtered_rpm) + ff;
         PWM_Apply(current_applied_pwm);
         current_pwm = current_applied_pwm;
 

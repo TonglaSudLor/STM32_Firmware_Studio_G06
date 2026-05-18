@@ -92,7 +92,8 @@ typedef struct {
     float speed_Kp;
     float speed_Ki;
     float speed_Kd;
-    float speed_Kf;            /**< Feed-Forward Gain (PWM per RPM) */
+    float K_vff;               /**< Velocity feedforward — V per (rad/s). Multiplies trajectory v_ref. */
+    float K_aff;               /**< Acceleration feedforward — V per (rad/s^2). Multiplies trajectory a_ref. */
     
     // PID Position Loop
     float pos_Kp;
@@ -179,6 +180,10 @@ extern volatile int tuning_progress;
 extern volatile Motor_TuningParams_t tuning;
 extern volatile bool is_joystick_connected;
 extern volatile bool emergency_stop;
+extern volatile bool position_loop_enabled;
+extern volatile bool  sine_test_enabled;
+extern volatile float sine_amp_rpm;
+extern volatile float sine_freq_hz;
 extern volatile SafetyConfig_t safety_config;
 extern volatile Motor_FaultCode_t fault_code;
 extern volatile float target_position_deg;

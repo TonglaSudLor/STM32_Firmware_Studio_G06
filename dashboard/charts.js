@@ -23,10 +23,17 @@ class TelemetryChart {
     }
 
     resize() {
-        const container = this.canvas.parentElement;
-        if (!container) return;
-        this.canvas.width = container.clientWidth;
-        this.canvas.height = container.clientHeight;
+        // Use the canvas's own laid-out size (CSS-driven) rather than the
+        // parent's clientHeight. This avoids the feedback loop where the
+        // canvas's drawing-buffer size grows the flex item, which grows
+        // the parent, which grows the buffer again on the next toggle.
+        const rect = this.canvas.getBoundingClientRect();
+        const w = Math.max(1, Math.round(rect.width));
+        const h = Math.max(1, Math.round(rect.height));
+        if (this.canvas.width !== w || this.canvas.height !== h) {
+            this.canvas.width = w;
+            this.canvas.height = h;
+        }
         this.draw();
     }
 
@@ -114,6 +121,35 @@ class TelemetryChart {
         ctx.setLineDash([]);
     }
 
+    setPreviewSine(amp, freq) {
+        this.previewSine = (amp && freq > 0) ? { amp, freq } : null;
+        this.draw();
+    }
+    clearPreviewSine() { this.previewSine = null; this.draw(); }
+
+    _drawSinePreview(width, height, minV, maxV) {
+        if (!this.previewSine) return;
+        const { amp, freq } = this.previewSine;
+        const range = maxV - minV;
+        const ctx = this.ctx;
+        const periods = 2;
+        ctx.beginPath();
+        ctx.strokeStyle = '#ff3131';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([6, 4]);
+        for (let x = 0; x <= width; x++) {
+            const phase = (x / width) * periods * 2 * Math.PI;
+            const val = Math.min(Math.max(amp * Math.sin(phase), minV), maxV);
+            const y = height - ((val - minV) / range) * height;
+            if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#ff3131';
+        ctx.font = '10px "JetBrains Mono"';
+        ctx.fillText(`PREVIEW  ±${amp} RPM @ ${freq} Hz`, 6, 14);
+    }
+
     _drawLive() {
         const { width, height } = this.canvas;
         const ctx = this.ctx;
@@ -150,28 +186,48 @@ class TelemetryChart {
         const range = maxV - minV;
         ctx.clearRect(0, 0, width, height);
 
-        // Compute time window
+        // Compute time window. Two modes:
+        //  - Scroll mode (this.scrollWindowSec set): a fixed window of N
+        //    seconds that slides with the live signal. Used by the sine test
+        //    so the wave doesn't get squeezed as the capture runs long.
+        //  - Fit mode (default): zoom out to cover the entire run, including
+        //    ghost runs in history.
+        let minT = 0;
         let maxT = 10;
-        this.tuningRuns.forEach(r => { if (r.times.length) maxT = Math.max(maxT, r.times[r.times.length - 1] + 1); });
-        if (this.currentRun && this.currentRun.times.length)
-            maxT = Math.max(maxT, this.currentRun.times[this.currentRun.times.length - 1] + 1);
+        const lastT = (this.currentRun && this.currentRun.times.length)
+            ? this.currentRun.times[this.currentRun.times.length - 1]
+            : 0;
+        const scrolling = this.scrollWindowSec && this.scrollWindowSec > 0;
+        if (scrolling) {
+            const win = this.scrollWindowSec;
+            maxT = Math.max(win, lastT);
+            minT = Math.max(0, maxT - win);
+        } else {
+            this.tuningRuns.forEach(r => { if (r.times.length) maxT = Math.max(maxT, r.times[r.times.length - 1] + 1); });
+            if (this.currentRun && this.currentRun.times.length)
+                maxT = Math.max(maxT, lastT + 1);
+        }
 
         this._drawGrid(width, height, range);
+        this._drawSinePreview(width, height, minV, maxV);
 
         // Time axis labels
         ctx.fillStyle = 'rgba(255,255,255,0.4)';
         ctx.font = '9px "JetBrains Mono"';
-        for (let s = 0; s <= maxT; s += 2) {
-            const x = (s / maxT) * width;
+        const span = maxT - minT;
+        const step = span <= 6 ? 1 : (span <= 20 ? 2 : 5);
+        for (let s = Math.ceil(minT / step) * step; s <= maxT; s += step) {
+            const x = ((s - minT) / span) * width;
             ctx.fillText(s + 's', x + 2, height - 2);
         }
 
-        // Ghost runs (older = more faded)
+        // Ghost runs (older = more faded). Skip in scroll mode because their
+        // local times don't align with the scrolling window.
         const runAlphas = [0.05, 0.12, 0.22];
-        this.tuningRuns.forEach((run, ri) => {
+        if (!scrolling) this.tuningRuns.forEach((run, ri) => {
             const alpha = runAlphas[Math.min(ri, runAlphas.length - 1)];
             const col = this._hexToRgba(this.color, alpha);
-            this._drawTuningLine(run.times, run.vals, maxT, col, false, 1.5, width, height, range, minV, maxV);
+            this._drawTuningLine(run.times, run.vals, maxT, col, false, 1.5, width, height, range, minV, maxV, minT);
 
             // Target line for this run
             if (run.target !== undefined) {
@@ -188,7 +244,7 @@ class TelemetryChart {
 
             // Settling marker
             if (run.settleTime !== null && run.settleTime !== undefined) {
-                const sx = (run.settleTime / maxT) * width;
+                const sx = ((run.settleTime - minT) / span) * width;
                 ctx.beginPath();
                 ctx.strokeStyle = `rgba(100,255,100,${alpha * 2})`;
                 ctx.setLineDash([3, 4]);
@@ -219,7 +275,14 @@ class TelemetryChart {
                 ctx.fillText(lbl, 8, ty - 4);
             }
             if (this.currentRun.times.length >= 2) {
-                this._drawTuningLine(this.currentRun.times, this.currentRun.vals, maxT, this.color, false, 2, width, height, range, minV, maxV);
+                // Setpoint reference (dashed white) — sine wave or step velocity command
+                if (this.currentRun.vsets && this.currentRun.vsets.length >= 2) {
+                    this._drawTuningLine(this.currentRun.times, this.currentRun.vsets, maxT,
+                                         'rgba(255,255,255,0.55)', true, 1.5,
+                                         width, height, range, minV, maxV, minT);
+                }
+                // Actual value (solid, channel color)
+                this._drawTuningLine(this.currentRun.times, this.currentRun.vals, maxT, this.color, false, 2, width, height, range, minV, maxV, minT);
             }
 
             // Current value label
@@ -244,21 +307,27 @@ class TelemetryChart {
         ctx.fillText('TUNING', 8, height / 2 + 10);
     }
 
-    _drawTuningLine(times, vals, maxT, color, dashed, lw, width, height, range, minV, maxV) {
+    _drawTuningLine(times, vals, maxT, color, dashed, lw, width, height, range, minV, maxV, minT) {
         if (times.length < 2) return;
         if (minV === undefined) minV = this.minVal;
         if (maxV === undefined) maxV = this.maxVal;
+        if (minT === undefined) minT = 0;
+        const span = maxT - minT;
+        if (span <= 0) return;
         const ctx = this.ctx;
         ctx.beginPath();
         ctx.strokeStyle = color;
         ctx.lineWidth = lw;
         ctx.lineJoin = 'round';
         if (dashed) ctx.setLineDash([6, 4]); else ctx.setLineDash([]);
+        let started = false;
         times.forEach((t, i) => {
-            const x = (t / maxT) * width;
+            if (t < minT) return;          // skip samples to the left of the window
+            const x = ((t - minT) / span) * width;
             let val = Math.min(Math.max(this._xform(vals[i]), minV), maxV);
             const y = height - ((val - minV) / range) * height;
-            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            if (!started) { ctx.moveTo(x, y); started = true; }
+            else ctx.lineTo(x, y);
         });
         ctx.stroke();
         ctx.setLineDash([]);
@@ -266,22 +335,58 @@ class TelemetryChart {
 
     _drawGrid(width, height, range) {
         const ctx = this.ctx;
+        const minV = this._effMin();
+        const maxV = this._effMax();
+        const yRange = maxV - minV;
+
         ctx.lineWidth = 1;
+
+        // Horizontal grid lines + Y-axis tick labels
         ctx.beginPath();
         ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-        for (let i = 0; i <= 4; i++) { const y = (height / 4) * i; ctx.moveTo(0, y); ctx.lineTo(width, y); }
+        for (let i = 0; i <= 4; i++) {
+            const y = (height / 4) * i;
+            ctx.moveTo(0, y);
+            ctx.lineTo(width, y);
+        }
         ctx.stroke();
+
+        ctx.fillStyle = 'rgba(255,255,255,0.45)';
+        ctx.font = '9px "JetBrains Mono"';
+        ctx.textBaseline = 'middle';
+        for (let i = 0; i <= 4; i++) {
+            const y = (height / 4) * i;
+            const val = maxV - (i / 4) * yRange;
+            const txt = Math.abs(val) >= 100 ? val.toFixed(0) : val.toFixed(1);
+            // Nudge top/bottom labels inward so they aren't clipped
+            const yT = i === 0 ? y + 7 : (i === 4 ? y - 7 : y);
+            ctx.fillText(txt, 4, yT);
+        }
+
+        // Left axis line
         ctx.beginPath();
         ctx.strokeStyle = 'rgba(255,255,255,0.3)';
         ctx.moveTo(1, 0); ctx.lineTo(1, height);
         ctx.stroke();
-        const zeroY = height - ((0 - this.minVal) / range) * height;
+
+        // Zero line (highlighted)
+        const zeroY = height - ((0 - minV) / yRange) * height;
         if (zeroY >= 0 && zeroY <= height) {
             ctx.beginPath();
             ctx.strokeStyle = 'rgba(255,255,255,0.2)';
             ctx.moveTo(0, zeroY); ctx.lineTo(width, zeroY);
             ctx.stroke();
+            ctx.fillStyle = 'rgba(255,255,255,0.55)';
+            ctx.fillText('0', 4, zeroY - 1);
         }
+
+        // X-axis label (right edge) — "now" indicator for live, "s" for tuning
+        ctx.fillStyle = 'rgba(255,255,255,0.35)';
+        ctx.font = '9px "JetBrains Mono"';
+        ctx.textBaseline = 'alphabetic';
+        const xLbl = this.tuningMode ? 'time (s) →' : 'now →';
+        const w = ctx.measureText(xLbl).width;
+        ctx.fillText(xLbl, width - w - 4, height - 4);
     }
 
     _hexToRgba(hex, alpha) {

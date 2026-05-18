@@ -163,7 +163,8 @@ function processPacket(packet) {
             case 'SKP':   syncTuning('input-speed-kp',  val); break;
             case 'SKI':   syncTuning('input-speed-ki',  val); break;
             case 'SKD':   syncTuning('input-speed-kd',  val); break;
-            case 'SKF':   syncTuning('input-speed-kf',  val); break;
+            case 'KVFF':  syncTuning('input-k-vff',     val); break;
+            case 'KAFF':  syncTuning('input-k-aff',     val); break;
             case 'VMAX':  syncTuning('input-move-coarse', val); break;
             case 'AMAX':  syncTuning('input-max-accel',   val); break;
             case 'STEPC': syncTuning('input-step-coarse', val); break;
@@ -171,6 +172,14 @@ function processPacket(packet) {
             case 'JOGF':  syncTuning('input-jog-fine',    val); break;
             case 'HOMES': syncTuning('input-home-speed',  val); break;
             case 'MINP':  syncTuning('input-min-pwm',     val); break;
+            case 'PLOOP': {
+                const newState = (val > 0.5);
+                if (newState !== posLoopEnabled) {
+                    posLoopEnabled = newState;
+                    renderPosLoopBtn();
+                }
+                break;
+            }
         }
     });
 
@@ -342,6 +351,153 @@ document.getElementById('btn-sys-mode').addEventListener('click', () => {
     log('Sent TOGGLE_MODE — LPUART1 baud will switch. If going to BASE, dashboard will disconnect.');
 });
 
+// Position loop enable/disable — bypass outer loop to tune velocity loop alone
+const btnPosLoop = document.getElementById('btn-pos-loop');
+let posLoopEnabled = true;
+const POS_INPUT_IDS = ['input-pos-kp', 'input-pos-ki', 'input-pos-kd'];
+let sineActive = false;
+let sineCapturing = false;
+let sineStartMs = 0;
+let prevTuningModeBeforeLoopOff = null;  // remembers the user's mode so we can restore it
+
+// Snapshot the default tuning-axis scaling so we can swap it while the
+// position loop is OFF (sine wave needs a symmetric, signed Y range).
+const TUNE_SCALE_DEFAULT = {
+    pos: { min: chartPos.tuningMinVal, max: chartPos.tuningMaxVal, abs: chartPos.absInTuning },
+    vel: { min: chartVel.tuningMinVal, max: chartVel.tuningMaxVal, abs: chartVel.absInTuning },
+    acc: { min: chartAcc.tuningMinVal, max: chartAcc.tuningMaxVal, abs: chartAcc.absInTuning },
+};
+function applyTuningChartScale(loopOff) {
+    if (loopOff) {
+        chartPos.tuningMinVal = -360; chartPos.tuningMaxVal = 360; chartPos.absInTuning = false;
+        chartVel.tuningMinVal = -60;  chartVel.tuningMaxVal = 60;  chartVel.absInTuning = false;
+        // acc has no tuning override -> nothing to do
+    } else {
+        chartPos.tuningMinVal = TUNE_SCALE_DEFAULT.pos.min;
+        chartPos.tuningMaxVal = TUNE_SCALE_DEFAULT.pos.max;
+        chartPos.absInTuning  = TUNE_SCALE_DEFAULT.pos.abs;
+        chartVel.tuningMinVal = TUNE_SCALE_DEFAULT.vel.min;
+        chartVel.tuningMaxVal = TUNE_SCALE_DEFAULT.vel.max;
+        chartVel.absInTuning  = TUNE_SCALE_DEFAULT.vel.abs;
+    }
+    chartPos.draw(); chartVel.draw(); chartAcc.draw();
+}
+function renderPosLoopBtn() {
+    btnPosLoop.textContent = posLoopEnabled ? 'Loop: ON' : 'Loop: OFF';
+    btnPosLoop.classList.toggle('active', posLoopEnabled);
+    btnPosLoop.classList.toggle('danger', !posLoopEnabled);
+
+    // Gray out + lock the position-PID inputs when the outer loop is bypassed
+    const section = btnPosLoop.closest('.tuning-section');
+    if (section) section.classList.toggle('disabled', !posLoopEnabled);
+    POS_INPUT_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = !posLoopEnabled;
+    });
+
+    // Swap Manual Override target row <-> sine wave generator
+    const posGrp  = document.getElementById('target-pos-group');
+    const sineGrp = document.getElementById('sine-gen-group');
+    if (posGrp && sineGrp) {
+        posGrp.style.display  = posLoopEnabled ? '' : 'none';
+        sineGrp.style.display = posLoopEnabled ? 'none' : '';
+    }
+    // Hide Gripper/Claw/Mode/Jog/Override during tuning — keep only Fine/Go Home
+    document.querySelectorAll('.manual-extra').forEach(el => {
+        el.style.display = posLoopEnabled ? '' : 'none';
+    });
+
+    // Loop OFF: switch the telemetry view to Tuning so the preview/run lives
+    // in the right chart mode. Loop ON: restore the user's prior mode.
+    if (!posLoopEnabled) {
+        if (prevTuningModeBeforeLoopOff === null) prevTuningModeBeforeLoopOff = tuningMode;
+        if (!tuningMode) setTuningMode(true);
+    } else if (prevTuningModeBeforeLoopOff !== null) {
+        if (tuningMode !== prevTuningModeBeforeLoopOff) setTuningMode(prevTuningModeBeforeLoopOff);
+        prevTuningModeBeforeLoopOff = null;
+    }
+
+    // Tuning Y-axis: when loop is OFF the signal can go negative (sine wave),
+    // so use symmetric ranges and disable abs-folding on the pos chart.
+    applyTuningChartScale(!posLoopEnabled);
+
+    // Sine preview on velocity chart (only when loop OFF and sine not yet started)
+    if (!posLoopEnabled && !sineActive) {
+        refreshSinePreview();
+    } else {
+        if (chartVel.clearPreviewSine) chartVel.clearPreviewSine();
+    }
+
+    // Killing the loop also stops any running sine — make sure firmware agrees
+    if (posLoopEnabled && sineActive) stopSine();
+}
+
+function refreshSinePreview() {
+    if (!chartVel.setPreviewSine) return;
+    const amp  = parseFloat(document.getElementById('input-sine-amp').value)  || 0;
+    const freq = parseFloat(document.getElementById('input-sine-freq').value) || 0;
+    chartVel.setPreviewSine(amp, freq);
+}
+
+function stopSine() {
+    sineActive = false;
+    sendCommand('SET:SINE_EN=0');
+    // End the capture and lock the trace in tuning-run history
+    if (sineCapturing) {
+        sineCapturing = false;
+        chartVel.finalizeRun(null, null);
+    }
+    chartPos.scrollWindowSec = null;
+    chartVel.scrollWindowSec = null;
+    chartAcc.scrollWindowSec = null;
+    const btn = document.getElementById('btn-sine-toggle');
+    if (btn) { btn.textContent = 'Start Sine'; btn.classList.remove('danger'); }
+    // Restore preview overlay (loop is still OFF)
+    if (!posLoopEnabled) refreshSinePreview();
+}
+function startSine() {
+    const amp  = parseFloat(document.getElementById('input-sine-amp').value)  || 0;
+    const freq = parseFloat(document.getElementById('input-sine-freq').value) || 0;
+    sendCommand(`SET:SINE_AMP=${amp}`);
+    sendCommand(`SET:SINE_FREQ=${freq}`);
+    sendCommand('SET:SINE_EN=1');
+    sineActive = true;
+    if (chartVel.clearPreviewSine) chartVel.clearPreviewSine();  // captured trace takes over
+    // Begin a tuning-mode capture window on the velocity chart.
+    // Use a scrolling 10-second window so the wave keeps the same
+    // horizontal density as the run grows.
+    sineStartMs = Date.now();
+    chartVel.startRun(0);
+    chartPos.scrollWindowSec = 10;
+    chartVel.scrollWindowSec = 10;
+    chartAcc.scrollWindowSec = 10;
+    sineCapturing = true;
+    const btn = document.getElementById('btn-sine-toggle');
+    if (btn) { btn.textContent = 'Stop Sine'; btn.classList.add('danger'); }
+    log(`Sine generator ON — ${amp} RPM @ ${freq} Hz`);
+}
+document.getElementById('btn-sine-toggle').addEventListener('click', () => {
+    sineActive ? stopSine() : startSine();
+});
+// Live-update amp/freq + refresh preview as you type
+['input-sine-amp', 'input-sine-freq'].forEach(id => {
+    const el = document.getElementById(id);
+    el.addEventListener('input',  () => { if (!sineActive && !posLoopEnabled) refreshSinePreview(); });
+    el.addEventListener('change', () => {
+        if (sineActive) {
+            const k = id === 'input-sine-amp' ? 'SINE_AMP' : 'SINE_FREQ';
+            sendCommand(`SET:${k}=${parseFloat(el.value) || 0}`);
+        }
+    });
+});
+btnPosLoop.addEventListener('click', () => {
+    posLoopEnabled = !posLoopEnabled;
+    sendCommand(`SET:POS_LOOP=${posLoopEnabled ? 1 : 0}`);
+    renderPosLoopBtn();
+    log(`Position loop ${posLoopEnabled ? 'ENABLED' : 'BYPASSED — velocity loop tuning mode'}`);
+});
+renderPosLoopBtn();
+
 document.getElementById('btn-jog-mode').addEventListener('click', () => {
     const newJog = state.jogMode === 'COARSE' ? 1 : 0;
     sendCommand(`SET:JOG_MODE=${newJog}`);
@@ -449,7 +605,8 @@ document.getElementById('send-tuning-btn').addEventListener('click', () => {
         'SPEED_KP':   'input-speed-kp',
         'SPEED_KI':   'input-speed-ki',
         'SPEED_KD':   'input-speed-kd',
-        'SPEED_KF':   'input-speed-kf',
+        'K_VFF':      'input-k-vff',
+        'K_AFF':      'input-k-aff',
         'POS_KP':     'input-pos-kp',
         'POS_KI':     'input-pos-ki',
         'POS_KD':     'input-pos-kd',
@@ -547,6 +704,16 @@ function tuningArmRun() {
 }
 
 function tuningTick() {
+    // Sine-driven capture (loop OFF): just push velocity samples for as long
+    // as the sine is running. The settle state machine doesn't apply here.
+    if (sineCapturing) {
+        const amp  = parseFloat(document.getElementById('input-sine-amp').value)  || 0;
+        const freq = parseFloat(document.getElementById('input-sine-freq').value) || 0;
+        const t = (Date.now() - sineStartMs) / 1000;
+        const ref = amp * Math.sin(2 * Math.PI * freq * t);
+        chartVel.addRunPoint(state.vel, ref);
+        return;
+    }
     if (!tuningMode || tuningState === 'IDLE' || tuningState === 'DONE') return;
 
     const vel = Math.abs(state.vel);
@@ -670,9 +837,33 @@ function renderMetricsHistory() {
     });
 }
 
-// Toggle button
-document.getElementById('mode-toggle-btn').addEventListener('click', () => {
-    tuningMode = !tuningMode;
+// Show/hide individual telemetry charts
+const CHART_TOGGLES = [
+    { chk: 'chk-show-pos', wrap: 'wrap-chart-pos', chart: () => chartPos },
+    { chk: 'chk-show-vel', wrap: 'wrap-chart-vel', chart: () => chartVel },
+    { chk: 'chk-show-acc', wrap: 'wrap-chart-acc', chart: () => chartAcc },
+];
+function applyChartVisibility() {
+    CHART_TOGGLES.forEach(t => {
+        const wrap = document.getElementById(t.wrap);
+        const checked = document.getElementById(t.chk).checked;
+        if (wrap) wrap.style.display = checked ? '' : 'none';
+    });
+    // Force the surviving canvases to re-measure their container
+    requestAnimationFrame(() => {
+        CHART_TOGGLES.forEach(t => {
+            if (document.getElementById(t.chk).checked) t.chart().resize();
+        });
+    });
+}
+CHART_TOGGLES.forEach(t => {
+    document.getElementById(t.chk).addEventListener('change', applyChartVisibility);
+});
+applyChartVisibility();
+
+function setTuningMode(on) {
+    if (tuningMode === on) return;
+    tuningMode = on;
     const btn = document.getElementById('mode-toggle-btn');
     btn.innerText = tuningMode ? 'Tuning' : 'Live';
     btn.className = tuningMode ? 'secondary-btn tuning-active' : 'secondary-btn';
@@ -680,15 +871,15 @@ document.getElementById('mode-toggle-btn').addEventListener('click', () => {
     chartVel.setMode(tuningMode);
     chartAcc.setMode(tuningMode);
     tuningState = 'IDLE';
-    // Toggle Path Sequencer / Metrics card visibility
     document.querySelector('.path-card').style.display    = tuningMode ? 'none' : '';
     document.querySelector('.metrics-card').style.display = tuningMode ? '' : 'none';
-    if (tuningMode) {
-        setMetricsStatus('IDLE — Send Move / Go Home / Ghost start to begin capture', '');
-    } else {
-        setMetricsStatus('IDLE — Switch to Tuning Mode and move motor', '');
-    }
-});
+    setMetricsStatus(tuningMode
+        ? 'IDLE — Send Move / Go Home / Ghost start to begin capture'
+        : 'IDLE — Switch to Tuning Mode and move motor', '');
+}
+
+// Toggle button
+document.getElementById('mode-toggle-btn').addEventListener('click', () => setTuningMode(!tuningMode));
 
 // Default: hide metrics card on load (Live mode default)
 document.addEventListener('DOMContentLoaded', () => {
@@ -862,7 +1053,8 @@ const DEFAULTS = {
     'input-speed-kp':    1.0,
     'input-speed-ki':    2.0,
     'input-speed-kd':    0.0,
-    'input-speed-kf':    0.0,
+    'input-k-vff':       3.033,
+    'input-k-aff':       0.445,
     'input-pos-kp':      1.2,
     'input-pos-ki':      0.05,
     'input-pos-kd':      0.1,

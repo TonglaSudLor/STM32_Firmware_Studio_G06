@@ -14,7 +14,13 @@
 #define DEFAULT_SPEED_KP    1.0f
 #define DEFAULT_SPEED_KI    2.0f
 #define DEFAULT_SPEED_KD    0.0f
-#define DEFAULT_SPEED_KF    0.0f  /**< Your characterized Feed-Forward gain */
+/* Trajectory feedforward (matches cascade-control block diagram).
+ *   Kvff units: V / (rad/s)   — compensates back-EMF + viscous damping
+ *   Kaff units: V / (rad/s^2) — compensates inertia
+ * Firmware converts trajectory RPM/(RPM/s) into rad/s/(rad/s^2) and Volts into PWM%.
+ */
+#define DEFAULT_K_VFF       3.033f
+#define DEFAULT_K_AFF       0.445f
 
 /* Position Loop (Outer) */
 #define DEFAULT_POS_KP      1.2f    /**< Increased for snappy response with S-Curve */

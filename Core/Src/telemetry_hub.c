@@ -77,12 +77,14 @@ void Telemetry_Update(void) {
     if (now - last_slow_sync_tick >= 1000) {
         last_slow_sync_tick = now;
         len = snprintf(tx_buffer, TX_BUFFER_SIZE,
-            "$SKP:%.3f,SKI:%.3f,SKD:%.3f,SKF:%.3f,PKP:%.3f,PKI:%.3f,PKD:%.3f,"
-            "VMAX:%.1f,AMAX:%.1f,STEPC:%.1f,STEPF:%.1f,JOGF:%.1f,HOMES:%.1f,MINP:%.1f*",
-            tuning.speed_Kp, tuning.speed_Ki, tuning.speed_Kd, tuning.speed_Kf,
-            tuning.pos_Kp, tuning.pos_Ki, tuning.pos_Kd, 
-            tuning.move_speed_coarse, tuning.max_accel, tuning.step_size_coarse, 
-            tuning.step_size_fine, tuning.jog_speed_fine, tuning.move_speed_return_home, tuning.min_pwm);
+            "$SKP:%.3f,SKI:%.3f,SKD:%.3f,KVFF:%.3f,KAFF:%.3f,PKP:%.3f,PKI:%.3f,PKD:%.3f,"
+            "VMAX:%.1f,AMAX:%.1f,STEPC:%.1f,STEPF:%.1f,JOGF:%.1f,HOMES:%.1f,MINP:%.1f,PLOOP:%d*",
+            tuning.speed_Kp, tuning.speed_Ki, tuning.speed_Kd,
+            tuning.K_vff, tuning.K_aff,
+            tuning.pos_Kp, tuning.pos_Ki, tuning.pos_Kd,
+            tuning.move_speed_coarse, tuning.max_accel, tuning.step_size_coarse,
+            tuning.step_size_fine, tuning.jog_speed_fine, tuning.move_speed_return_home, tuning.min_pwm,
+            position_loop_enabled ? 1 : 0);
             
         if (len > 0) {
             HAL_UART_Transmit(t_huart, (uint8_t*)tx_buffer, len, 100);
@@ -150,7 +152,23 @@ static void Telemetry_HandleSet(char *payload) {
             else if (strcmp(key, "SPEED_KP") == 0) tuning.speed_Kp = val;
             else if (strcmp(key, "SPEED_KI") == 0) tuning.speed_Ki = val;
             else if (strcmp(key, "SPEED_KD") == 0) tuning.speed_Kd = val;
-            else if (strcmp(key, "SPEED_KF") == 0) tuning.speed_Kf = val;
+            else if (strcmp(key, "POS_LOOP") == 0) position_loop_enabled = (val > 0.5f);
+            else if (strcmp(key, "SINE_EN")  == 0) {
+                bool on = (val > 0.5f);
+                sine_test_enabled = on;
+                if (on && !emergency_stop) {
+                    /* Wake the control loop so the sine path executes.
+                     * Anchor target_pos to the current encoder reading so the
+                     * trajectory generator stays put while we drive the
+                     * velocity loop directly with the sine reference. */
+                    extern void Motor_MoveToPosition(float target_degrees);
+                    Motor_MoveToPosition(encoder.current_position_deg);
+                }
+            }
+            else if (strcmp(key, "SINE_AMP") == 0) sine_amp_rpm  = val;
+            else if (strcmp(key, "SINE_FREQ")== 0) sine_freq_hz  = val;
+            else if (strcmp(key, "K_VFF")    == 0) tuning.K_vff    = val;
+            else if (strcmp(key, "K_AFF")    == 0) tuning.K_aff    = val;
             else if (strcmp(key, "V_MAX") == 0 || strcmp(key, "MOVE_COARSE") == 0) tuning.move_speed_coarse = val;
             else if (strcmp(key, "A_MAX") == 0 || strcmp(key, "MAX_ACCEL") == 0) tuning.max_accel = val;
             else if (strcmp(key, "STEP_COARSE") == 0) tuning.step_size_coarse = val;
