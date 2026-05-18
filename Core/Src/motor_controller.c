@@ -300,16 +300,24 @@ typedef enum {
     H_WIGGLE_SEARCH,
     H_FIND_EDGE_A,
     H_FIND_EDGE_B,
+    H_VERIFY_EDGE_B,    /**< Re-approach edge B from the opposite side to cancel sensor hysteresis */
+    H_VERIFY_EDGE_A,    /**< Continue back through the zone and re-cross edge A from the opposite side */
     H_CALCULATE_ZERO,
     H_DONE,
     H_ERROR
 } HomingState_t;
 
+#define HOMING_VERIFY_OVERSHOOT_DEG  1.5f   /**< how far past edge_b we travel before reversing */
+#define HOMING_VERIFY_MAX_TRAVEL_DEG 30.0f  /**< abort verify if we travel this far without finding the next edge */
+
 static HomingState_t h_state = H_IDLE;
-static float h_edge_a = 0, h_edge_b = 0;
+static float h_edge_a = 0, h_edge_b = 0, h_edge_a_verify = 0, h_edge_b_verify = 0;
+static float h_verify_reverse_start = 0;     /**< encoder pos at the moment we reverse, used as travel reference */
+static float h_verify_a_start = 0;           /**< encoder pos when the edge-A verify phase begins */
 static float h_wiggle_amp = 20.0f;
 static float h_start_pos = 0;
 static int h_direction = 1;
+static bool h_verify_overshot = false;
 
 /**
  * @brief Standalone Homing Sequence Function
@@ -382,12 +390,87 @@ bool Motor_RunHomingSequence(void)
 
         case H_FIND_EDGE_B:
             // Continue moving until sensor releases
-            trajectory.target_pos += (float)h_direction * 0.5f; 
+            trajectory.target_pos += (float)h_direction * 0.5f;
 
-            if (hw.raw_prox_bit) { 
+            if (hw.raw_prox_bit) {
                 h_edge_b = encoder.current_position_deg;
+                h_verify_overshot = false;
+                h_state = H_VERIFY_EDGE_B;
+                printf("[HOMING] Edge B (first): %.2f. Verifying from the other side...\r\n", h_edge_b);
+            }
+            return false;
+
+        case H_VERIFY_EDGE_B:
+            /* Step 1: overshoot a small amount past edge B in the original
+             * direction so we're cleanly outside the sensor's detection zone.
+             * Step 2: reverse and creep back. The sensor should trigger again
+             * at the same physical edge but from the other side; averaging
+             * the two readings cancels the hysteresis offset.
+             * Safety: if the reverse creep travels too far without seeing
+             * the sensor (sensor too narrow, mechanical slip, etc.), abort
+             * the verify and fall back to the original edge_b reading rather
+             * than spin a full revolution looking for it. */
+            if (!h_verify_overshot) {
+                trajectory.target_pos += (float)h_direction * 0.5f;
+                float traveled = (encoder.current_position_deg - h_edge_b) * (float)h_direction;
+                if (traveled >= HOMING_VERIFY_OVERSHOOT_DEG) {
+                    h_verify_overshot = true;
+                    h_direction = -h_direction;   /* reverse */
+                    h_verify_reverse_start = encoder.current_position_deg;
+                    printf("[HOMING] Overshot %.2f deg, reversing to verify Edge B\r\n",
+                           HOMING_VERIFY_OVERSHOOT_DEG);
+                }
+                return false;
+            }
+
+            /* Reversed creep — watch for the sensor to trigger again */
+            trajectory.target_pos += (float)h_direction * 0.5f;
+            if (!hw.raw_prox_bit) {
+                h_edge_b_verify = encoder.current_position_deg;
+                printf("[HOMING] Edge B (verify): %.2f.  Avg: %.2f\r\n",
+                       h_edge_b_verify, 0.5f * (h_edge_b + h_edge_b_verify));
+                h_edge_b = 0.5f * (h_edge_b + h_edge_b_verify);
+                /* We're now inside the sensor zone heading back toward edge A.
+                 * Continue and watch for the sensor to RELEASE — that's edge A
+                 * from the opposite side, which lets us average out its
+                 * hysteresis the same way we just did for edge B. */
+                h_verify_a_start = encoder.current_position_deg;
+                h_state = H_VERIFY_EDGE_A;
+                return false;
+            }
+
+            /* Safety net: never let verify travel more than the cap. If we
+             * exhaust it, skip the verify and use the original edges. */
+            float back_traveled = (h_verify_reverse_start - encoder.current_position_deg)
+                                  * (float)(-h_direction);
+            if (back_traveled >= HOMING_VERIFY_MAX_TRAVEL_DEG) {
+                printf("[HOMING] Verify abort (B): traveled %.2f deg without re-detecting sensor. "
+                       "Falling back to Edge B = %.2f\r\n", back_traveled, h_edge_b);
                 h_state = H_CALCULATE_ZERO;
-                printf("[HOMING] Edge B: %.2f\r\n", h_edge_b);
+            }
+            return false;
+
+        case H_VERIFY_EDGE_A:
+            /* Same reversed direction as during H_VERIFY_EDGE_B. We're inside
+             * the sensor zone. Keep going; the sensor will release as we exit
+             * across edge A from the opposite side. */
+            trajectory.target_pos += (float)h_direction * 0.5f;
+            if (hw.raw_prox_bit) {
+                h_edge_a_verify = encoder.current_position_deg;
+                printf("[HOMING] Edge A (verify): %.2f.  Avg: %.2f\r\n",
+                       h_edge_a_verify, 0.5f * (h_edge_a + h_edge_a_verify));
+                h_edge_a = 0.5f * (h_edge_a + h_edge_a_verify);
+                h_state = H_CALCULATE_ZERO;
+                return false;
+            }
+
+            /* Safety net for edge A verify too. */
+            float a_traveled = (h_verify_a_start - encoder.current_position_deg)
+                               * (float)(-h_direction);
+            if (a_traveled >= HOMING_VERIFY_MAX_TRAVEL_DEG) {
+                printf("[HOMING] Verify abort (A): traveled %.2f deg without releasing. "
+                       "Falling back to Edge A = %.2f\r\n", a_traveled, h_edge_a);
+                h_state = H_CALCULATE_ZERO;
             }
             return false;
 
@@ -690,11 +773,15 @@ void Motor_ProcessPacket(char action, char safety, char status)
         // Toggle Emergency Stop
         if (!emergency_stop) {
             emergency_stop = true;
+            fault_code |= FAULT_ESTOP_JOYSTICK;
             Motor_SendAudioCommand('E');
             printf("[SAFETY] E-Stop LATCHED via Joystick\r\n");
         } else if (!hw.in_estop && hw.raw_prox_bit) {
             // Only clear if physical hardware is also safe
             emergency_stop = false;
+            fault_code &= ~(FAULT_ESTOP_PHYSICAL | FAULT_PROX_LOST |
+                            FAULT_ESTOP_JOYSTICK | FAULT_ESTOP_DASHBOARD |
+                            FAULT_ESTOP_MODBUS);
             Motor_SendAudioCommand('C');
             printf("[SAFETY] E-Stop CLEARED via Joystick\r\n");
         }
@@ -715,6 +802,7 @@ void Motor_ProcessCommand(char cmd)
     // PRIORITY 1: Manual Emergency Stop Command
     if (cmd == 'P' || cmd == 'X') {
         emergency_stop = true;
+        fault_code |= FAULT_ESTOP_JOYSTICK;
         Motor_SendAudioCommand('E');
         trajectory.current_setpoint_vel = 0.0f;
         trajectory.current_setpoint_pos = encoder.current_position_deg;
@@ -1116,8 +1204,26 @@ void Motor_ControlLoop(void)
         fault_code &= ~FAULT_OVER_ROTATION;
     }
 
+    /* Fault-bit hygiene: clear stale automatic-safety fault bits when the
+     * user disables that check, even if e-stop is latched. Without this the
+     * dashboard keeps showing "Encoder Error" after the user unchecks
+     * Encoder Check because the clear-path that lives later in this function
+     * is unreachable while e-stop is active. */
+    if (!safety_config.encoder_check) fault_code &= ~FAULT_ENCODER_ERROR;
+    if (!safety_config.stall_prevent) fault_code &= ~FAULT_MOTOR_STALLED;
+    if (!safety_config.joystick_check) fault_code &= ~FAULT_JOYSTICK_LOST;
+
+    /* If e-stop was raised solely by an automatic safety fault that the user
+     * has now disabled, and no other fault (automatic or manual) remains,
+     * auto-release the e-stop so the motor can run again. Manual e-stop
+     * sources (physical button, dashboard, joystick button, Modbus) stay
+     * latched until explicitly cleared. */
+    if (emergency_stop && fault_code == FAULT_NONE && !hw.in_estop) {
+        emergency_stop = false;
+    }
+
     // Stop motor if e-stop or stopped mode
-    if (emergency_stop || current_mode == MOTOR_MODE_STOPPED) { 
+    if (emergency_stop || current_mode == MOTOR_MODE_STOPPED) {
         if (ghost_move_active) {
             ghost_move_active = false;
             ghost_dump_requested = true;

@@ -271,6 +271,7 @@ static void ModbusBridge_HandleCommands(void)
     // 0x25: Safety / Soft Stop
     if (register_frame[0x25].U16 & 0x01) {
         emergency_stop = true;
+        fault_code |= FAULT_ESTOP_MODBUS;
         register_frame[0x25].U16 &= ~0x01;
     } else if (register_frame[0x25].U16 & 0x02) {
         emergency_stop = false;

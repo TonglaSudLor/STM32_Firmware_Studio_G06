@@ -104,9 +104,13 @@ void HW_RefreshIO(void)
         if (hw.in_estop) {
             /* Emergency Pressed: Safe the system immediately */
             emergency_stop = true;
+            fault_code |= FAULT_ESTOP_PHYSICAL;
         } else if (hw.in_reset_btn) {
             /* Reset Pressed AND Emergency is Released: Enter Ready state */
             emergency_stop = false;
+            fault_code &= ~(FAULT_ESTOP_PHYSICAL | FAULT_PROX_LOST |
+                            FAULT_ESTOP_JOYSTICK | FAULT_ESTOP_DASHBOARD |
+                            FAULT_ESTOP_MODBUS);
         }
 
         /* Update Outputs based on emergency_stop state */
@@ -119,7 +123,7 @@ void HW_RefreshIO(void)
         }
     } else {
         /* In override mode, still update emergency_stop flag but don't force outputs */
-        if (hw.in_estop) emergency_stop = true;
+        if (hw.in_estop) { emergency_stop = true; fault_code |= FAULT_ESTOP_PHYSICAL; }
         else if (hw.in_reset_btn) emergency_stop = false;
     }
 
@@ -143,6 +147,7 @@ void HW_EStop_Trigger(void)
     hw.out_relay_motor  = 0; /* Must be 0 (OFF) for safe state! */
     if (!emergency_stop) {
         emergency_stop = true;
+        fault_code |= FAULT_ESTOP_PHYSICAL;
         Motor_SendAudioCommand('E');
     }
     apply_outputs();

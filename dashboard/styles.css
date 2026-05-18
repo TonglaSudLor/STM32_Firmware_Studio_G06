@@ -187,6 +187,51 @@ header {
     letter-spacing: 0.5px;
 }
 
+.chart-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+.chart-header-row label { margin-bottom: 0; }
+
+.chart-legend-inline {
+    display: inline-flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    font-size: 0.55rem;
+    font-family: "JetBrains Mono", monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+.lg-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    color: rgba(255,255,255,0.7);
+}
+.lg-chip::before {
+    content: "";
+    display: inline-block;
+    width: 10px;
+    height: 2px;
+    background: currentColor;
+}
+.lg-chip.lg-pos    { color: #00f2ff; }                                 /* cyan — pos chart actual */
+.lg-chip.lg-vel    { color: #ff4ddd; }                                 /* magenta — vel chart actual */
+.lg-chip.lg-acc    { color: #ffe44d; }                                 /* yellow — accel chart actual */
+.lg-chip.lg-target { color: rgba(255,255,255,0.5); }                   /* dashed white */
+.lg-chip.lg-target::before { background: repeating-linear-gradient(to right, currentColor 0 3px, transparent 3px 6px); }
+.lg-chip.lg-kf     { color: #00ff88; }                                 /* lime — Kalman estimate */
+.lg-chip.lg-sanity { color: rgba(255,200,0,0.85); }                    /* amber — open-loop model */
+.lg-chip.lg-sanity::before { background: repeating-linear-gradient(to right, currentColor 0 3px, transparent 3px 6px); }
+
 .chart-wrapper canvas {
     flex: 1 1 0;
     min-height: 0;

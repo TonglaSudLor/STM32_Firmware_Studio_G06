@@ -49,11 +49,18 @@ typedef enum {
  * @brief System fault codes (Bitmask)
  */
 typedef enum {
-    FAULT_NONE = 0x00,
-    FAULT_MOTOR_STALLED = 0x01,
-    FAULT_ENCODER_ERROR = 0x02,
-    FAULT_JOYSTICK_LOST = 0x04,
-    FAULT_OVER_ROTATION = 0x08     /**< Motor exceeded rotation limit */
+    FAULT_NONE              = 0x000,
+    /* Automatic safety faults (gated by safety_config) */
+    FAULT_MOTOR_STALLED     = 0x001,
+    FAULT_ENCODER_ERROR     = 0x002,
+    FAULT_JOYSTICK_LOST     = 0x004,
+    FAULT_OVER_ROTATION     = 0x008,   /**< Motor exceeded rotation limit */
+    /* User / external e-stop sources (always raise; informational only) */
+    FAULT_ESTOP_PHYSICAL    = 0x010,   /**< Hardware E-Stop button (EXTI) */
+    FAULT_PROX_LOST         = 0x020,   /**< Proximity sensor open */
+    FAULT_ESTOP_JOYSTICK    = 0x040,   /**< Joystick safety button (P/X) */
+    FAULT_ESTOP_DASHBOARD   = 0x080,   /**< Dashboard EMERGENCY STOP button */
+    FAULT_ESTOP_MODBUS      = 0x100    /**< Modbus 0x25 soft-stop request */
 } Motor_FaultCode_t;
 
 /**

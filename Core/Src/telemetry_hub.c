@@ -254,6 +254,7 @@ static void Telemetry_HandleSet(char *payload) {
 static void Telemetry_HandleCmd(char *payload) {
     if (strcmp(payload, "ESTOP=1") == 0 || strcmp(payload, "ESTOP") == 0) {
         emergency_stop = true;
+        fault_code |= FAULT_ESTOP_DASHBOARD;
     } else if (strcmp(payload, "CLEAR") == 0) {
         fault_code = FAULT_NONE;
         emergency_stop = false;

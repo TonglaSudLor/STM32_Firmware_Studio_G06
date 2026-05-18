@@ -1,8 +1,8 @@
 ../Core/Src/modbus_bridge.c:60:13:motor_at_target	3
 ../Core/Src/modbus_bridge.c:92:13:PnP_StateMachine	31
 ../Core/Src/modbus_bridge.c:179:13:ModbusBridge_HandleCommands	25
-../Core/Src/modbus_bridge.c:285:6:ModbusBridge_Init	1
-../Core/Src/modbus_bridge.c:302:6:ModbusBridge_Process	1
-../Core/Src/modbus_bridge.c:314:6:ModbusBridge_UpdateRegisters	18
-../Core/Src/modbus_bridge.c:362:6:ModbusBridge_RxCallback	2
-../Core/Src/modbus_bridge.c:379:6:ModbusBridge_TimerCallback	1
+../Core/Src/modbus_bridge.c:286:6:ModbusBridge_Init	1
+../Core/Src/modbus_bridge.c:303:6:ModbusBridge_Process	1
+../Core/Src/modbus_bridge.c:315:6:ModbusBridge_UpdateRegisters	18
+../Core/Src/modbus_bridge.c:363:6:ModbusBridge_RxCallback	2
+../Core/Src/modbus_bridge.c:380:6:ModbusBridge_TimerCallback	1

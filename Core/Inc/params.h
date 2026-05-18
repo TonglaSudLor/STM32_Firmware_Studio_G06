@@ -19,11 +19,11 @@
  *   Kaff units: V / (rad/s^2) — compensates inertia
  * Firmware converts trajectory RPM/(RPM/s) into rad/s/(rad/s^2) and Volts into PWM%.
  */
-#define DEFAULT_K_VFF       3.033f
-#define DEFAULT_K_AFF       0.445f
+#define DEFAULT_K_VFF       0.0f
+#define DEFAULT_K_AFF       0.0f
 
 /* Position Loop (Outer) */
-#define DEFAULT_POS_KP      1.2f    /**< Increased for snappy response with S-Curve */
+#define DEFAULT_POS_KP      0.4f
 #define DEFAULT_POS_KI      0.05f
 #define DEFAULT_POS_KD      0.1f
 
@@ -71,7 +71,7 @@
 #define HOME_HOLD_TIME_MS   1000
 
 #define HOMING_SEARCH_RPM    10.0f    /**< Speed for wiggle search */
-#define HOMING_CREEP_RPM     3.0f    /**< Speed for fine edge detection */
+#define HOMING_CREEP_RPM     1.0f    /**< Speed for fine edge detection */
 #define HOMING_MAX_WIGGLE    180.0f  /**< Max search amplitude to protect cables */
 
 /* ============================================================================

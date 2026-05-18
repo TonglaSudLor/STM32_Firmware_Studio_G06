@@ -317,10 +317,15 @@ function decodeFault(val) {
     const bits = parseInt(val);
     if (bits === 0) return 'NONE';
     const f = [];
-    if (bits & 0x01) f.push('STALL');
-    if (bits & 0x02) f.push('ENCODER');
-    if (bits & 0x04) f.push('JOY_LOST');
-    if (bits & 0x08) f.push('OVER_ROT');
+    if (bits & 0x001) f.push('STALL');
+    if (bits & 0x002) f.push('ENCODER');
+    if (bits & 0x004) f.push('JOY_LOST');
+    if (bits & 0x008) f.push('OVER_ROT');
+    if (bits & 0x010) f.push('ESTOP_HW');
+    if (bits & 0x020) f.push('PROX_LOST');
+    if (bits & 0x040) f.push('ESTOP_JOY');
+    if (bits & 0x080) f.push('ESTOP_DASH');
+    if (bits & 0x100) f.push('ESTOP_MBUS');
     return f.join(' | ');
 }
 
@@ -569,10 +574,17 @@ btnOverride.addEventListener('click', () => {
 
 // --- Fault Modal ---
 const FAULT_INFO = {
-    'STALL':    { name: 'Motor Stalled',    desc: 'PWM high but rotor not moving for 2s. Check obstruction or wiring.' },
-    'ENCODER':  { name: 'Encoder Error',    desc: 'Encoder signal lost or phase inverted. Check encoder cable.' },
-    'JOY_LOST': { name: 'Joystick Lost',    desc: 'ESP32 joystick reported disconnected.' },
-    'OVER_ROT': { name: 'Over-Rotation',    desc: 'Exceeded soft limit (720° from home). Wire-twist protection.' },
+    /* Automatic faults (gated by safety_config) */
+    'STALL':       { name: 'Motor Stalled',         desc: 'PWM high but rotor not moving for 2 s. Source: automatic safety monitor. Check obstruction or wiring.' },
+    'ENCODER':     { name: 'Encoder Error',         desc: 'Encoder signal lost or phase inverted. Source: automatic safety monitor. Check encoder cable.' },
+    'JOY_LOST':    { name: 'Joystick Lost',         desc: 'ESP32 joystick disconnected. Source: automatic safety monitor (Joystick Check).' },
+    'OVER_ROT':    { name: 'Over-Rotation',         desc: 'Exceeded ±720° from home. Source: soft-limit watchdog (wire-twist protection).' },
+    /* User / external e-stop sources (informational; not gated by safety_config) */
+    'ESTOP_HW':    { name: 'E-Stop: Physical',      desc: 'Hardware E-Stop button was pressed (GPIO EXTI). Release the button and press the physical Reset.' },
+    'PROX_LOST':   { name: 'Proximity Lost',        desc: 'Proximity sensor reported open. Source: physical interlock.' },
+    'ESTOP_JOY':   { name: 'E-Stop: Joystick',      desc: 'E-Stop triggered by the joystick safety button (P) or command (X). Source: ESP32 joystick.' },
+    'ESTOP_DASH':  { name: 'E-Stop: Dashboard',     desc: 'EMERGENCY STOP button on the dashboard was clicked. Source: user via dashboard.' },
+    'ESTOP_MBUS':  { name: 'E-Stop: Modbus',        desc: 'Modbus register 0x25 requested soft stop. Source: Base System / Modbus master.' },
 };
 
 function refreshFaultModal() {
@@ -1205,9 +1217,9 @@ const DEFAULTS = {
     'input-speed-kp':    1.0,
     'input-speed-ki':    2.0,
     'input-speed-kd':    0.0,
-    'input-k-vff':       3.033,
-    'input-k-aff':       0.445,
-    'input-pos-kp':      1.2,
+    'input-k-vff':       0.0,
+    'input-k-aff':       0.0,
+    'input-pos-kp':      0.4,
     'input-pos-ki':      0.05,
     'input-pos-kd':      0.1,
     'input-max-accel':   2000,
