@@ -287,6 +287,49 @@
                     </div>
                 </div>
             </div>
+
+            <div class="card kalman-card">
+                <div class="section-head-row">
+                    <h3>Kalman Filter</h3>
+                    <div class="kf-head-buttons">
+                        <button id="btn-kf-toggle" class="toggle-btn">KF: OFF</button>
+                        <button id="btn-kf-reset" class="toggle-btn" title="Re-anchor estimate to current encoder reading">Reset</button>
+                        <button id="btn-kf-sanity" class="toggle-btn" title="Overlay the open-loop model prediction to verify motor parameters">Model: OFF</button>
+                    </div>
+                </div>
+
+                <div class="kf-state-grid">
+                    <div class="kf-state-item"><label>θ̂ (deg)</label><span id="kf-theta" class="value">--</span></div>
+                    <div class="kf-state-item"><label>ω̂ (RPM)</label><span id="kf-omega" class="value">--</span></div>
+                    <div class="kf-state-item"><label>τ̂_L (N·m)</label><span id="kf-tau" class="value">--</span></div>
+                    <div class="kf-state-item"><label>î_a (A)</label><span id="kf-ia" class="value">--</span></div>
+                    <div class="kf-state-item small"><label>Innov.</label><span id="kf-innov" class="value">--</span></div>
+                    <div class="kf-state-item small"><label>P00</label><span id="kf-p00" class="value">--</span></div>
+                    <div class="kf-state-item small"><label>P11</label><span id="kf-p11" class="value">--</span></div>
+                    <div class="kf-state-item small"><label>P22</label><span id="kf-p22" class="value">--</span></div>
+                </div>
+
+                <div class="kf-rmse-row">
+                    <div class="rmse-cell"><label>RMSE θ̂ vs meas</label><span id="kf-rmse-theta" class="value">--</span></div>
+                    <div class="rmse-cell"><label>RMSE ω̂ vs filt</label><span id="kf-rmse-omega" class="value">--</span></div>
+                </div>
+
+                <details class="kf-tune">
+                    <summary>Q / R tuning</summary>
+                    <div class="input-row">
+                        <div class="input-group"><label>σ θ (rad/√s)</label><input type="number" id="input-kf-q-theta" step="0.001" value="0.001"></div>
+                        <div class="input-group"><label>σ ω (rad/s/√s)</label><input type="number" id="input-kf-q-omega" step="0.01" value="0.1"></div>
+                    </div>
+                    <div class="input-row">
+                        <div class="input-group"><label>σ τ (N·m/√s)</label><input type="number" id="input-kf-q-tau" step="0.05" value="0.5"></div>
+                        <div class="input-group"><label>σ i (A/√s)</label><input type="number" id="input-kf-q-i" step="0.05" value="0.5"></div>
+                    </div>
+                    <div class="input-row">
+                        <div class="input-group"><label>R (rad²)</label><input type="number" id="input-kf-r" step="1e-9" value="4.9e-8"></div>
+                        <div class="input-group" style="align-self:flex-end"><button id="btn-kf-apply-noise" class="secondary-btn">Apply Q/R</button></div>
+                    </div>
+                </details>
+            </div>
         </div>
     </main>
 

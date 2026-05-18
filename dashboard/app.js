@@ -25,9 +25,23 @@ const state = {
     seqActive: false,
     seqLoop: false,
     currentWaypointIdx: -1,
+
+    // Kalman filter telemetry
+    kfEnabled: false,
+    kfTheta: 0,         // deg
+    kfOmega: 0,         // RPM
+    kfTau: 0,           // N·m
+    kfIa: 0,            // A
+    kfInnov: 0,
+    kfP00: 0, kfP11: 0, kfP22: 0, kfP33: 0,
+    kfSanityTheta: 0,   // deg, open-loop model
+    kfSanityOmega: 0,   // RPM
+    kfSanityShow: false,
 };
 
 let tuningSynced = false;
+// Hoisted because renderPosLoopBtn() (called during script eval) references it.
+let tuningMode = false;
 
 // --- Charts & Visualizer ---
 const visualizer        = new RobotVisualizer('robot-visualizer');
@@ -157,6 +171,18 @@ function processPacket(packet) {
             case 'GHOST': state.ghost      = val === '1'; break;
             case 'GUD':   state.gripper_ud = val === '1'; break;
             case 'GCO':   state.gripper_co = val === '1'; break;
+            case 'KFEN':  state.kfEnabled  = val === '1'; break;
+            case 'KTH':   state.kfTheta    = safeNum; break;
+            case 'KOM':   state.kfOmega    = safeNum; break;
+            case 'KTL':   state.kfTau      = safeNum; break;
+            case 'KIA':   state.kfIa       = safeNum; break;
+            case 'KIV':   state.kfInnov    = safeNum; break;
+            case 'KP00':  state.kfP00      = safeNum; break;
+            case 'KP11':  state.kfP11      = safeNum; break;
+            case 'KP22':  state.kfP22      = safeNum; break;
+            case 'KP33':  state.kfP33      = safeNum; break;
+            case 'KSTH':  state.kfSanityTheta = safeNum; break;
+            case 'KSOM':  state.kfSanityOmega = safeNum; break;
             case 'PKP':   syncTuning('input-pos-kp',    val); break;
             case 'PKI':   syncTuning('input-pos-ki',    val); break;
             case 'PKD':   syncTuning('input-pos-kd',    val); break;
@@ -173,6 +199,9 @@ function processPacket(packet) {
             case 'HOMES': syncTuning('input-home-speed',  val); break;
             case 'MINP':  syncTuning('input-min-pwm',     val); break;
             case 'PLOOP': {
+                // Ignore for 2 s after the user clicked, otherwise a stale
+                // in-flight slow telemetry packet would overwrite the click.
+                if (Date.now() - posLoopUserClickedAt < 2000) break;
                 const newState = (val > 0.5);
                 if (newState !== posLoopEnabled) {
                     posLoopEnabled = newState;
@@ -193,6 +222,17 @@ function processPacket(packet) {
     chartVel.addTarget(state.velSetpoint);
     chartAcc.addData(state.acc);
     chartAcc.addTarget(state.accSetpoint);
+
+    // KF overlays (always pushed; rendering on each chart is unconditional
+    // because the chart class hides empty arrays). When KF is disabled the
+    // estimate is just the open-loop integration with corrections.
+    chartPos.addEstimate(state.kfTheta);
+    chartVel.addEstimate(state.kfOmega);
+    if (state.kfSanityShow) {
+        chartPos.addSanity(state.kfSanityTheta);
+        chartVel.addSanity(state.kfSanityOmega);
+    }
+    updateKalmanCard();
     checkGhostStart();
     tuningTick();
 }
@@ -354,6 +394,7 @@ document.getElementById('btn-sys-mode').addEventListener('click', () => {
 // Position loop enable/disable — bypass outer loop to tune velocity loop alone
 const btnPosLoop = document.getElementById('btn-pos-loop');
 let posLoopEnabled = true;
+let posLoopUserClickedAt = 0;   // timestamp of last user click on the Loop button
 const POS_INPUT_IDS = ['input-pos-kp', 'input-pos-ki', 'input-pos-kd'];
 let sineActive = false;
 let sineCapturing = false;
@@ -430,6 +471,20 @@ function renderPosLoopBtn() {
 
     // Killing the loop also stops any running sine — make sure firmware agrees
     if (posLoopEnabled && sineActive) stopSine();
+
+    // Loop OFF → show Kalman card in place of Step Response Metrics.
+    // Loop ON  → restore Step Response Metrics (only when in Tuning mode).
+    const kf = document.querySelector('.kalman-card');
+    const metrics = document.querySelector('.metrics-card');
+    if (kf && metrics) {
+        if (!posLoopEnabled) {
+            kf.style.display = '';
+            metrics.style.display = 'none';
+        } else {
+            kf.style.display = 'none';
+            metrics.style.display = tuningMode ? '' : 'none';
+        }
+    }
 }
 
 function refreshSinePreview() {
@@ -492,6 +547,7 @@ document.getElementById('btn-sine-toggle').addEventListener('click', () => {
 });
 btnPosLoop.addEventListener('click', () => {
     posLoopEnabled = !posLoopEnabled;
+    posLoopUserClickedAt = Date.now();
     sendCommand(`SET:POS_LOOP=${posLoopEnabled ? 1 : 0}`);
     renderPosLoopBtn();
     log(`Position loop ${posLoopEnabled ? 'ENABLED' : 'BYPASSED — velocity loop tuning mode'}`);
@@ -659,7 +715,7 @@ document.getElementById('sim-btn').addEventListener('click', () => {
 });
 
 // --- Tuning Mode State Machine ---
-let tuningMode = false;
+// (tuningMode is hoisted to the top of the file — see initial declaration.)
 let tuningState = 'IDLE'; // IDLE | ARMED | CAPTURING | SETTLING | DONE
 let tuningRunCount = 0;
 let tuningStartTime = 0;
@@ -872,7 +928,12 @@ function setTuningMode(on) {
     chartAcc.setMode(tuningMode);
     tuningState = 'IDLE';
     document.querySelector('.path-card').style.display    = tuningMode ? 'none' : '';
-    document.querySelector('.metrics-card').style.display = tuningMode ? '' : 'none';
+    // Metrics card only when Loop ON and Tuning mode; Kalman card takes the
+    // slot whenever Loop is OFF (see renderPosLoopBtn).
+    const _metrics = document.querySelector('.metrics-card');
+    if (_metrics) _metrics.style.display = (tuningMode && posLoopEnabled) ? '' : 'none';
+    const _kf = document.querySelector('.kalman-card');
+    if (_kf) _kf.style.display = !posLoopEnabled ? '' : 'none';
     setMetricsStatus(tuningMode
         ? 'IDLE — Send Move / Go Home / Ghost start to begin capture'
         : 'IDLE — Switch to Tuning Mode and move motor', '');
@@ -885,6 +946,97 @@ document.getElementById('mode-toggle-btn').addEventListener('click', () => setTu
 document.addEventListener('DOMContentLoaded', () => {
     const m = document.querySelector('.metrics-card');
     if (m) m.style.display = 'none';
+});
+
+/* ============================================================================
+ * Kalman Filter dashboard
+ * ========================================================================== */
+
+/* Relocate the Kalman card from the right column to the left column so it
+ * lives next to (and replaces) the Step Response Metrics panel. */
+(function relocateKalmanCard() {
+    const kf = document.querySelector('.kalman-card');
+    const metrics = document.querySelector('.metrics-card');
+    if (kf && metrics && metrics.parentElement) {
+        metrics.parentElement.insertBefore(kf, metrics.nextSibling);
+        kf.style.display = 'none';  // visibility is driven by Loop / Tuning state
+    }
+})();
+const KF_RMSE_WINDOW = 100;         // last N samples for RMSE
+const kfRmseTheta = [];
+const kfRmseOmega = [];
+
+function updateKalmanCard() {
+    const set = (id, txt) => { const el = document.getElementById(id); if (el) el.innerText = txt; };
+    set('kf-theta', state.kfTheta.toFixed(2));
+    set('kf-omega', state.kfOmega.toFixed(2));
+    set('kf-tau',   state.kfTau.toFixed(3));
+    set('kf-ia',    state.kfIa.toFixed(3));
+    set('kf-innov', state.kfInnov.toExponential(2));
+    set('kf-p00',   state.kfP00.toExponential(2));
+    set('kf-p11',   state.kfP11.toExponential(2));
+    set('kf-p22',   state.kfP22.toExponential(2));
+
+    // RMSE: compare KF estimate to the raw signal we'd otherwise use.
+    // For pos: kfTheta vs raw encoder (state.currentPos).
+    // For vel: kfOmega vs lowpass-derived RPM (state.vel).
+    kfRmseTheta.push(state.kfTheta - state.currentPos);
+    kfRmseOmega.push(state.kfOmega - state.vel);
+    if (kfRmseTheta.length > KF_RMSE_WINDOW) kfRmseTheta.shift();
+    if (kfRmseOmega.length > KF_RMSE_WINDOW) kfRmseOmega.shift();
+    const rms = arr => {
+        if (!arr.length) return 0;
+        let s = 0; for (const v of arr) s += v * v;
+        return Math.sqrt(s / arr.length);
+    };
+    set('kf-rmse-theta', rms(kfRmseTheta).toFixed(3) + ' °');
+    set('kf-rmse-omega', rms(kfRmseOmega).toFixed(2) + ' RPM');
+
+    // Toggle button reflects firmware state (so the dashboard syncs after reload)
+    const btn = document.getElementById('btn-kf-toggle');
+    if (btn) {
+        btn.textContent = state.kfEnabled ? 'KF: ON' : 'KF: OFF';
+        btn.classList.toggle('active',  state.kfEnabled);
+        btn.classList.toggle('warning', !state.kfEnabled);
+    }
+}
+
+document.getElementById('btn-kf-toggle').addEventListener('click', () => {
+    const next = !state.kfEnabled;
+    sendCommand(`SET:KF_EN=${next ? 1 : 0}`);
+    log(`Kalman filter ${next ? 'ENABLED' : 'DISABLED'}`);
+});
+
+document.getElementById('btn-kf-reset').addEventListener('click', () => {
+    sendCommand('SET:KF_RESET=1');
+    kfRmseTheta.length = 0;
+    kfRmseOmega.length = 0;
+    log('Kalman filter reset to current encoder reading');
+});
+
+document.getElementById('btn-kf-sanity').addEventListener('click', () => {
+    state.kfSanityShow = !state.kfSanityShow;
+    const b = document.getElementById('btn-kf-sanity');
+    b.textContent = state.kfSanityShow ? 'Model: ON' : 'Model: OFF';
+    b.classList.toggle('active',  state.kfSanityShow);
+    b.classList.toggle('warning', !state.kfSanityShow);
+    if (!state.kfSanityShow) {
+        chartPos.clearSanity();
+        chartVel.clearSanity();
+    }
+});
+
+document.getElementById('btn-kf-apply-noise').addEventListener('click', () => {
+    const send = (key, id) => {
+        const v = parseFloat(document.getElementById(id).value);
+        if (!isNaN(v)) sendCommand(`SET:${key}=${v}`);
+    };
+    send('KF_Q_THETA', 'input-kf-q-theta');
+    send('KF_Q_OMEGA', 'input-kf-q-omega');
+    send('KF_Q_TAU',   'input-kf-q-tau');
+    send('KF_Q_I',     'input-kf-q-i');
+    send('KF_R',       'input-kf-r');
+    log('Kalman noise parameters applied');
 });
 
 // --- Gripper Config ---

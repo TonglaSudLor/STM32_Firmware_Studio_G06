@@ -668,8 +668,16 @@ void Motor_ProcessPacket(char action, char safety, char status)
     // 2. Connection Status Logic
     if (!current_status) {
         is_joystick_connected = false;
-        fault_code |= FAULT_JOYSTICK_LOST;
-        emergency_stop = true;
+        /* Only raise the fault + latch e-stop if the Joystick safety check is
+         * enabled. When the user has unchecked "Joystick Check" in the
+         * dashboard Faults modal, a dropped joystick link must NOT halt the
+         * motor — useful for bench testing without the joystick connected. */
+        if (safety_config.joystick_check) {
+            fault_code |= FAULT_JOYSTICK_LOST;
+            emergency_stop = true;
+        } else {
+            fault_code &= ~FAULT_JOYSTICK_LOST;
+        }
         return;
     } else {
         is_joystick_connected = true;
@@ -1007,10 +1015,12 @@ void Motor_ControlLoop(void)
         a_button_evaluating = false;
     }
 
-    // Joystick fault from ESP32 disconnect signal only (no timer)
-    if (!is_joystick_connected) {
+    // Joystick fault from ESP32 disconnect signal only (no timer).
+    // Honour the "Joystick Check" safety toggle: when disabled, neither raise
+    // the fault bit nor force STOPPED mode — the motor keeps running.
+    if (!is_joystick_connected && safety_config.joystick_check) {
         fault_code |= FAULT_JOYSTICK_LOST;
-        if (safety_config.joystick_check && current_mode != MOTOR_MODE_STOPPED) {
+        if (current_mode != MOTOR_MODE_STOPPED) {
             current_mode = MOTOR_MODE_STOPPED;
             PWM_Apply(0.0f);
         }

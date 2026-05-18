@@ -1,7 +1,7 @@
-../Core/Src/telemetry_hub.c:34:6:Telemetry_HasReceivedCommand	4	static
-../Core/Src/telemetry_hub.c:38:6:Telemetry_Init	16	static
-../Core/Src/telemetry_hub.c:47:6:Telemetry_Update	288	static
-../Core/Src/telemetry_hub.c:95:6:Telemetry_OnByteReceived	16	static
-../Core/Src/telemetry_hub.c:120:13:Telemetry_ParseCommand	32	static
-../Core/Src/telemetry_hub.c:138:13:Telemetry_HandleSet	40	static
-../Core/Src/telemetry_hub.c:191:13:Telemetry_HandleCmd	16	static
+../Core/Src/telemetry_hub.c:35:6:Telemetry_HasReceivedCommand	4	static
+../Core/Src/telemetry_hub.c:39:6:Telemetry_Init	16	static
+../Core/Src/telemetry_hub.c:49:6:Telemetry_Update	296	static
+../Core/Src/telemetry_hub.c:119:6:Telemetry_OnByteReceived	16	static
+../Core/Src/telemetry_hub.c:144:13:Telemetry_ParseCommand	32	static
+../Core/Src/telemetry_hub.c:162:13:Telemetry_HandleSet	40	static
+../Core/Src/telemetry_hub.c:254:13:Telemetry_HandleCmd	16	static

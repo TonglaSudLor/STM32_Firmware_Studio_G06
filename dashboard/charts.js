@@ -66,6 +66,22 @@ class TelemetryChart {
         if (this.targetHistory.length > this.maxDataPoints) this.targetHistory.shift();
     }
 
+    /* Overlay traces — used by the Kalman dashboard.
+     * estHistory: KF state estimate.
+     * sanityHistory: open-loop physical model prediction (no correction). */
+    addEstimate(val) {
+        if (!this.estHistory) this.estHistory = [];
+        this.estHistory.push({ value: val });
+        if (this.estHistory.length > this.maxDataPoints) this.estHistory.shift();
+    }
+    addSanity(val) {
+        if (!this.sanityHistory) this.sanityHistory = [];
+        this.sanityHistory.push({ value: val });
+        if (this.sanityHistory.length > this.maxDataPoints) this.sanityHistory.shift();
+    }
+    clearEstimate() { this.estHistory = []; }
+    clearSanity()   { this.sanityHistory = []; }
+
     // --- Tuning mode ---
     startRun(target) {
         this.currentRun = { times: [], vals: [], vsets: [], target, startTime: Date.now() };
@@ -161,6 +177,10 @@ class TelemetryChart {
         if (this.targetHistory.length >= 2)
             this._drawLine(this.targetHistory, 'rgba(255,255,255,0.35)', true, 1.5);
         this._drawLine(this.history, this.color, false, 2);
+        if (this.estHistory    && this.estHistory.length    >= 2)
+            this._drawLine(this.estHistory,    '#00ff88', false, 1.8);   /* KF estimate (lime) */
+        if (this.sanityHistory && this.sanityHistory.length >= 2)
+            this._drawLine(this.sanityHistory, 'rgba(255,200,0,0.7)', true, 1.5); /* model sanity (amber dash) */
 
         ctx.fillStyle = this.color;
         ctx.font = 'bold 11px "JetBrains Mono"';
@@ -221,11 +241,13 @@ class TelemetryChart {
             ctx.fillText(s + 's', x + 2, height - 2);
         }
 
-        // Ghost runs (older = more faded). Skip in scroll mode because their
-        // local times don't align with the scrolling window.
-        const runAlphas = [0.05, 0.12, 0.22];
+        // Ghost runs. Most recent gets a clearly visible alpha so it can be
+        // compared against the live trace; older runs fade out. Index 0 is
+        // the oldest run, length-1 is the most recent.
+        const lastIdx = this.tuningRuns.length - 1;
+        const alphaFor = (ri) => (ri === lastIdx) ? 0.55 : (ri === lastIdx - 1 ? 0.25 : 0.10);
         if (!scrolling) this.tuningRuns.forEach((run, ri) => {
-            const alpha = runAlphas[Math.min(ri, runAlphas.length - 1)];
+            const alpha = alphaFor(ri);
             const col = this._hexToRgba(this.color, alpha);
             this._drawTuningLine(run.times, run.vals, maxT, col, false, 1.5, width, height, range, minV, maxV, minT);
 

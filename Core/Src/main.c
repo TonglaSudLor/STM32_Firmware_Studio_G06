@@ -25,6 +25,8 @@
 #include "modbus_bridge.h"
 #include "telemetry_hub.h"
 #include "hw_io.h"
+#include "kalman.h"
+#include "params.h"
 #include <string.h>
 #include <stdio.h>
 /* USER CODE END Includes */
@@ -53,6 +55,7 @@ UART_HandleTypeDef huart3;
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim7;
 TIM_HandleTypeDef htim16;
 
 /* USER CODE BEGIN PV */
@@ -73,6 +76,7 @@ static void MX_USART3_UART_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM6_Init(void);
+static void MX_TIM7_Init(void);
 static void MX_TIM16_Init(void);
 /* USER CODE BEGIN PFP */
 
@@ -188,6 +192,7 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM3_Init();
   MX_TIM6_Init();
+  MX_TIM7_Init();
   MX_TIM16_Init();
   /* USER CODE BEGIN 2 */
   /* Force LPUART1 to JOYSTICK/Dashboard mode (115200 8N1) on boot regardless
@@ -204,6 +209,8 @@ int main(void)
   Motor_SetMotionProfile(250.0f, 500.0f, 0.1f);
   ModbusBridge_Init();
   Telemetry_Init(&hlpuart1);
+  Kalman_Init();
+  HAL_TIM_Base_Start_IT(&htim7);   /* fires HAL_TIM_PeriodElapsedCallback at 1 kHz */
 
   HAL_UART_Receive_IT(&hlpuart1, (uint8_t*)&modbus_rx_byte, 1);
   HAL_UART_Receive_IT(&huart3, (uint8_t*)&rx_byte, 1);
@@ -579,6 +586,27 @@ static void MX_TIM3_Init(void)
   * @param None
   * @retval None
   */
+static void MX_TIM7_Init(void)
+{
+  /* 170 MHz / (170 * 1000) = 1 kHz tick for the Kalman filter.
+   * IMPORTANT: clock + NVIC must be set up BEFORE HAL_TIM_Base_Init touches
+   * the TIM7 registers, otherwise the writes hit a dead peripheral. */
+  __HAL_RCC_TIM7_CLK_ENABLE();
+  HAL_NVIC_SetPriority(TIM7_DAC_IRQn, 2, 0);  /* below TIM6 (0) and UART (0) so RX is never starved */
+  HAL_NVIC_EnableIRQ(TIM7_DAC_IRQn);
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  htim7.Instance = TIM7;
+  htim7.Init.Prescaler = 169;
+  htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim7.Init.Period = 999;
+  htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim7) != HAL_OK) { Error_Handler(); }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK) { Error_Handler(); }
+}
+
 static void MX_TIM6_Init(void)
 {
 
@@ -766,6 +794,14 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM6) {
     Motor_ControlLoop();
+  } else if (htim->Instance == TIM7) {
+    /* 1 kHz Kalman filter tick. u is derived from the last applied PWM
+     * duty cycle; measurement is the encoder angle in radians. */
+    extern volatile float current_pwm;
+    float u = (current_pwm / 100.0f) * SUPPLY_VOLTAGE;
+    float theta_rad = encoder.current_position_deg * (3.14159265f / 180.0f);
+    Kalman_SanityTick(u);
+    Kalman_Tick(u, theta_rad);
   } else if (htim->Instance == TIM16) {
     /* Modbus RTU T3.5 silence timeout — signal that a frame has ended */
     ModbusBridge_TimerCallback();

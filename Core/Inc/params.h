@@ -74,4 +74,33 @@
 #define HOMING_CREEP_RPM     3.0f    /**< Speed for fine edge detection */
 #define HOMING_MAX_WIGGLE    180.0f  /**< Max search amplitude to protect cables */
 
+/* ============================================================================
+ * MOTOR PHYSICAL MODEL (System Identification)
+ * Used by the Kalman filter. All mechanical terms are referred to the
+ * OUTPUT SHAFT (where the encoder is mounted). Electrical terms are at the
+ * motor terminals.
+ * ============================================================================ */
+#define MOT_R_ARM       1.4534f     /**< Armature resistance (Ohm) */
+#define MOT_L_ARM       0.001448f   /**< Armature inductance (H) */
+#define MOT_K_E         0.04165f    /**< Back-EMF constant (V·s/rad, motor shaft) */
+#define MOT_K_T         0.04065f    /**< Torque constant (N·m/A, motor shaft) */
+#define MOT_B_VISC      0.19279f    /**< Viscous damping at output (N·m·s/rad) */
+#define MOT_J_INERTIA   0.72762f    /**< Total inertia at output (kg·m^2) */
+#define MOT_N_GEAR      70.0f       /**< Total gear ratio (motor / output) */
+#define MOT_ETA_GB      0.836f      /**< Gearbox efficiency */
+
+/* ============================================================================
+ * KALMAN FILTER
+ * State x = [theta, omega, tau_L, i_a] in output-shaft frame.
+ * Encoder bin = 360°/8192 ≈ 0.04395° ≈ 7.67e-4 rad.
+ * R_default = bin^2 / 12 ≈ 4.9e-8 rad^2.
+ * Q_c (continuous) is diagonal; the four sigma values are tunable live.
+ * ============================================================================ */
+#define KF_DT               0.001f       /**< KF tick = 1 kHz on TIM7 */
+#define KF_R_DEFAULT        4.9e-8f      /**< Encoder quantization variance (rad^2) */
+#define KF_SIGMA_THETA_DEF  1.0e-3f      /**< sqrt(Qc[0,0]) — position drift (rad/sqrt(s)) */
+#define KF_SIGMA_OMEGA_DEF  1.0e-1f      /**< sqrt(Qc[1,1]) — unmodeled friction (rad/s/sqrt(s)) */
+#define KF_SIGMA_TAU_DEF    5.0e-1f      /**< sqrt(Qc[2,2]) — load-torque random walk (N·m/sqrt(s)) */
+#define KF_SIGMA_I_DEF      5.0e-1f      /**< sqrt(Qc[3,3]) — voltage/PWM imperfections (A/sqrt(s)) */
+
 #endif /* PARAMS_H */

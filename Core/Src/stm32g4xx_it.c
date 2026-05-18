@@ -274,6 +274,15 @@ void TIM6_DAC_IRQHandler(void)
 }
 
 /**
+  * @brief This function handles TIM7 global / DAC2&4 underrun interrupts (Kalman filter tick).
+  */
+void TIM7_DAC_IRQHandler(void)
+{
+  extern TIM_HandleTypeDef htim7;
+  HAL_TIM_IRQHandler(&htim7);
+}
+
+/**
   * @brief This function handles LPUART1 global interrupt.
   */
 void LPUART1_IRQHandler(void)
