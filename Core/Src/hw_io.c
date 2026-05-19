@@ -105,6 +105,9 @@ void HW_RefreshIO(void)
             /* Emergency Pressed: Safe the system immediately */
             emergency_stop = true;
             fault_code |= FAULT_ESTOP_PHYSICAL;
+            /* Motor relay is about to open, encoder loses power → position
+             * cannot be trusted after recovery. Force a re-home. */
+            position_unknown = true;
         } else if (hw.in_reset_btn) {
             /* Reset Pressed AND Emergency is Released: Enter Ready state */
             emergency_stop = false;
@@ -123,8 +126,11 @@ void HW_RefreshIO(void)
         }
     } else {
         /* In override mode, still update emergency_stop flag but don't force outputs */
-        if (hw.in_estop) { emergency_stop = true; fault_code |= FAULT_ESTOP_PHYSICAL; }
-        else if (hw.in_reset_btn) emergency_stop = false;
+        if (hw.in_estop) {
+            emergency_stop = true;
+            fault_code |= FAULT_ESTOP_PHYSICAL;
+            position_unknown = true;
+        } else if (hw.in_reset_btn) emergency_stop = false;
     }
 
     /* --- Update Mode lamp if not overridden --- */
@@ -148,6 +154,7 @@ void HW_EStop_Trigger(void)
     if (!emergency_stop) {
         emergency_stop = true;
         fault_code |= FAULT_ESTOP_PHYSICAL;
+        position_unknown = true;
         Motor_SendAudioCommand('E');
     }
     apply_outputs();

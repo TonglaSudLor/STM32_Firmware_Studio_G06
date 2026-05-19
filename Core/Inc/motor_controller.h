@@ -187,6 +187,7 @@ extern volatile int tuning_progress;
 extern volatile Motor_TuningParams_t tuning;
 extern volatile bool is_joystick_connected;
 extern volatile bool emergency_stop;
+extern volatile bool position_unknown;
 extern volatile bool position_loop_enabled;
 extern volatile bool  sine_test_enabled;
 extern volatile float sine_amp_rpm;

@@ -30,6 +30,12 @@ volatile int tuning_progress = 0;
 volatile Motor_TuningParams_t tuning;
 volatile bool is_joystick_connected = false;
 volatile bool emergency_stop = true;
+/* Set to true when the physical (hardware) E-Stop fires — the motor relay
+ * opens, which cuts power to the encoder too, so the TIM3 quadrature count
+ * cannot be trusted across the outage. On recovery, the firmware ignores the
+ * normal "return to original_home_offset_deg" path and forces a re-homing
+ * sequence instead. Cleared once homing has been triggered. */
+volatile bool position_unknown = false;
 /* When false, the outer position PID is bypassed and the velocity PID is fed
  * the S-curve velocity setpoint directly. Use this to tune the inner loop
  * in isolation. Trajectory generator (and so v_ref / a_ref feedforward) still runs. */
@@ -995,11 +1001,23 @@ void Motor_ControlLoop(void)
 
     // Check if E-Stop just cleared
     if (last_emergency_stop && !emergency_stop) {
-        // Automatically return to origin home (proximity sensor home)
-        current_mode = MOTOR_MODE_POSITION;
-        trajectory.target_pos = original_home_offset_deg;
-        Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
-        printf("[SAFETY] E-Stop Cleared. Returning to Origin Home (%.2f)\r\n", original_home_offset_deg);
+        if (position_unknown) {
+            /* Recovery from a physical (hardware) E-stop: motor relay was
+             * open, encoder lost power, TIM3 quadrature counts are stale.
+             * Don't trust current_position_deg — kick off a re-home. */
+            position_unknown = false;
+            current_mode = MOTOR_MODE_POSITION;
+            trigger_homing_sequence = true;
+            Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
+            printf("[SAFETY] Physical E-Stop cleared — position unknown, re-homing.\r\n");
+        } else {
+            /* Soft E-stop: motor stayed powered, encoder count is still
+             * trustworthy. Just slew back to the saved origin home. */
+            current_mode = MOTOR_MODE_POSITION;
+            trajectory.target_pos = original_home_offset_deg;
+            Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
+            printf("[SAFETY] E-Stop Cleared. Returning to Origin Home (%.2f)\r\n", original_home_offset_deg);
+        }
     }
     last_emergency_stop = emergency_stop;
     
