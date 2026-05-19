@@ -50,7 +50,8 @@
                         <span id="stat-mode" class="value">---</span>
                     </div>
                     <div class="status-item">
-                        <label>Faults <button id="btn-fault-info" class="info-btn" title="Fault details & safety config">ℹ</button></label>
+                        <label>Faults <button id="btn-fault-info" class="info-btn"
+                                title="Fault details & safety config">ℹ</button></label>
                         <span id="stat-fault" class="value ok">None</span>
                     </div>
                     <div class="status-item">
@@ -126,22 +127,34 @@
                     <div class="metric-block">
                         <h4>POSITION</h4>
                         <div class="metric-row">
-                            <div class="metric-item"><label>Settling</label><span id="m-pos-settle" class="metric-val">--</span></div>
-                            <div class="metric-item"><label>Overshoot</label><span id="m-pos-over" class="metric-val">--</span></div>
+                            <div class="metric-item"><label>Settling</label><span id="m-pos-settle"
+                                    class="metric-val">--</span></div>
+                            <div class="metric-item"><label>Overshoot</label><span id="m-pos-over"
+                                    class="metric-val">--</span></div>
                         </div>
                     </div>
                     <div class="metric-block">
                         <h4>VELOCITY</h4>
                         <div class="metric-row">
-                            <div class="metric-item"><label>Settling</label><span id="m-vel-settle" class="metric-val">--</span></div>
-                            <div class="metric-item"><label>Overshoot</label><span id="m-vel-over" class="metric-val">--</span></div>
+                            <div class="metric-item"><label>Settling</label><span id="m-vel-settle"
+                                    class="metric-val">--</span></div>
+                            <div class="metric-item"><label>Overshoot</label><span id="m-vel-over"
+                                    class="metric-val">--</span></div>
                         </div>
                     </div>
                 </div>
                 <div class="metrics-history-section">
                     <h4>Run History</h4>
                     <table class="metrics-table">
-                        <thead><tr><th>#</th><th>Pos.Set(s)</th><th>Pos.OS%</th><th>Vel.Set(s)</th><th>Vel.OS%</th></tr></thead>
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Pos.Set(s)</th>
+                                <th>Pos.OS%</th>
+                                <th>Vel.Set(s)</th>
+                                <th>Vel.OS%</th>
+                            </tr>
+                        </thead>
                         <tbody id="metrics-history-body"></tbody>
                     </table>
                 </div>
@@ -226,7 +239,9 @@
                     <div class="tuning-section">
                         <div class="section-head-row">
                             <h4>PID Position Loop</h4>
-                            <button id="btn-pos-loop" class="toggle-btn active" title="Disable to tune the velocity loop in isolation. Trajectory generator still runs and feeds the velocity loop directly.">Loop: ON</button>
+                            <button id="btn-pos-loop" class="toggle-btn active"
+                                title="Disable to tune the velocity loop in isolation. Trajectory generator still runs and feeds the velocity loop directly.">Loop:
+                                ON</button>
                         </div>
                         <div class="input-row">
                             <div class="input-group"><label>Kp</label><input type="number" id="input-pos-kp" step="0.1"
@@ -239,15 +254,21 @@
                     </div>
 
                     <div class="tuning-section">
-                        <h4>Motion Limits</h4>
+                        <h4>S-Curve</h4>
                         <div class="input-row">
-                            <div class="input-group"><label>Max Accel</label><input type="number" id="input-max-accel"
-                                    step="10" value="2000"></div>
+                            <div class="input-group"><label>v_max [rad/s]</label><input type="number"
+                                    id="input-vmax-rad" step="0.1" value="7.304"></div>
+                            <div class="input-group"><label>a_max [rad/s²]</label><input type="number"
+                                    id="input-amax-rad" step="0.1" value="27.49"></div>
+                        </div>
+                        <div class="input-row">
+                            <div class="input-group"><label>j_max [rad/s³]</label><input type="number"
+                                    id="input-jmax-rad" step="10" value="1400"></div>
                             <div class="input-group"><label>Min PWM</label><input type="number" id="input-min-pwm"
                                     step="0.5" value="0.0"></div>
                         </div>
-                        <div class="input-group"><label>Home Speed</label><input type="number" id="input-home-speed"
-                                step="5" value="30"></div>
+                        <div class="input-group"><label>Home Speed (RPM)</label><input type="number"
+                                id="input-home-speed" step="5" value="30"></div>
                     </div>
 
                     <div class="tuning-section">
@@ -255,8 +276,7 @@
                         <div class="input-row">
                             <div class="input-group"><label>Fine RPM</label><input type="number" id="input-jog-fine"
                                     step="1" value="10"></div>
-                            <div class="input-group"><label>Coarse RPM</label><input type="number"
-                                    id="input-move-coarse" step="5" value="100"></div>
+                            <div class="input-group" style="visibility:hidden"></div>
                         </div>
                         <div class="input-row">
                             <div class="input-group"><label>Step (C)</label><input type="number" id="input-step-coarse"
@@ -277,19 +297,24 @@
                         <label>Target Pos</label>
                         <div class="flex-row target-input-row">
                             <input type="range" id="range-target" min="0" max="180" value="0">
-                            <button id="btn-negate-target" class="toggle-btn" style="width:32px; padding:4px;">±</button>
+                            <button id="btn-negate-target" class="toggle-btn"
+                                style="width:32px; padding:4px;">±</button>
                             <input type="number" id="input-target" min="0" max="180" value="0">
                             <button id="btn-set-target" class="primary-btn sm">Move</button>
                         </div>
                     </div>
 
                     <div class="input-group" id="sine-gen-group" style="display:none">
-                        <label>Sine Wave Generator <span style="color:var(--accent-red);font-weight:normal">(velocity-loop test)</span></label>
+                        <label>Sine Wave Generator <span
+                                style="color:var(--accent-red);font-weight:normal">(velocity-loop test)</span></label>
                         <div class="input-row">
-                            <div class="input-group"><label>Amplitude (RPM)</label><input type="number" id="input-sine-amp" step="1" value="30"></div>
-                            <div class="input-group"><label>Frequency (Hz)</label><input type="number" id="input-sine-freq" step="0.1" min="0" value="0.5"></div>
+                            <div class="input-group"><label>Amplitude (RPM)</label><input type="number"
+                                    id="input-sine-amp" step="1" value="30"></div>
+                            <div class="input-group"><label>Frequency (Hz)</label><input type="number"
+                                    id="input-sine-freq" step="0.1" min="0" value="0.5"></div>
                         </div>
-                        <button id="btn-sine-toggle" class="primary-btn sm" style="width:100%;margin-top:6px">Start Sine</button>
+                        <button id="btn-sine-toggle" class="primary-btn sm" style="width:100%;margin-top:6px">Start
+                            Sine</button>
                     </div>
 
                     <div class="toggle-group manual-extra">
@@ -315,8 +340,11 @@
                     <h3>Kalman Filter</h3>
                     <div class="kf-head-buttons">
                         <button id="btn-kf-toggle" class="toggle-btn">KF: OFF</button>
-                        <button id="btn-kf-reset" class="toggle-btn" title="Re-anchor estimate to current encoder reading">Reset</button>
-                        <button id="btn-kf-sanity" class="toggle-btn" title="Overlay the open-loop model prediction to verify motor parameters">Model: OFF</button>
+                        <button id="btn-kf-reset" class="toggle-btn"
+                            title="Re-anchor estimate to current encoder reading">Reset</button>
+                        <button id="btn-kf-sanity" class="toggle-btn"
+                            title="Overlay the open-loop model prediction to verify motor parameters">Model:
+                            OFF</button>
                     </div>
                 </div>
 
@@ -325,30 +353,39 @@
                     <div class="kf-state-item"><label>ω̂ (RPM)</label><span id="kf-omega" class="value">--</span></div>
                     <div class="kf-state-item"><label>τ̂_L (N·m)</label><span id="kf-tau" class="value">--</span></div>
                     <div class="kf-state-item"><label>î_a (A)</label><span id="kf-ia" class="value">--</span></div>
-                    <div class="kf-state-item small"><label>Innov.</label><span id="kf-innov" class="value">--</span></div>
+                    <div class="kf-state-item small"><label>Innov.</label><span id="kf-innov" class="value">--</span>
+                    </div>
                     <div class="kf-state-item small"><label>P00</label><span id="kf-p00" class="value">--</span></div>
                     <div class="kf-state-item small"><label>P11</label><span id="kf-p11" class="value">--</span></div>
                     <div class="kf-state-item small"><label>P22</label><span id="kf-p22" class="value">--</span></div>
                 </div>
 
                 <div class="kf-rmse-row">
-                    <div class="rmse-cell"><label>RMSE θ̂ vs meas</label><span id="kf-rmse-theta" class="value">--</span></div>
-                    <div class="rmse-cell"><label>RMSE ω̂ vs filt</label><span id="kf-rmse-omega" class="value">--</span></div>
+                    <div class="rmse-cell"><label>RMSE θ̂ vs meas</label><span id="kf-rmse-theta"
+                            class="value">--</span></div>
+                    <div class="rmse-cell"><label>RMSE ω̂ vs filt</label><span id="kf-rmse-omega"
+                            class="value">--</span></div>
                 </div>
 
                 <details class="kf-tune">
                     <summary>Q / R tuning</summary>
                     <div class="input-row">
-                        <div class="input-group"><label>σ θ (rad/√s)</label><input type="number" id="input-kf-q-theta" step="0.001" value="0.001"></div>
-                        <div class="input-group"><label>σ ω (rad/s/√s)</label><input type="number" id="input-kf-q-omega" step="0.01" value="0.1"></div>
+                        <div class="input-group"><label>σ θ (rad/√s)</label><input type="number" id="input-kf-q-theta"
+                                step="0.001" value="0.001"></div>
+                        <div class="input-group"><label>σ ω (rad/s/√s)</label><input type="number" id="input-kf-q-omega"
+                                step="0.01" value="0.1"></div>
                     </div>
                     <div class="input-row">
-                        <div class="input-group"><label>σ τ (N·m/√s)</label><input type="number" id="input-kf-q-tau" step="0.05" value="0.5"></div>
-                        <div class="input-group"><label>σ i (A/√s)</label><input type="number" id="input-kf-q-i" step="0.05" value="0.5"></div>
+                        <div class="input-group"><label>σ τ (N·m/√s)</label><input type="number" id="input-kf-q-tau"
+                                step="0.05" value="0.5"></div>
+                        <div class="input-group"><label>σ i (A/√s)</label><input type="number" id="input-kf-q-i"
+                                step="0.05" value="0.5"></div>
                     </div>
                     <div class="input-row">
-                        <div class="input-group"><label>R (rad²)</label><input type="number" id="input-kf-r" step="1e-9" value="4.9e-8"></div>
-                        <div class="input-group" style="align-self:flex-end"><button id="btn-kf-apply-noise" class="secondary-btn">Apply Q/R</button></div>
+                        <div class="input-group"><label>R (rad²)</label><input type="number" id="input-kf-r" step="1e-9"
+                                value="4.9e-8"></div>
+                        <div class="input-group" style="align-self:flex-end"><button id="btn-kf-apply-noise"
+                                class="secondary-btn">Apply Q/R</button></div>
                     </div>
                 </details>
             </div>
@@ -395,7 +432,8 @@
                             <strong>Triggers when (either):</strong>
                             <ul>
                                 <li><b>Phase inversion:</b> PWM &gt; 50% one way, RPM &gt; 5 RPM the other way</li>
-                                <li><b>Signal loss:</b> PWM &gt; 50%, RPM near 0, encoder counts frozen for 1 second</li>
+                                <li><b>Signal loss:</b> PWM &gt; 50%, RPM near 0, encoder counts frozen for 1 second
+                                </li>
                             </ul>
                             <em>Cause:</em> encoder cable disconnected, A/B swapped, or hardware fault.
                         </div>
@@ -460,19 +498,24 @@
             <div class="modal-section" id="sim-delays-section">
                 <h4>Simulation Delays (ms)</h4>
                 <div class="input-row">
-                    <div class="input-group"><label>Open</label><input type="number" id="delay-open" value="600" step="100" min="0"></div>
-                    <div class="input-group"><label>Close</label><input type="number" id="delay-close" value="600" step="100" min="0"></div>
+                    <div class="input-group"><label>Open</label><input type="number" id="delay-open" value="600"
+                            step="100" min="0"></div>
+                    <div class="input-group"><label>Close</label><input type="number" id="delay-close" value="600"
+                            step="100" min="0"></div>
                 </div>
                 <div class="input-row" style="margin-top:0.5rem">
-                    <div class="input-group"><label>Up</label><input type="number" id="delay-up" value="600" step="100" min="0"></div>
-                    <div class="input-group"><label>Down</label><input type="number" id="delay-down" value="600" step="100" min="0"></div>
+                    <div class="input-group"><label>Up</label><input type="number" id="delay-up" value="600" step="100"
+                            min="0"></div>
+                    <div class="input-group"><label>Down</label><input type="number" id="delay-down" value="600"
+                            step="100" min="0"></div>
                 </div>
             </div>
             <div class="modal-section" id="real-sensor-info" style="display:none">
                 <h4>Real Sensor Info</h4>
                 <div class="real-sensor-desc">
                     Each gripper action waits for the corresponding reed switch to confirm before proceeding.<br><br>
-                    <span class="pin-table">PB0 = Up &nbsp;|&nbsp; PA4 = Down &nbsp;|&nbsp; PA1 = Close &nbsp;|&nbsp; PA0 = Open</span><br><br>
+                    <span class="pin-table">PB0 = Up &nbsp;|&nbsp; PA4 = Down &nbsp;|&nbsp; PA1 = Close &nbsp;|&nbsp;
+                        PA0 = Open</span><br><br>
                     Timeout: 3000 ms (firmware <code>REED_SW_TIMEOUT_MS</code>)
                 </div>
             </div>

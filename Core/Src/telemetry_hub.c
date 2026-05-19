@@ -102,11 +102,12 @@ void Telemetry_Update(void) {
         last_slow_sync_tick = now;
         len = snprintf(tx_buffer, TX_BUFFER_SIZE,
             "$SKP:%.3f,SKI:%.3f,SKD:%.3f,KVFF:%.3f,KAFF:%.3f,PKP:%.3f,PKI:%.3f,PKD:%.3f,"
-            "VMAX:%.1f,AMAX:%.1f,STEPC:%.1f,STEPF:%.1f,JOGF:%.1f,HOMES:%.1f,MINP:%.1f,PLOOP:%d*",
+            "VMAX:%.2f,AMAX:%.2f,JMAX:%.1f,STEPC:%.1f,STEPF:%.1f,JOGF:%.1f,HOMES:%.1f,MINP:%.1f,PLOOP:%d*",
             tuning.speed_Kp, tuning.speed_Ki, tuning.speed_Kd,
             tuning.K_vff, tuning.K_aff,
             tuning.pos_Kp, tuning.pos_Ki, tuning.pos_Kd,
-            tuning.move_speed_coarse, tuning.max_accel, tuning.step_size_coarse,
+            tuning.move_speed_coarse, tuning.max_accel, tuning.max_jerk,
+            tuning.step_size_coarse,
             tuning.step_size_fine, tuning.jog_speed_fine, tuning.move_speed_return_home, tuning.min_pwm,
             position_loop_enabled ? 1 : 0);
             
@@ -234,6 +235,11 @@ static void Telemetry_HandleSet(char *payload) {
             else if (strcmp(key, "K_AFF")    == 0) tuning.K_aff    = val;
             else if (strcmp(key, "V_MAX") == 0 || strcmp(key, "MOVE_COARSE") == 0) tuning.move_speed_coarse = val;
             else if (strcmp(key, "A_MAX") == 0 || strcmp(key, "MAX_ACCEL") == 0) tuning.max_accel = val;
+            else if (strcmp(key, "J_MAX") == 0 || strcmp(key, "MAX_JERK") == 0) tuning.max_jerk = val;
+            /* SI-unit alternatives (rad/s, rad/s², rad/s³). 1 rad/s = 60/(2π) RPM ≈ 9.5493. */
+            else if (strcmp(key, "V_MAX_RAD") == 0) tuning.move_speed_coarse = val * (60.0f / (2.0f * 3.14159265f));
+            else if (strcmp(key, "A_MAX_RAD") == 0) tuning.max_accel         = val * (60.0f / (2.0f * 3.14159265f));
+            else if (strcmp(key, "J_MAX_RAD") == 0) tuning.max_jerk          = val * (60.0f / (2.0f * 3.14159265f));
             else if (strcmp(key, "STEP_COARSE") == 0) tuning.step_size_coarse = val;
             else if (strcmp(key, "STEP_FINE") == 0) tuning.step_size_fine = val;
             else if (strcmp(key, "MIN_PWM") == 0) tuning.min_pwm = val;

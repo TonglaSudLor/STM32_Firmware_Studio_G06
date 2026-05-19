@@ -212,88 +212,252 @@ static void Encoder_Update(void)
     encoder.filtered_rpm = (0.15f * instant_rpm) + (0.85f * encoder.filtered_rpm);
 }
 
-/**
- * @brief Update trajectory setpoints for smooth movement using S-Curve profile
- * 
- * This implementation uses a 3rd order trajectory (jerk-limited) to ensure 
- * smooth transitions between acceleration and constant velocity phases.
- */
+/* ============================================================================
+ * 7-Segment S-Curve Trajectory Generator
+ *
+ * Each move is pre-planned analytically into seven phases:
+ *   1. J+   jerk up        (a: 0 → +a_peak)
+ *   2. A+   const accel
+ *   3. J-   jerk down      (a: +a_peak → 0,  v reaches v_peak)
+ *   4. V    const velocity cruise
+ *   5. J-   jerk down      (a: 0 → -a_peak)
+ *   6. A-   const decel
+ *   7. J+   jerk up        (a: -a_peak → 0,  v reaches 0 at target)
+ *
+ * The planner handles three reduced cases automatically:
+ *   - Triangular A profile (move too short to reach a_max)
+ *   - Triangular V profile (move too short to reach v_max)
+ *   - Triangular A+V profile (very short move)
+ *
+ * Units inside the planner: degrees, deg/s, deg/s², deg/s³. Convert at the
+ * boundary with the rest of the firmware (RPM, RPM/s, RPM/s²) by ×6 / ÷6.
+ * ========================================================================== */
+
+typedef struct {
+    bool   active;
+    int8_t direction;          /* +1 forward, -1 reverse */
+    float  pos_start_deg;
+    float  pos_target_deg;     /* target snapshot at plan time */
+    float  distance;           /* |target - start|, degrees */
+    float  t_elapsed;          /* seconds since plan began */
+    /* Phase durations (seconds) */
+    float  T_j, T_a, T_v;
+    /* Achieved peaks (may be < limits for short moves) */
+    float  a_peak_dps2;
+    float  v_peak_dps;
+    float  jmax_dps3;
+    /* Cumulative time boundaries */
+    float  t1, t2, t3, t4, t5, t6, t7;
+    /* Pre-computed state at boundaries (relative pos, deg-positive) */
+    float  v1_dps, v2_dps;
+    float  p1_deg, p2_deg, p3_deg, p4_deg, p5_deg, p6_deg;
+} SCurvePlan_t;
+
+static SCurvePlan_t s_plan = {0};
+
+/* Conversion helpers — firmware is in RPM/RPM/s/RPM/s², planner is in
+ * deg/s, deg/s², deg/s³. 1 RPM = 6 deg/s. */
+#define RPM_TO_DPS    6.0f
+#define DPS_TO_RPM   (1.0f / 6.0f)
+
+static void scurve_plan(float pos_start, float pos_target,
+                        float vmax_dps, float amax_dps2, float jmax_dps3)
+{
+    s_plan.t_elapsed       = 0.0f;
+    s_plan.pos_start_deg   = pos_start;
+    s_plan.pos_target_deg  = pos_target;
+    s_plan.distance        = fabsf(pos_target - pos_start);
+    s_plan.direction       = (pos_target >= pos_start) ? +1 : -1;
+    s_plan.jmax_dps3       = jmax_dps3;
+
+    /* Trivial moves: already there or bad limits → flat plan */
+    if (s_plan.distance < 0.001f ||
+        vmax_dps   <= 0.0f ||
+        amax_dps2  <= 0.0f ||
+        jmax_dps3  <= 0.0f)
+    {
+        s_plan.T_j = s_plan.T_a = s_plan.T_v = 0.0f;
+        s_plan.a_peak_dps2 = 0.0f;
+        s_plan.v_peak_dps  = 0.0f;
+        s_plan.t1 = s_plan.t2 = s_plan.t3 = s_plan.t4 =
+        s_plan.t5 = s_plan.t6 = s_plan.t7 = 0.0f;
+        s_plan.active = false;
+        return;
+    }
+
+    /* Step 1: can the accel ramp reach a_max within the available v_max? */
+    float T_j_full = amax_dps2 / jmax_dps3;
+    float v_after_full_jerks = amax_dps2 * T_j_full;     /* = a²/j, both jerk phases combined */
+
+    float T_j, T_a, a_peak, v_peak;
+    if (vmax_dps >= v_after_full_jerks) {
+        /* Yes — accel reaches a_max */
+        T_j   = T_j_full;
+        a_peak = amax_dps2;
+        T_a    = vmax_dps / amax_dps2 - T_j;             /* ≥ 0 */
+        v_peak = vmax_dps;                                /* tentative */
+    } else {
+        /* No — triangular A profile, a_peak < a_max */
+        a_peak = sqrtf(vmax_dps * jmax_dps3);
+        T_j    = a_peak / jmax_dps3;
+        T_a    = 0.0f;
+        v_peak = vmax_dps;
+    }
+
+    /* Step 2: does the move have room for a V cruise? */
+    float d_accel = v_peak * (2.0f * T_j + T_a) * 0.5f;
+    float T_v;
+    if (2.0f * d_accel <= s_plan.distance) {
+        /* Trapezoidal V profile */
+        T_v = (s_plan.distance - 2.0f * d_accel) / v_peak;
+    } else {
+        /* No cruise. Recompute v_peak for triangular V. */
+        T_v = 0.0f;
+
+        /* Try: still reach a_max — solve  d = v_p·T_j + v_p²/a_max */
+        float aTj  = amax_dps2 * T_j_full;
+        float disc = aTj * aTj + 4.0f * amax_dps2 * s_plan.distance;
+        float v_try = (-aTj + sqrtf(disc)) * 0.5f;
+
+        if (v_try >= v_after_full_jerks) {
+            /* Still reaches a_max */
+            v_peak = v_try;
+            a_peak = amax_dps2;
+            T_j    = T_j_full;
+            T_a    = v_peak / amax_dps2 - T_j;
+        } else {
+            /* Triangular A AND V: d = 2·v·sqrt(v/j) → v = (d²·j/4)^(1/3) */
+            float d_sq = s_plan.distance * s_plan.distance;
+            v_peak = powf(d_sq * jmax_dps3 * 0.25f, 1.0f / 3.0f);
+            a_peak = sqrtf(v_peak * jmax_dps3);
+            T_j    = a_peak / jmax_dps3;
+            T_a    = 0.0f;
+        }
+    }
+
+    /* Store */
+    s_plan.T_j         = T_j;
+    s_plan.T_a         = T_a;
+    s_plan.T_v         = T_v;
+    s_plan.a_peak_dps2 = a_peak;
+    s_plan.v_peak_dps  = v_peak;
+
+    /* Boundary times */
+    s_plan.t1 = T_j;
+    s_plan.t2 = s_plan.t1 + T_a;
+    s_plan.t3 = s_plan.t2 + T_j;
+    s_plan.t4 = s_plan.t3 + T_v;
+    s_plan.t5 = s_plan.t4 + T_j;
+    s_plan.t6 = s_plan.t5 + T_a;
+    s_plan.t7 = s_plan.t6 + T_j;
+
+    /* Pre-compute relative state at each boundary to avoid recomputing every tick */
+    s_plan.v1_dps = 0.5f * jmax_dps3 * T_j * T_j;                                                            /* end of J+ */
+    s_plan.v2_dps = s_plan.v1_dps + a_peak * T_a;                                                            /* end of A+ */
+    s_plan.p1_deg = jmax_dps3 * T_j * T_j * T_j / 6.0f;
+    s_plan.p2_deg = s_plan.p1_deg + s_plan.v1_dps * T_a + 0.5f * a_peak * T_a * T_a;
+    s_plan.p3_deg = s_plan.p2_deg + s_plan.v2_dps * T_j + 0.5f * a_peak * T_j * T_j
+                                    - jmax_dps3 * T_j * T_j * T_j / 6.0f;
+    s_plan.p4_deg = s_plan.p3_deg + v_peak * T_v;
+    s_plan.p5_deg = s_plan.p4_deg + v_peak * T_j - jmax_dps3 * T_j * T_j * T_j / 6.0f;
+    s_plan.p6_deg = s_plan.p5_deg + s_plan.v2_dps * T_a - 0.5f * a_peak * T_a * T_a;
+
+    s_plan.active = true;
+}
+
+/* Evaluate the plan at time t. Outputs are RELATIVE (always non-negative pos,
+ * always non-negative vel/accel during accel phase). The caller applies sign
+ * via plan.direction. */
+static void scurve_eval(float t, float *p_rel, float *v_dps, float *a_dps2)
+{
+    float T_j   = s_plan.T_j;
+    float a_pk  = s_plan.a_peak_dps2;
+    float v_pk  = s_plan.v_peak_dps;
+    float jmax  = s_plan.jmax_dps3;
+
+    if (t <= 0.0f)             { *p_rel = 0.0f;              *v_dps = 0.0f; *a_dps2 = 0.0f; return; }
+    if (t >= s_plan.t7)        { *p_rel = s_plan.distance;   *v_dps = 0.0f; *a_dps2 = 0.0f; return; }
+
+    if (t < s_plan.t1) {                                /* J+ */
+        *a_dps2 =        jmax * t;
+        *v_dps  = 0.5f * jmax * t * t;
+        *p_rel  =        jmax * t * t * t / 6.0f;
+    } else if (t < s_plan.t2) {                         /* A+ */
+        float dt = t - s_plan.t1;
+        *a_dps2 = a_pk;
+        *v_dps  = s_plan.v1_dps + a_pk * dt;
+        *p_rel  = s_plan.p1_deg + s_plan.v1_dps * dt + 0.5f * a_pk * dt * dt;
+    } else if (t < s_plan.t3) {                         /* J- (still in accel half) */
+        float dt = t - s_plan.t2;
+        *a_dps2 = a_pk - jmax * dt;
+        *v_dps  = s_plan.v2_dps + a_pk * dt - 0.5f * jmax * dt * dt;
+        *p_rel  = s_plan.p2_deg + s_plan.v2_dps * dt + 0.5f * a_pk * dt * dt
+                                  - jmax * dt * dt * dt / 6.0f;
+    } else if (t < s_plan.t4) {                         /* V cruise */
+        float dt = t - s_plan.t3;
+        *a_dps2 = 0.0f;
+        *v_dps  = v_pk;
+        *p_rel  = s_plan.p3_deg + v_pk * dt;
+    } else if (t < s_plan.t5) {                         /* J- (decel side) */
+        float dt = t - s_plan.t4;
+        *a_dps2 = -jmax * dt;
+        *v_dps  =  v_pk - 0.5f * jmax * dt * dt;
+        *p_rel  = s_plan.p4_deg + v_pk * dt - jmax * dt * dt * dt / 6.0f;
+    } else if (t < s_plan.t6) {                         /* A- */
+        float dt = t - s_plan.t5;
+        *a_dps2 = -a_pk;
+        *v_dps  = s_plan.v2_dps - a_pk * dt;
+        *p_rel  = s_plan.p5_deg + s_plan.v2_dps * dt - 0.5f * a_pk * dt * dt;
+    } else {                                            /* J+ final */
+        float dt = t - s_plan.t6;
+        *a_dps2 = -a_pk + jmax * dt;
+        *v_dps  = s_plan.v1_dps - a_pk * dt + 0.5f * jmax * dt * dt;
+        *p_rel  = s_plan.p6_deg + s_plan.v1_dps * dt - 0.5f * a_pk * dt * dt
+                                  + jmax * dt * dt * dt / 6.0f;
+    }
+}
+
 static void Trajectory_Generator_Update(void)
 {
-    float error = trajectory.target_pos - trajectory.current_setpoint_pos;
-    float abs_error = fabsf(error);
-    float v_current = trajectory.current_setpoint_vel;
-    
-    // 1. Exit condition: Very close and almost stopped
-    if (abs_error < 0.02f && fabsf(v_current) < 0.1f) {
-        trajectory.current_setpoint_pos = trajectory.target_pos;
-        trajectory.current_setpoint_vel = 0.0f;
+    /* Convert RPM-units → deg/s-units for planner */
+    float vmax_dps  = motion_config.max_velocity     * RPM_TO_DPS;
+    float amax_dps2 = motion_config.max_acceleration * RPM_TO_DPS;
+    float jmax_dps3 = tuning.max_jerk                * RPM_TO_DPS;
+
+    /* (Re-)plan if no active plan OR the target has changed since planning.
+     * The new plan starts from the current setpoint_pos so that
+     * setpoint_pos is continuous across the re-plan; setpoint_vel/accel
+     * snap to 0 (which causes a transient the speed PID will absorb — see
+     * SCurve notes). */
+    if (!s_plan.active || trajectory.target_pos != s_plan.pos_target_deg) {
+        scurve_plan(trajectory.current_setpoint_pos,
+                    trajectory.target_pos,
+                    vmax_dps, amax_dps2, jmax_dps3);
+    }
+
+    if (!s_plan.active) {
+        /* No motion — hold at target */
+        trajectory.current_setpoint_pos   = trajectory.target_pos;
+        trajectory.current_setpoint_vel   = 0.0f;
         trajectory.current_setpoint_accel = 0.0f;
         return;
     }
 
-    float max_v = motion_config.max_velocity;
-    float max_a = motion_config.max_acceleration;
-    float smoothing = motion_config.jerk_smoothing;
-    
-    // Jerk Time (Time to reach max acceleration)
-    float T_j = smoothing * 0.25f; // Map 0..1 to 0..0.25s
-    if (T_j < control_dt) T_j = control_dt;
-    float jerk = max_a / T_j;
+    s_plan.t_elapsed += control_dt;
 
-    // S-Curve Braking Distance Calculation:
-    // d_stop = d_trapezoidal + d_jerk_lag
-    // d_jerk_lag = v * (T_j / 2)
-    float v_rps = v_current / 60.0f;
-    float d_trap = (360.0f * v_rps * v_rps) / (2.0f * (max_a / 60.0f));
-    float d_jerk = fabsf(v_current) * T_j * 3.0f; // 3.0 = (360/60)/2
-    float stop_dist_s = d_trap + d_jerk;
-    
-    // 2. Determine Target Acceleration
-    float target_accel = 0.0f;
-    bool is_moving_towards = (error * v_current >= 0 || fabsf(v_current) < 0.1f);
+    float p_rel, v_dps, a_dps2;
+    scurve_eval(s_plan.t_elapsed, &p_rel, &v_dps, &a_dps2);
 
-    if (is_moving_towards) {
-        if (abs_error < stop_dist_s) {
-            // DECELERATION: Ramp accel towards -max_a
-            target_accel = (error > 0) ? -max_a : max_a;
-        } else {
-            // ACCELERATION: Ramp accel towards max_a (limit by max_v)
-            if (fabsf(v_current) < max_v) {
-                target_accel = (error > 0) ? max_a : -max_a;
-            } else {
-                target_accel = 0.0f; // Cruising at max_v
-            }
-        }
-    } else {
-        // OVERSHOT: High priority deceleration to zero
-        target_accel = (v_current > 0) ? -max_a : max_a;
+    trajectory.current_setpoint_pos   = s_plan.pos_start_deg + (float)s_plan.direction * p_rel;
+    trajectory.current_setpoint_vel   = (float)s_plan.direction * v_dps * DPS_TO_RPM;     /* RPM */
+    trajectory.current_setpoint_accel = (float)s_plan.direction * a_dps2 * DPS_TO_RPM;    /* RPM/s */
+
+    if (s_plan.t_elapsed >= s_plan.t7) {
+        s_plan.active = false;
+        trajectory.current_setpoint_pos   = s_plan.pos_target_deg;
+        trajectory.current_setpoint_vel   = 0.0f;
+        trajectory.current_setpoint_accel = 0.0f;
     }
-
-    // 3. Apply Jerk limit to Acceleration
-    float accel_error = target_accel - trajectory.current_setpoint_accel;
-    float jerk_step = jerk * control_dt;
-    
-    if (fabsf(accel_error) < jerk_step) {
-        trajectory.current_setpoint_accel = target_accel;
-    } else {
-        if (accel_error > 0) trajectory.current_setpoint_accel += jerk_step;
-        else trajectory.current_setpoint_accel -= jerk_step;
-    }
-    
-    // Clamp acceleration
-    if (trajectory.current_setpoint_accel > max_a) trajectory.current_setpoint_accel = max_a;
-    if (trajectory.current_setpoint_accel < -max_a) trajectory.current_setpoint_accel = -max_a;
-
-    // 4. Update Velocity and Position
-    trajectory.current_setpoint_vel += trajectory.current_setpoint_accel * control_dt;
-    
-    // Prevent sign flip and overshoot due to Jerk lag during final stop
-    if (abs_error < 0.2f && fabsf(trajectory.current_setpoint_vel) < 2.0f) {
-        if (!is_moving_towards) trajectory.current_setpoint_vel = 0;
-    }
-
-    trajectory.current_setpoint_pos += (trajectory.current_setpoint_vel / 60.0f) * 360.0f * control_dt;
 }
 
 static float resolution_step = 10.0f; 
@@ -547,8 +711,9 @@ void Motor_Init(void)
     tuning.move_speed_return_home = MOVE_SPEED_RETURN_HOME;
     tuning.step_size_coarse = STEP_SIZE_COARSE; 
     tuning.step_size_fine = STEP_SIZE_FINE;
-    tuning.min_pwm = DEFAULT_MIN_PWM; 
+    tuning.min_pwm = DEFAULT_MIN_PWM;
     tuning.max_accel = DEFAULT_MAX_ACCEL;
+    tuning.max_jerk  = DEFAULT_MAX_JERK;
     
     resolution_step = tuning.step_size_coarse;
     
@@ -570,11 +735,6 @@ void Motor_Init(void)
     // Initialize motion profile defaults with user-calculated S-curve params
     motion_config.max_velocity = tuning.move_speed_coarse;
     motion_config.max_acceleration = tuning.max_accel;
-    // Jerk time Tj = 0.01963s. Smoothing factor = Tj / 0.25 ≈ 0.0785
-    motion_config.jerk_smoothing = 0.0785f; 
-    
-    // Increase control loop speed inner gain slightly for better tracking
-    pid_speed.Kp = 1.5f; 
     
     // Start hardware peripherals
     HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
@@ -613,13 +773,11 @@ void Motor_SetVoltageLimit(float max_voltage, float supply_voltage)
 void Motor_SetMotionProfile(float max_rpm, float max_accel, float smoothing)
 {
     // (Fix: Do not overwrite tuning struct here, only update active motion_config)
+    (void)smoothing; /* smoothing param kept for API compat; jerk is controlled by tuning.max_jerk */
     
     // Update active trajectory limits
     motion_config.max_velocity = max_rpm;
     motion_config.max_acceleration = max_accel;
-    if (smoothing > 0.0f) {
-        motion_config.jerk_smoothing = smoothing;
-    }
 }
 
 void Motor_SetJogVelocity(float rpm)

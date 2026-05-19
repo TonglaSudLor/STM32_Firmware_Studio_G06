@@ -114,7 +114,8 @@ typedef struct {
     float step_size_fine;      /**< Degrees per click in Fine mode */
     float move_speed_return_home; /**< Custom RPM for returning to home/origin */
     float min_pwm;             /**< Minimum PWM to overcome friction */
-    float max_accel;           /**< Maximum acceleration (RPM/s) */
+    float max_accel;           /**< Maximum acceleration (RPM/s) — a_max for S-curve */
+    float max_jerk;            /**< Maximum jerk (RPM/s²) — j_max for S-curve */
 } Motor_TuningParams_t;
 
 /**
@@ -155,7 +156,7 @@ typedef struct {
 typedef struct {
     float max_velocity;
     float max_acceleration;
-    float jerk_smoothing;
+    /* jerk is controlled by tuning.max_jerk, not here */
 } Trajectory_Config_t;
 
 /**

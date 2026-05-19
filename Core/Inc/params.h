@@ -32,7 +32,7 @@
  * ============================================================================ */
 
 #define JOG_SPEED_FINE      10.0f   /**< Increased for better feedback */
-#define MOVE_SPEED_COARSE   100.0f  /**< 7.304 rad/s converted to RPM */
+#define MOVE_SPEED_COARSE   69.74f  /**< 7.304 rad/s converted to RPM (v_max for S-curve) */
 #define MOVE_SPEED_RETURN_HOME 30.0f /**< Custom speed for returning to home/origin */
 
 #define STEP_SIZE_COARSE    10.0f
@@ -49,7 +49,8 @@
 #define POS_INTEGRAL_MAX    200.0f
 
 #define DEFAULT_MIN_PWM     0.0f    /**< Increased to overcome static friction */
-#define DEFAULT_MAX_ACCEL   2000.0f /**< 27.49 rad/s^2 converted to RPM/s^2 */
+#define DEFAULT_MAX_ACCEL   262.5f   /**< 27.49 rad/s^2 converted to RPM/s   (a_max for S-curve) */
+#define DEFAULT_MAX_JERK    5252.0f  /**< 550 rad/s^3 converted to RPM/s² (j_max for S-curve, T_j ≈ 50ms) */
 
 /* ============================================================================
  * SAFETY PROTOCOLS

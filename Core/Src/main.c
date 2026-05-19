@@ -205,7 +205,7 @@ int main(void)
 
   Motor_Init();
   HW_Init();
-  Motor_SetVoltageLimit(12.0f, 12.0f);
+  Motor_SetVoltageLimit(SUPPLY_VOLTAGE, SUPPLY_VOLTAGE);  /* 24 V — must match params.h SUPPLY_VOLTAGE used by the FF math */
   Motor_SetMotionProfile(250.0f, 500.0f, 0.1f);
   ModbusBridge_Init();
   Telemetry_Init(&hlpuart1);
