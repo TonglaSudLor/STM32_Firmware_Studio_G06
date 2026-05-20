@@ -167,7 +167,11 @@
             <div class="card telemetry-card">
                 <div class="card-header">
                     <h3>Motion Telemetry</h3>
-                    <button id="mode-toggle-btn" class="secondary-btn">Live</button>
+                    <div class="view-mode-switch" id="view-mode-switch">
+                        <button id="mode-toggle-btn" class="vm-btn active" data-mode="live">Live</button>
+                        <button id="mode-tuning-btn" class="vm-btn" data-mode="tuning">Tuning</button>
+                        <button id="mode-test-btn" class="vm-btn" data-mode="test">Test</button>
+                    </div>
                     <div class="chart-legend">
                         <label class="legend-item pos"><input type="checkbox" id="chk-show-pos" checked>Pos</label>
                         <label class="legend-item vel"><input type="checkbox" id="chk-show-vel" checked>Vel</label>
@@ -208,6 +212,107 @@
                             </span>
                         </div>
                         <canvas id="chart-acc"></canvas>
+                    </div>
+                </div>
+
+                <!-- TEST MODE PANEL — replaces chart area when Test view is active -->
+                <div id="test-panel" class="test-panel hidden">
+                    <div class="test-panel-header">
+                        <h3>Test Suite</h3>
+                        <button id="btn-test-folder" class="secondary-btn sm" title="Pick the folder where CSVs will be saved">Pick Folder</button>
+                        <div id="test-folder-status" class="test-folder-status">No folder selected — CSVs will download.</div>
+                    </div>
+
+                    <div id="test-recording-bar" class="test-rec-bar hidden">
+                        <span class="rec-dot"></span>
+                        <span id="test-rec-label">Recording…</span>
+                        <span id="test-rec-samples" class="test-rec-samples">0 samples</span>
+                        <span id="test-rec-elapsed" class="test-rec-elapsed">0.0s</span>
+                        <button id="btn-test-stop" class="danger-btn sm">Stop</button>
+                    </div>
+
+                    <div class="test-panel-grid">
+                        <div class="test-group">
+                            <h4>Hardware Tests</h4>
+                            <div class="test-btn-grid">
+                                <button class="test-btn" data-test="HW1">HW-1 Encoder</button>
+                                <button class="test-btn" data-test="HW2">HW-2 PWM→Speed</button>
+                                <button class="test-btn" data-test="HW3">HW-3 Step (no load)</button>
+                                <button class="test-btn" data-test="HW4">HW-4 Step (2 kg)</button>
+                                <button class="test-btn" data-test="HW5">HW-5 Precision 100×</button>
+                                <button class="test-btn" data-test="HW6">HW-6 Rot 540°</button>
+                                <button class="test-btn" data-test="HW7">HW-7 Full Auto</button>
+                                <button class="test-btn" data-test="HW8">HW-8 Set Home</button>
+                                <button class="test-btn" data-test="HW9">HW-9 Out-of-WS</button>
+                                <button class="test-btn" data-test="HW10">HW-10 Rod drop</button>
+                            </div>
+                        </div>
+
+                        <div class="test-group">
+                            <h4>Lab 4 Experiments</h4>
+                            <div class="test-btn-grid">
+                                <button class="test-btn" data-test="L4-1-TRAP">L4-1 Trap</button>
+                                <button class="test-btn" data-test="L4-1-SCURVE">L4-1 S-Curve</button>
+                                <button class="test-btn" data-test="L4-2-FF">L4-2 +FF</button>
+                                <button class="test-btn" data-test="L4-2-NOFF">L4-2 −FF</button>
+                                <button class="test-btn" data-test="L4-3">L4-3 PID step</button>
+                                <button class="test-btn" data-test="L4-4">L4-4 Anti-windup</button>
+                                <button class="test-btn" data-test="L4-5">L4-5 Kalman Q/R</button>
+                                <button class="test-btn" data-test="L4-6">L4-6 Kalman ia</button>
+                                <button class="test-btn" data-test="L4-7">L4-7 SysID</button>
+                            </div>
+                        </div>
+
+                        <div class="test-group">
+                            <h4>Free Capture</h4>
+                            <div class="test-btn-row">
+                                <input type="text" id="test-free-tag" placeholder="tag (e.g. tune_run3)" />
+                                <button id="btn-test-free" class="primary-btn sm">Start</button>
+                            </div>
+                            <div class="test-limit-row">
+                                <label class="test-limit-item">
+                                    <input type="checkbox" id="cap-opt-time" />
+                                    Auto-stop after
+                                    <input type="number" id="cap-opt-time-val" value="5" min="0.5" step="0.5" />
+                                    s
+                                </label>
+                                <label class="test-limit-item">
+                                    <input type="checkbox" id="cap-opt-settle" />
+                                    Only record while moving (|vel|&gt;
+                                    <input type="number" id="cap-opt-settle-val" value="3" min="0.1" step="0.5" />
+                                    RPM)
+                                </label>
+                                <label class="test-limit-item">
+                                    <input type="checkbox" id="cap-opt-decim" />
+                                    Keep 1 in
+                                    <input type="number" id="cap-opt-decim-val" value="5" min="1" step="1" />
+                                </label>
+                            </div>
+                            <div class="test-hint">All limits also apply to the HW/L4 test buttons. Manual Stop always works.</div>
+                        </div>
+
+                        <div class="test-group">
+                            <h4>Manual Entry (protractor / single-value tests)</h4>
+                            <div class="test-manual-row">
+                                <select id="test-manual-id">
+                                    <option value="HW1">HW-1 Encoder</option>
+                                    <option value="HW5">HW-5 Precision</option>
+                                    <option value="HW8">HW-8 Set Home</option>
+                                    <option value="HW9">HW-9 Out-of-WS</option>
+                                    <option value="HW10">HW-10 Rod drop</option>
+                                </select>
+                                <input type="number" id="test-manual-target" placeholder="target" step="0.01" />
+                                <input type="number" id="test-manual-measured" placeholder="measured" step="0.01" />
+                                <input type="text" id="test-manual-note" placeholder="note (optional)" />
+                                <button id="btn-test-manual-save" class="primary-btn sm">Save Row</button>
+                            </div>
+                            <div id="test-manual-status" class="test-hint"></div>
+                        </div>
+
+                        <div class="test-group test-files-group">
+                            <h4>Recent Files</h4>
+                            <ul id="test-file-list" class="test-file-list"><li class="test-file-empty">none yet</li></ul>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -564,6 +669,7 @@
     <script src="visualizer.js"></script>
     <script src="charts.js"></script>
     <script src="app.js"></script>
+    <script src="testing.js"></script>
 </body>
 
 </html>

@@ -238,6 +238,7 @@ function processPacket(packet) {
     updateKalmanCard();
     checkGhostStart();
     tuningTick();
+    if (window.TestSuite) window.TestSuite.onPacket(state, packet);
 }
 
 async function sendCommand(cmd) {
@@ -942,30 +943,54 @@ CHART_TOGGLES.forEach(t => {
 });
 applyChartVisibility();
 
+// View mode: 'live' | 'tuning' | 'test'
+let viewMode = 'live';
+
 function setTuningMode(on) {
-    if (tuningMode === on) return;
-    tuningMode = on;
-    const btn = document.getElementById('mode-toggle-btn');
-    btn.innerText = tuningMode ? 'Tuning' : 'Live';
-    btn.className = tuningMode ? 'secondary-btn tuning-active' : 'secondary-btn';
+    setViewMode(on ? 'tuning' : 'live');
+}
+
+function setViewMode(mode) {
+    if (viewMode === mode) return;
+    viewMode = mode;
+    tuningMode = (mode === 'tuning');
+
+    // Update segmented switch
+    document.querySelectorAll('#view-mode-switch .vm-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.mode === mode);
+    });
+
+    // Charts switch live/tuning behavior (Test reuses live scaling)
     chartPos.setMode(tuningMode);
     chartVel.setMode(tuningMode);
     chartAcc.setMode(tuningMode);
     tuningState = 'IDLE';
-    document.querySelector('.path-card').style.display = tuningMode ? 'none' : '';
-    // Metrics card only when Loop ON and Tuning mode; Kalman card takes the
-    // slot whenever Loop is OFF (see renderPosLoopBtn).
+
+    // Telemetry card: show test panel instead of charts when in Test mode
+    const telCard = document.querySelector('.telemetry-card');
+    if (telCard) telCard.classList.toggle('test-mode', mode === 'test');
+    const testPanel = document.getElementById('test-panel');
+    if (testPanel) testPanel.classList.toggle('hidden', mode !== 'test');
+
+    // Path card hides in tuning mode (preserve original behavior)
+    document.querySelector('.path-card').style.display = (mode === 'tuning') ? 'none' : '';
+
     const _metrics = document.querySelector('.metrics-card');
     if (_metrics) _metrics.style.display = (tuningMode && posLoopEnabled) ? '' : 'none';
     const _kf = document.querySelector('.kalman-card');
     if (_kf) _kf.style.display = !posLoopEnabled ? '' : 'none';
-    setMetricsStatus(tuningMode
-        ? 'IDLE — Send Move / Go Home / Ghost start to begin capture'
-        : 'IDLE — Switch to Tuning Mode and move motor', '');
+
+    if (mode === 'tuning') {
+        setMetricsStatus('IDLE — Send Move / Go Home / Ghost start to begin capture', '');
+    } else if (mode === 'live') {
+        setMetricsStatus('IDLE — Switch to Tuning Mode and move motor', '');
+    }
 }
 
-// Toggle button
-document.getElementById('mode-toggle-btn').addEventListener('click', () => setTuningMode(!tuningMode));
+// Segmented switch — wires Live / Tuning / Test buttons
+document.querySelectorAll('#view-mode-switch .vm-btn').forEach(btn => {
+    btn.addEventListener('click', () => setViewMode(btn.dataset.mode));
+});
 
 // Default: hide metrics card on load (Live mode default)
 document.addEventListener('DOMContentLoaded', () => {
