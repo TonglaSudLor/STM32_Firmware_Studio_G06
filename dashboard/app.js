@@ -1129,7 +1129,12 @@ document.querySelectorAll('input[name="gripper-mode"]').forEach(radio => {
 });
 
 // --- Gripper Sequence Helpers ---
-function msDelay(ms) { return new Promise(r => setTimeout(r, ms)); }
+function msDelay(ms) {
+    // Guard: NaN / undefined / negative → setTimeout fires immediately, which
+    // causes the path sequencer to skip its inter-waypoint wait.
+    const safe = (Number.isFinite(ms) && ms > 0) ? ms : 0;
+    return new Promise(r => setTimeout(r, safe));
+}
 
 function waitForGripperState(predicate, timeout) {
     return new Promise(resolve => {
@@ -1186,6 +1191,7 @@ btnRunSeq.addEventListener('click', () => {
     btnRunSeq.className = 'toggle-btn ' + (state.seqActive ? 'active' : '');
     if (state.seqActive) {
         state.currentWaypointIdx = 0;
+        state.gripperHasRod = false;  // start each Run with empty gripper
         executeNextWaypoint();
     }
 });
@@ -1213,14 +1219,35 @@ async function executeNextWaypoint() {
     sendCommand(`SET:TARGET=${target}`);
     renderWaypoints();
 
-    const movDelay = parseFloat(document.getElementById('input-seq-delay').value) * 1000;
+    const rawDelay = parseFloat(document.getElementById('input-seq-delay').value);
+    const movDelay = (Number.isFinite(rawDelay) && rawDelay >= 0) ? rawDelay * 1000 : 2000;
     await msDelay(movDelay);
     if (!state.seqActive) return;
 
     if (gripperConfig.enabled) {
-        const isPick = (state.currentWaypointIdx % 2 === 0);
-        if (isPick) await runGripperPick();
-        else await runGripperPlace();
+        // Single-rod shuttle. Action at each waypoint depends on whether the
+        // gripper is currently holding the rod, not on waypoint index — so it
+        // works across loops without dropping the rod.
+        //
+        //   empty gripper  → PICK (grab here)
+        //   holding rod, last waypoint, no loop → PLACE (final drop)
+        //   holding rod, otherwise              → PLACE then PICK
+        const idx = state.currentWaypointIdx;
+        const isLast = (idx === state.waypoints.length - 1);
+
+        if (!state.gripperHasRod) {
+            await runGripperPick();
+            state.gripperHasRod = true;
+        } else if (isLast && !state.seqLoop) {
+            await runGripperPlace();
+            state.gripperHasRod = false;
+        } else {
+            await runGripperPlace();
+            state.gripperHasRod = false;
+            if (!state.seqActive) return;
+            await runGripperPick();
+            state.gripperHasRod = true;
+        }
     }
     if (!state.seqActive) return;
 
