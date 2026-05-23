@@ -34,34 +34,34 @@ $(wildcard ../makefile.init) \
 $(wildcard ../makefile.targets) \
 
 
-BUILD_ARTIFACT_NAME := Studio_STM32_Firmware_G06-new
+BUILD_ARTIFACT_NAME := STM32_Firmware_Studio_G06
 BUILD_ARTIFACT_EXTENSION := elf
 BUILD_ARTIFACT_PREFIX :=
 BUILD_ARTIFACT := $(BUILD_ARTIFACT_PREFIX)$(BUILD_ARTIFACT_NAME)$(if $(BUILD_ARTIFACT_EXTENSION),.$(BUILD_ARTIFACT_EXTENSION),)
 
 # Add inputs and outputs from these tool invocations to the build variables 
 EXECUTABLES += \
-Studio_STM32_Firmware_G06-new.elf \
+STM32_Firmware_Studio_G06.elf \
 
 MAP_FILES += \
-Studio_STM32_Firmware_G06-new.map \
+STM32_Firmware_Studio_G06.map \
 
 SIZE_OUTPUT += \
 default.size.stdout \
 
 OBJDUMP_LIST += \
-Studio_STM32_Firmware_G06-new.list \
+STM32_Firmware_Studio_G06.list \
 
 
 # All Target
 all: main-build
 
 # Main-build Target
-main-build: Studio_STM32_Firmware_G06-new.elf secondary-outputs
+main-build: STM32_Firmware_Studio_G06.elf secondary-outputs
 
 # Tool invocations
-Studio_STM32_Firmware_G06-new.elf Studio_STM32_Firmware_G06-new.map: $(OBJS) $(USER_OBJS) E:\college\.[studio]\.[Second_Year]\sem2\Tongla_cooking\Studio_STM32_Firmware_G06-new\STM32_Firmware_Studio_G06\STM32G474RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "Studio_STM32_Firmware_G06-new.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"E:\college\.[studio]\.[Second_Year]\sem2\Tongla_cooking\Studio_STM32_Firmware_G06-new\STM32_Firmware_Studio_G06\STM32G474RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="Studio_STM32_Firmware_G06-new.map" -Wl,--gc-sections -static -u_printf_float --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+STM32_Firmware_Studio_G06.elf STM32_Firmware_Studio_G06.map: $(OBJS) $(USER_OBJS) C:\Users\Lenovo\Documents\Thadzy\PickPlaceRobot\Firmware\STM32_Firmware_Studio_G06\STM32G474RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "STM32_Firmware_Studio_G06.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\Lenovo\Documents\Thadzy\PickPlaceRobot\Firmware\STM32_Firmware_Studio_G06\STM32G474RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="STM32_Firmware_Studio_G06.map" -Wl,--gc-sections -static -u_printf_float --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
@@ -70,14 +70,14 @@ default.size.stdout: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOOL_DEPS)
 	@echo 'Finished building: $@'
 	@echo ' '
 
-Studio_STM32_Firmware_G06-new.list: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-objdump -h -S $(EXECUTABLES) > "Studio_STM32_Firmware_G06-new.list"
+STM32_Firmware_Studio_G06.list: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-objdump -h -S $(EXECUTABLES) > "STM32_Firmware_Studio_G06.list"
 	@echo 'Finished building: $@'
 	@echo ' '
 
 # Other Targets
 clean:
-	-$(RM) Studio_STM32_Firmware_G06-new.elf Studio_STM32_Firmware_G06-new.list Studio_STM32_Firmware_G06-new.map default.size.stdout
+	-$(RM) STM32_Firmware_Studio_G06.elf STM32_Firmware_Studio_G06.list STM32_Firmware_Studio_G06.map default.size.stdout
 	-@echo ' '
 
 secondary-outputs: $(SIZE_OUTPUT) $(OBJDUMP_LIST)
