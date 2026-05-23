@@ -457,6 +457,17 @@ static void Trajectory_Generator_Update(void)
         trajectory.current_setpoint_pos   = s_plan.pos_target_deg;
         trajectory.current_setpoint_vel   = 0.0f;
         trajectory.current_setpoint_accel = 0.0f;
+
+        /* Trajectory finished. The position PID has accumulated integral
+         * during the whole move because encoder always lags the setpoint
+         * (finite Kp needs error to produce response). When the trajectory
+         * snaps to target with vel=0, the residual integral keeps pushing
+         * the motor forward → overshoot → PID then slams reverse →
+         * mechanical jerk and motor-noise EMI bursts. Clear the position
+         * integral right at trajectory end so only proportional + the
+         * still-correct derivative term command the final settling. */
+        pid_position.integral   = 0.0f;
+        pid_position.d_filt     = 0.0f;
     }
 }
 
@@ -748,6 +759,8 @@ void Motor_MoveToPosition(float target_degrees)
     if (emergency_stop) return;
     trajectory.target_pos = target_degrees;
     current_mode = MOTOR_MODE_POSITION;
+    motion_config.max_velocity    = tuning.move_speed_coarse;
+    motion_config.max_acceleration = tuning.max_accel;
 }
 
 void Motor_Stop(void)
@@ -1149,9 +1162,11 @@ void Motor_ControlLoop(void)
     pid_position.Ki = tuning.pos_Ki;
     pid_position.Kd = tuning.pos_Kd;
 
-    // Only sync trajectory speed if not in a special mode (like return home)
+    // Sync acceleration only — velocity is set explicitly by each caller
+    // (Motor_MoveToPosition, Motor_SetMotionProfile, homing state machine).
+    // Do NOT overwrite max_velocity here: that would cancel any slow-speed
+    // profile set for return-home or fine-jog moves.
     if (current_mode == MOTOR_MODE_POSITION || current_mode == MOTOR_MODE_GHOST) {
-        motion_config.max_velocity = tuning.move_speed_coarse;
         motion_config.max_acceleration = tuning.max_accel;
     }
 
@@ -1159,6 +1174,21 @@ void Motor_ControlLoop(void)
 
     // Check if E-Stop just cleared
     if (last_emergency_stop && !emergency_stop) {
+        /* Always reset PID state on E-Stop clear regardless of path.
+         * Without this, wound-up integrals from before the stop apply
+         * full PWM the instant the relay re-energises, which causes the
+         * encoder signal-loss timer to start (high PWM, zero RPM for one tick)
+         * and can fire FAULT_ENCODER_ERROR even though the encoder is fine. */
+        pid_speed.integral    = 0.0f;
+        pid_speed.error_prev  = 0.0f;
+        pid_speed.d_filt      = 0.0f;
+        pid_position.integral = 0.0f;
+        pid_position.error_prev = 0.0f;
+        pid_position.d_filt   = 0.0f;
+        trajectory.current_setpoint_vel   = 0.0f;
+        trajectory.current_setpoint_accel = 0.0f;
+        fault_code &= ~FAULT_ENCODER_ERROR;  /* clear stale encoder fault from E-Stop relay bounce */
+
         if (position_unknown) {
             /* Recovery from a physical (hardware) E-stop: motor relay was
              * open, encoder lost power, TIM3 quadrature counts are stale.
@@ -1169,12 +1199,16 @@ void Motor_ControlLoop(void)
             Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
             printf("[SAFETY] Physical E-Stop cleared — position unknown, re-homing.\r\n");
         } else {
-            /* Soft E-stop: motor stayed powered, encoder count is still
-             * trustworthy. Just slew back to the saved origin home. */
-            current_mode = MOTOR_MODE_POSITION;
-            trajectory.target_pos = original_home_offset_deg;
-            Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
-            printf("[SAFETY] E-Stop Cleared. Returning to Origin Home (%.2f)\r\n", original_home_offset_deg);
+            /* Soft E-stop (or boot): motor relay just closed this tick and the
+             * user only asked to clear the latch — they did not request motion.
+             * Snap trajectory to the current encoder position so no PWM is
+             * commanded. The user must explicitly issue the next move. This
+             * also avoids stall faults when the relay hasn't physically
+             * settled and any commanded PWM produces no rotation. */
+            current_mode = MOTOR_MODE_STOPPED;
+            trajectory.target_pos             = encoder.current_position_deg;
+            trajectory.current_setpoint_pos   = encoder.current_position_deg;
+            printf("[SAFETY] E-Stop Cleared. Holding at current position (%.2f).\r\n", encoder.current_position_deg);
         }
     }
     last_emergency_stop = emergency_stop;
@@ -1306,8 +1340,47 @@ void Motor_ControlLoop(void)
     }
 
     // 2. Encoder Phase Inversion
-    bool encoder_inverted = (current_applied_pwm >  ENCODER_FAULT_PWM_THRESHOLD && encoder.filtered_rpm < -ENCODER_INVERSION_RPM_LIMIT) ||
-                            (current_applied_pwm < -ENCODER_FAULT_PWM_THRESHOLD && encoder.filtered_rpm >  ENCODER_INVERSION_RPM_LIMIT);
+    // The check fires only when ALL of these are true for 30 consecutive
+    // ticks (~300 ms):
+    //   - PWM is well above the fault threshold (motor is actively driven)
+    //   - PWM direction has been stable for ≥ 500 ms (no recent reversal)
+    //   - count_delta sign opposes PWM sign by a clear margin
+    // This kills the entire family of normal-physics transients:
+    //   * direction reversal during overshoot recovery (inertia carries
+    //     the motor the old way while PWM is already commanding the new)
+    //   * trajectory deceleration where PWM may briefly counter-pulse
+    //   * settling-region small motions where count_delta is noisy
+    // A genuinely miswired encoder will keep counts opposite to PWM
+    // forever, so the 800 ms (500 + 300) total latency is still safe.
+    int32_t count_delta = encoder.absolute_counts - last_absolute_counts;
+    static int8_t   last_pwm_sign = 0;
+    static uint32_t pwm_dir_stable_tick = 0;
+    int8_t pwm_sign_now =
+        (current_applied_pwm >  ENCODER_FAULT_PWM_THRESHOLD) ?  1 :
+        (current_applied_pwm < -ENCODER_FAULT_PWM_THRESHOLD) ? -1 : 0;
+    if (pwm_sign_now != last_pwm_sign) {
+        pwm_dir_stable_tick = HAL_GetTick();   /* reset stability window */
+        last_pwm_sign = pwm_sign_now;
+    }
+    bool pwm_dir_settled = (pwm_sign_now != 0) &&
+                           ((HAL_GetTick() - pwm_dir_stable_tick) >= 500);
+
+    /* Also suppress during homing: wiggle search keeps flipping h_direction,
+     * creep speeds are 1–10 RPM, and breakaway static friction can make
+     * count_delta cross zero while PWM is held high — none of that is a
+     * wiring fault. */
+    bool instant_inverted = pwm_dir_settled &&
+                            (current_mode != MOTOR_MODE_HOMING) && (
+        (pwm_sign_now ==  1 && count_delta < -10) ||
+        (pwm_sign_now == -1 && count_delta >  10));
+
+    static uint8_t inversion_streak = 0;
+    if (instant_inverted) {
+        if (inversion_streak < 255) inversion_streak++;
+    } else {
+        inversion_streak = 0;
+    }
+    bool encoder_inverted = (inversion_streak >= 30);   /* 300 ms continuous */
 
     if (safety_config.encoder_check && encoder_inverted) {
         fault_code |= FAULT_ENCODER_ERROR;
@@ -1317,8 +1390,20 @@ void Motor_ControlLoop(void)
     }
 
     // 3. Encoder Signal Loss
+    // Suppressed during homing: search/creep speeds are 1–10 RPM, so static-
+    // friction breakaway at the start of a wiggle/creep move legitimately
+    // produces high PWM with ~0 RPM and counts barely changing for hundreds
+    // of milliseconds — that looks identical to "encoder cable unplugged",
+    // but it isn't, it's just slow start-up. Homing has its own failure
+    // detection (H_ERROR via HOMING_MAX_WIGGLE) so a real stuck condition
+    // is still caught.
     bool encoder_signal_lost = false;
-    if (fabsf(current_applied_pwm) > ENCODER_FAULT_PWM_THRESHOLD &&
+    if (current_mode == MOTOR_MODE_HOMING) {
+        /* Don't arm the timer at all — and re-baseline last_absolute_counts
+         * so it doesn't see a stale "no change" the moment homing ends. */
+        encoder_fault_timer = 0;
+        last_absolute_counts = encoder.absolute_counts;
+    } else if (fabsf(current_applied_pwm) > ENCODER_FAULT_PWM_THRESHOLD &&
         fabsf(encoder.filtered_rpm) < STALL_VELOCITY_THRESHOLD &&
         encoder.absolute_counts == last_absolute_counts) {
 
@@ -1404,9 +1489,19 @@ void Motor_ControlLoop(void)
             ghost_move_active = false;
             ghost_dump_requested = true;
         }
-        PWM_Apply(0.0f); 
+        PWM_Apply(0.0f);
+        /* CRITICAL: also reset the module-level PWM monitor variable. Without
+         * this, current_applied_pwm holds the last large value commanded just
+         * before the fault (e.g. -80% from the corrective brake), the early-
+         * return below skips the PID compute that would normally overwrite
+         * it, and every subsequent tick the safety checks above see a stale
+         * "high PWM" alongside zero RPM → encoder-signal-loss timer arms
+         * → FAULT_ENCODER_ERROR re-fires within 1 s → user can never clear
+         * the emergency. */
+        current_applied_pwm = 0.0f;
+        current_pwm = 0.0f;
 
-        // Continuously sync trajectory during E-Stop so the motor does not violently snap 
+        // Continuously sync trajectory during E-Stop so the motor does not violently snap
         // back to an old target position when the E-Stop state is cleared.
         trajectory.target_pos = encoder.current_position_deg;
         trajectory.current_setpoint_pos = encoder.current_position_deg;
@@ -1414,6 +1509,12 @@ void Motor_ControlLoop(void)
         trajectory.current_setpoint_accel = 0.0f;
         pid_speed.integral = 0.0f;
         pid_position.integral = 0.0f;
+        /* Also re-baseline the signal-loss tracker so that when emergency
+         * clears, the very next tick doesn't see a stale "count not changing
+         * while PWM is high" condition. (Inversion-streak naturally resets
+         * because pwm_sign_now == 0 once current_applied_pwm is 0.) */
+        encoder_fault_timer = 0;
+        last_absolute_counts = encoder.absolute_counts;
         
         return; 
     }

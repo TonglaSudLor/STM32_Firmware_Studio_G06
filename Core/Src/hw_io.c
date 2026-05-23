@@ -64,8 +64,45 @@ void HW_Init(void)
 void HW_RefreshIO(void)
 {
     /* --- Read all Opto inputs (1 = Active) --- */
-    /* E-Stop NO contact: Healthy = Opto OFF (Pin HIGH). Emergency = Opto ON (Pin LOW) */
-    hw.in_estop       = (HAL_GPIO_ReadPin(E_Stop_GPIO_Port, E_Stop_Pin)             == GPIO_PIN_RESET) ? 1 : 0;
+    /* E-Stop: PA5 has only the internal ~40k pull-up (no external pull-up
+     * possible on this PCB). Motor current and relay arcs couple noise onto
+     * the high-impedance pin and cause spurious LOW pulses while the motor
+     * is running, which previously latched FAULT_ESTOP_PHYSICAL whenever
+     * the motor moved. Mitigation:
+     *   - Require 8 CONSECUTIVE LOW reads at 100 Hz (~80 ms continuous) to
+     *     declare a press. EMI bursts almost never sustain LOW that long;
+     *     a human finger easily does, and 80 ms is imperceptible latency.
+     *   - ANY HIGH read resets the counter to 0 — no gradual decrement.
+     *     A real press is a clean continuous LOW; noise is bursty and the
+     *     first HIGH read in any burst restarts the count.
+     * The EXTI fast-trigger path has been removed (see HAL_GPIO_EXTI_Callback
+     * in main.c): a microsecond-window vote cannot tell a real press from an
+     * EMI burst, so this polled debounce is now the only path that can set
+     * hw.in_estop = 1 and latch the emergency. */
+    {
+        static uint8_t  estop_debounce = 0;
+        static uint16_t motor_active_ticks = 0;   /* lingers after relay opens */
+        uint8_t estop_raw = (HAL_GPIO_ReadPin(E_Stop_GPIO_Port, E_Stop_Pin) == GPIO_PIN_RESET) ? 1 : 0;
+
+        /* Adaptive threshold: motor noise on PA5 only happens while the motor
+         * power relay is ON (or just transitioned). When idle, respond fast
+         * (80 ms) for a snappy button. When the motor is running or recently
+         * was, demand a much longer continuous LOW (300 ms) so motor EMI
+         * cannot accumulate enough consecutive samples to trip. */
+        if (hw.out_relay_motor) {
+            motor_active_ticks = 100;  /* hold strict mode 1 s past relay open */
+        } else if (motor_active_ticks > 0) {
+            motor_active_ticks--;
+        }
+        uint8_t threshold = (motor_active_ticks > 0) ? 30 : 8;
+
+        if (estop_raw) {
+            if (estop_debounce < threshold) estop_debounce++;
+        } else {
+            estop_debounce = 0;  /* any HIGH read = not a sustained press; restart */
+        }
+        hw.in_estop = (estop_debounce >= threshold) ? 1 : 0;
+    }
     hw.in_proximity   = (HAL_GPIO_ReadPin(Proximity_Sensor_GPIO_Port, Proximity_Sensor_Pin) == GPIO_PIN_RESET) ? 1 : 0;
     hw.raw_prox_bit   = (HAL_GPIO_ReadPin(Proximity_Sensor_GPIO_Port, Proximity_Sensor_Pin) == GPIO_PIN_RESET) ? 1 : 0;
     hw.in_select_mode = (HAL_GPIO_ReadPin(Selected_Mode_GPIO_Port, Selected_Mode_Pin) == GPIO_PIN_RESET) ? 1 : 0;
@@ -81,7 +118,18 @@ void HW_RefreshIO(void)
             Mode_Toggle();
         }
     }
-    hw.in_reset_btn   = (HAL_GPIO_ReadPin(Reset_Btn_GPIO_Port, Reset_Btn_Pin)       == GPIO_PIN_RESET) ? 1 : 0;
+    /* Debounce reset button: require 5 consecutive active reads (~100ms at 50Hz poll).
+     * Prevents contact bounce from causing rapid relay oscillation. */
+    {
+        static uint8_t reset_debounce = 0;
+        uint8_t reset_raw = (HAL_GPIO_ReadPin(Reset_Btn_GPIO_Port, Reset_Btn_Pin) == GPIO_PIN_RESET) ? 1 : 0;
+        if (reset_raw) {
+            if (reset_debounce < 5) reset_debounce++;
+        } else {
+            reset_debounce = 0;
+        }
+        hw.in_reset_btn = (reset_debounce >= 5) ? 1 : 0;
+    }
 
     /* --- Read Reed Switch inputs (gripper position feedback) --- */
 #if REED_SW_ACTIVE_LEVEL == 1

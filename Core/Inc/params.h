@@ -59,7 +59,9 @@
 #define STALL_PWM_THRESHOLD      25.0f   /**< Increased from 15% */
 #define STALL_VELOCITY_THRESHOLD 0.5f    /**< More sensitive low-speed detection */
 #define STALL_TIME_MS            2000    /**< Give it 2 seconds to start moving */
-#define STALL_SETTLING_ERROR_DEG 5.0f    /**< Don't trigger stall if error < 5 deg */
+#define STALL_SETTLING_ERROR_DEG 15.0f   /**< Don't trigger stall if error < 15 deg
+                                              * (covers normal PID overshoot/undershoot;
+                                              *  genuine stall under load has error >> 15°) */
 
 #define ENCODER_FAULT_PWM_THRESHOLD 50.0f   /**< PWM threshold for hardware check */
 #define ENCODER_INVERSION_RPM_LIMIT 5.0f    /**< RPM threshold for inversion check */

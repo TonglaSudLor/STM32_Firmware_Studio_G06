@@ -117,7 +117,7 @@ void Telemetry_Update(void) {
     }
 }
 
-void Telemetry_OnByteReceived(uint8_t byte) {
+void Telemetry_ProcessByte(uint8_t byte) {
     switch (rx_state) {
         case TLM_STATE_IDLE:
             if (byte == '$') {

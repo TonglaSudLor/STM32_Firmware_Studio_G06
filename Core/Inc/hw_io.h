@@ -6,7 +6,7 @@
  * Provides a flat debug struct visible in STM32CubeIDE Live Expressions.
  *
  * Pinout:
- *   Inputs  (Opto):    PA5=E-Stop, PA6=Proximity, PA7=SelectMode, PB6=Reset
+ *   Inputs  (Opto):    PA5=E-Stop, PB9=Proximity, PA6=SelectMode, PA7=Reset
  *   Inputs  (Reed SW): PB0=Up, PA4=Down, PA1=Close, PA0=Open  (1=position reached)
  *   Outputs (Relay):   PB12=MotorPower, PB11=ModeLight, PB2=StatusLight
  *   Outputs (Gripper): PC0=Up/Down, PC1=Close/Open
@@ -31,9 +31,9 @@
 typedef struct {
     /* --- Inputs (auto-updated every 100Hz, read-only) --- */
     volatile uint8_t in_estop;        /* PA5  E-Stop button via Opto CH1  (1=pressed) */
-    volatile uint8_t in_proximity;    /* PA6  Proximity sensor via Opto CH2 (1=detected) */
-    volatile uint8_t in_select_mode;  /* PA7  Mode switch via Opto CH3    (1=Joystick, 0=Base) */
-    volatile uint8_t in_reset_btn;    /* PB6  Reset button via Opto CH4   (1=pressed) */
+    volatile uint8_t in_proximity;    /* PB9  Proximity sensor via Opto CH2 (1=detected) */
+    volatile uint8_t in_select_mode;  /* PA6  Mode switch via Opto CH3    (1=Joystick, 0=Base) */
+    volatile uint8_t in_reset_btn;    /* PA7  Reset button via Opto CH4   (1=pressed) */
     volatile uint8_t raw_prox_bit;    /* PA6  Raw bit state (0 or 1) for debugging */
     volatile uint8_t sanity_check;   /* Should be 0xAA (170) if code is updated */
 
