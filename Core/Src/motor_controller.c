@@ -1749,10 +1749,10 @@ float Motor_GetSpeed(void) { return encoder.filtered_rpm; }
  * Gripper & Sequence Functions
  * ============================================================================ */
 
-void Gripper_Up(void) { hw.out_gripper_ud = 0; printf("Gripper: UP\r\n"); }
-void Gripper_Down(void) { hw.out_gripper_ud = 1; printf("Gripper: DOWN\r\n"); }
-void Gripper_Open(void) { hw.out_gripper_co = 0; printf("Gripper: OPEN\r\n"); }
-void Gripper_Close(void) { hw.out_gripper_co = 1; printf("Gripper: CLOSE\r\n"); }
+void Gripper_Up(void)    { hw.out_gripper_up = 1; hw.out_gripper_down = 0; printf("Gripper: UP\r\n"); }
+void Gripper_Down(void)  { hw.out_gripper_up = 0; hw.out_gripper_down = 1; printf("Gripper: DOWN\r\n"); }
+void Gripper_Open(void)  { hw.out_gripper_up = 1; hw.out_gripper_down = 0; printf("Gripper: OPEN\r\n"); }
+void Gripper_Close(void) { hw.out_gripper_up = 0; hw.out_gripper_down = 1; printf("Gripper: CLOSE\r\n"); }
 
 void Gripper_Toggle(void)
 {

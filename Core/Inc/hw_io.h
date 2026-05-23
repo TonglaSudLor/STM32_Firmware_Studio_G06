@@ -7,9 +7,10 @@
  *
  * Pinout:
  *   Inputs  (Opto):    PA5=E-Stop, PB9=Proximity, PA6=SelectMode, PA7=Reset
- *   Inputs  (Reed SW): PB0=Up, PA4=Down, PA1=Close, PA0=Open  (1=position reached)
+ *   Inputs  (Reed SW): PB0=Up, PC1=Down, PC0=Close, PC3=Open  (1=position reached)
+ *   Inputs  (Current): PA0=WCS1800 via ADC1_IN1 (voltage divider R1=1k, R2=1.8k)
  *   Outputs (Relay):   PB12=MotorPower, PB11=ModeLight, PB2=StatusLight
- *   Outputs (Gripper): PC0=Up/Down, PC1=Close/Open
+ *   Outputs (Gripper): PA1=Up relay, PA4=Down relay
  */
 
 #ifndef HW_IO_H
@@ -43,14 +44,18 @@ typedef struct {
     volatile uint8_t out_relay_status; /* PB2  Relay CH3: Status Lamp      (1=Red/Emergency, 0=Green/Ready) */
 
     /* --- Gripper Outputs --- */
-    volatile uint8_t out_gripper_ud;  /* PC0  Relay CH4: Up/Down          (1=Down, 0=Up) */
-    volatile uint8_t out_gripper_co;  /* PC1  Relay CH5: Close/Open       (1=Close, 0=Open) */
+    volatile uint8_t out_gripper_up;  /* PA1  Relay: Gripper UP           (1=energise UP relay) */
+    volatile uint8_t out_gripper_down;/* PA4  Relay: Gripper DOWN         (1=energise DOWN relay) */
 
     /* --- Reed Switch Inputs (gripper position feedback) --- */
     volatile uint8_t in_reed_up;      /* PB0  Reed SW Up    (1=gripper is UP) */
-    volatile uint8_t in_reed_down;    /* PA4  Reed SW Down  (1=gripper is DOWN) */
-    volatile uint8_t in_reed_close;   /* PA1  Reed SW Close (1=claw is CLOSED) */
-    volatile uint8_t in_reed_open;    /* PA0  Reed SW Open  (1=claw is OPEN) */
+    volatile uint8_t in_reed_down;    /* PC1  Reed SW Down  (1=gripper is DOWN) */
+    volatile uint8_t in_reed_close;   /* PC0  Reed SW Close (1=claw is CLOSED) */
+    volatile uint8_t in_reed_open;    /* PC3  Reed SW Open  (1=claw is OPEN) */
+
+    /* --- Current Sensor (WCS1800 on PA0 via 1kΩ/1.8kΩ divider) --- */
+    volatile float    current_amps;     /* Filtered motor current (A); negative = reverse  */
+    volatile uint32_t current_adc_raw;  /* Raw ADC value — use for zero-offset calibration */
 
     /* --- Motor Driver Status (read-only) --- */
     volatile uint8_t out_motor_dir;   /* PA9  Direction pin state         (1=Forward, 0=Reverse) */

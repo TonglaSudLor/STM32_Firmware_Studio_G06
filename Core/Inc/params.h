@@ -93,6 +93,11 @@
 #define MOT_ETA_GB      0.836f      /**< Gearbox efficiency */
 
 /* ============================================================================
+ * CURRENT SENSING — WCS1800 on PA0 (via 1kΩ/1.8kΩ voltage divider to 3.3V ADC)
+ * ============================================================================ */
+#define OVERCURRENT_LIMIT_AMPS   15.0f  /**< Trip threshold — tune to motor nameplate rating */
+
+/* ============================================================================
  * KALMAN FILTER
  * State x = [theta, omega, tau_L, i_a] in output-shaft frame.
  * Encoder bin = 360°/8192 ≈ 0.04395° ≈ 7.67e-4 rad.

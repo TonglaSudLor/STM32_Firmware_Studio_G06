@@ -66,10 +66,10 @@ void Telemetry_Update(void) {
     float acc_set = trajectory.current_setpoint_accel;
 
     int len = snprintf(tx_buffer, TX_BUFFER_SIZE,
-        "$POS:%.2f,VEL:%.2f,ACC:%.2f,TAR:%.2f,VSET:%.2f,ASET:%.2f,PWM:%.1f,MODE:%d,SYSM:%d,JOGM:%d,JOY:%d,ESTOP:%d,FAULT:%d,PROX:%d,GHOST:%d,GUD:%d,GCO:%d*",
+        "$POS:%.2f,VEL:%.2f,ACC:%.2f,TAR:%.2f,VSET:%.2f,ASET:%.2f,PWM:%.1f,MODE:%d,SYSM:%d,JOGM:%d,JOY:%d,ESTOP:%d,FAULT:%d,PROX:%d,GHOST:%d,GUP:%d,GDN:%d,CURR:%.2f*",
         pos, vel, acc, target, vel_set, acc_set, current_pwm, (int)current_mode, (int)control_system_mode, (int)jog_mode, (int)is_joystick_connected,
         (int)emergency_stop, (int)fault_code, (int)hw.raw_prox_bit, (int)current_mode == MOTOR_MODE_GHOST,
-        (int)hw.out_gripper_ud, (int)hw.out_gripper_co);
+        (int)hw.out_gripper_up, (int)hw.out_gripper_down, hw.current_amps);
 
     if (len > 0) {
         HAL_UART_Transmit(t_huart, (uint8_t*)tx_buffer, len, 100);
@@ -267,13 +267,14 @@ static void Telemetry_HandleCmd(char *payload) {
     } else if (strcmp(payload, "HOME") == 0) {
         trigger_homing_sequence = true;
     } else if (strcmp(payload, "GRIP_UP") == 0) {
-        hw.out_gripper_ud = 0;
+        hw.out_gripper_up   = 1;
+        hw.out_gripper_down = 0;
     } else if (strcmp(payload, "GRIP_DN") == 0) {
-        hw.out_gripper_ud = 1;
-    } else if (strcmp(payload, "GRIP_OPEN") == 0) {
-        hw.out_gripper_co = 0;
-    } else if (strcmp(payload, "GRIP_CLOSE") == 0) {
-        hw.out_gripper_co = 1;
+        hw.out_gripper_up   = 0;
+        hw.out_gripper_down = 1;
+    } else if (strcmp(payload, "GRIP_STOP") == 0) {
+        hw.out_gripper_up   = 0;
+        hw.out_gripper_down = 0;
     } else if (strcmp(payload, "TOGGLE_MODE") == 0) {
         Mode_Toggle();
     }

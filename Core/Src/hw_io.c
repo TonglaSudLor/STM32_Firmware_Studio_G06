@@ -13,6 +13,8 @@
 
 #include "hw_io.h"
 #include "motor_controller.h"
+#include "current_sensor.h"
+#include "params.h"
 #include <stdio.h>
 
 /* --- Hardware Debug Struct Instance --- */
@@ -37,10 +39,10 @@ static void apply_outputs(void)
                       hw.out_relay_mode   ? GPIO_PIN_SET : GPIO_PIN_RESET);
     HAL_GPIO_WritePin(Relay__SysStatus_GPIO_Port, Relay__SysStatus_Pin,
                       hw.out_relay_status ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(Gripper_UpDown_GPIO_Port, Gripper_UpDown_Pin,
-                      hw.out_gripper_ud   ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(Gripper_CloseOpen_GPIO_Port, Gripper_CloseOpen_Pin,
-                      hw.out_gripper_co   ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Gripper_Up_GPIO_Port,   Gripper_Up_Pin,
+                      hw.out_gripper_up   ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Gripper_Down_GPIO_Port, Gripper_Down_Pin,
+                      hw.out_gripper_down ? GPIO_PIN_SET : GPIO_PIN_RESET);
     /* Reed SW pins are inputs — nothing to write */
 }
 
@@ -54,8 +56,8 @@ void HW_Init(void)
     hw.out_relay_motor  = 0; /* Motor power OFF until system is ready */
     hw.out_relay_mode   = 0; /* Base system mode lamp */
     hw.out_relay_status = 0; /* Green = System Ready */
-    hw.out_gripper_ud   = 0; /* Gripper UP */
-    hw.out_gripper_co   = 0; /* Gripper OPEN */
+    hw.out_gripper_up   = 0; /* Gripper UP relay OFF */
+    hw.out_gripper_down = 0; /* Gripper DOWN relay OFF */
     /* Reed SW pins are inputs — no init needed */
 
     apply_outputs();
@@ -143,6 +145,21 @@ void HW_RefreshIO(void)
     hw.in_reed_close = (HAL_GPIO_ReadPin(Reed_Close_GPIO_Port, Reed_Close_Pin) == GPIO_PIN_RESET) ? 1 : 0;
     hw.in_reed_open  = (HAL_GPIO_ReadPin(Reed_Open_GPIO_Port,  Reed_Open_Pin)  == GPIO_PIN_RESET) ? 1 : 0;
 #endif
+
+    /* --- Sample WCS1800 current sensor (PA0, ADC1_IN1) --- */
+    hw.current_amps    = CurrentSensor_Sample();
+    hw.current_adc_raw = CurrentSensor_GetRaw();
+
+    /* Overcurrent trip: cut motor power immediately */
+    if (!hw.override_enabled &&
+        (hw.current_amps > OVERCURRENT_LIMIT_AMPS || hw.current_amps < -OVERCURRENT_LIMIT_AMPS))
+    {
+        emergency_stop = true;
+        hw.out_relay_motor  = 0;
+        hw.out_relay_status = 1;
+        printf("[FAULT] Overcurrent: %.1f A (limit %.1f A)\r\n",
+               hw.current_amps, (float)OVERCURRENT_LIMIT_AMPS);
+    }
 
     /* --- Read motor direction pin state for monitoring --- */
     hw.out_motor_dir  = (HAL_GPIO_ReadPin(Motor_Direction_GPIO_Port, Motor_Direction_Pin) == GPIO_PIN_SET) ? 1 : 0;

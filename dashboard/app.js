@@ -20,6 +20,7 @@ const state = {
     estop: false,
     gripper_ud: 0,
     gripper_co: 0,
+    current: 0,
     override: false,
     waypoints: [],
     seqActive: false,
@@ -169,8 +170,9 @@ function processPacket(packet) {
             case 'FAULT': state.fault = decodeFault(val); break;
             case 'PROX': state.prox = val !== '1'; break;
             case 'GHOST': state.ghost = val === '1'; break;
-            case 'GUD': state.gripper_ud = val === '1'; break;
-            case 'GCO': state.gripper_co = val === '1'; break;
+            case 'GUP': break;
+            case 'GDN': state.gripper_ud = val === '1'; state.gripper_co = val === '1'; break;
+            case 'CURR': state.current = safeNum; break;
             case 'KFEN': state.kfEnabled = val === '1'; break;
             case 'KTH': state.kfTheta = safeNum; break;
             case 'KOM': state.kfOmega = safeNum; break;
@@ -273,6 +275,7 @@ function updateUI() {
     }
 
     document.getElementById('stat-pwm').innerText = (isNaN(state.pwm) ? '0.0' : state.pwm.toFixed(1)) + "%";
+    document.getElementById('stat-current').innerText = state.current.toFixed(2) + ' A';
     ioProx.className = "io-item " + (state.prox ? "active" : "");
     ioEstop.className = "io-item " + (state.estop ? "active" : "");
 
