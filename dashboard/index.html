@@ -462,6 +462,30 @@
                         <button id="btn-fine-home" class="toggle-btn">Fine Home</button>
                         <button id="btn-go-home" class="toggle-btn">Go to Home</button>
                     </div>
+                    <div class="input-group" style="margin-top:8px">
+                        <label>Home Offset
+                            <span style="color:var(--text-dim,#888);font-weight:normal;font-size:0.82em">
+                                &nbsp;+° past sensor &nbsp;/&nbsp; −° before sensor
+                            </span>
+                        </label>
+                        <div style="display:flex;gap:4px;align-items:center">
+                            <button id="btn-offset-dec" class="toggle-btn"
+                                style="width:34px;padding:4px 0;font-size:1.15em;flex-shrink:0"
+                                title="Decrease offset by 0.5°">−</button>
+                            <input type="number" id="input-home-offset" step="0.5" value="0.0"
+                                style="flex:1;text-align:center"
+                                title="+X = home is X° past sensor  /  −X = home is X° before sensor">
+                            <button id="btn-offset-inc" class="toggle-btn"
+                                style="width:34px;padding:4px 0;font-size:1.15em;flex-shrink:0"
+                                title="Increase offset by 0.5°">+</button>
+                            <span style="color:var(--text-dim,#888);font-size:0.9em;padding-left:2px">°</span>
+                        </div>
+                        <button id="btn-apply-home-offset" class="primary-btn"
+                            style="width:100%;margin-top:6px"
+                            title="Save this offset value and immediately run the homing sequence. Arm will stop at (sensor centre + offset) and that becomes position 0.">
+                            ⌂ Save Offset &amp; Home
+                        </button>
+                    </div>
                 </div>
             </div>
 

@@ -207,6 +207,7 @@ function processPacket(packet) {
             case 'STEPF': syncTuning('input-step-fine', val); break;
             case 'JOGF': syncTuning('input-jog-fine', val); break;
             case 'HOMES': syncTuning('input-home-speed', val); break;
+            case 'HOFS':  syncTuning('input-home-offset', val); break;
             case 'MINP': syncTuning('input-min-pwm', val); break;
             case 'PLOOP': {
                 // Ignore for 2 s after the user clicked, otherwise a stale
@@ -750,15 +751,69 @@ Object.entries(SAFETY_TOGGLES).forEach(([id, key]) => {
     });
 });
 
+/**
+ * triggerHoming() — shared helper used by both Fine Home and Save Offset & Home.
+ *
+ * If an E-Stop is currently active the firmware's Motor_RunHomingSequence() will
+ * return immediately (silently) without moving.  We therefore auto-clear it here
+ * before sending CMD:HOME, then wait 200 ms to let the firmware settle before
+ * the homing command arrives.
+ */
+async function triggerHoming() {
+    if (state.estop) {
+        log('E-Stop active — clearing automatically before homing…', 'warn');
+        sendCommand('CMD:CLEAR');
+        state.estop = false;
+        state.fault = 'NONE';
+        updateUI();
+        await new Promise(r => setTimeout(r, 200));
+    }
+    sendCommand('CMD:HOME');
+    log('Homing sequence triggered');
+}
+
 document.getElementById('btn-fine-home').addEventListener('click', () => {
-    sendCommand("CMD:HOME");
-    log("Homing sequence triggered");
+    triggerHoming();
 });
 
 document.getElementById('btn-go-home').addEventListener('click', () => {
     sendCommand("SET:TARGET=0");
     log("Returning to home (0°)");
     if (tuningMode) { tuningState = 'IDLE'; tuningArmRun(); setMetricsStatus('ARMED (Go Home) — Waiting for motor motion...', ''); }
+});
+
+/* Home Offset: +/− step buttons, direct input, and Apply & Home button */
+function applyHomeOffset(v) {
+    if (isNaN(v)) return;
+    document.getElementById('input-home-offset').value = v;
+    sendCommand(`SET:HOME_OFFSET=${v}`);
+    log(`Home offset saved → ${v}°`);
+}
+
+document.getElementById('btn-offset-dec').addEventListener('click', () => {
+    const step = parseFloat(document.getElementById('input-home-offset').step) || 0.5;
+    const cur  = parseFloat(document.getElementById('input-home-offset').value) || 0;
+    applyHomeOffset(Math.round((cur - step) * 10) / 10);
+});
+
+document.getElementById('btn-offset-inc').addEventListener('click', () => {
+    const step = parseFloat(document.getElementById('input-home-offset').step) || 0.5;
+    const cur  = parseFloat(document.getElementById('input-home-offset').value) || 0;
+    applyHomeOffset(Math.round((cur + step) * 10) / 10);
+});
+
+document.getElementById('input-home-offset').addEventListener('change', e => {
+    applyHomeOffset(parseFloat(e.target.value));
+});
+
+/* Save Offset & Home — saves the offset value then immediately triggers homing.
+ * Uses triggerHoming() so an active E-Stop is cleared automatically first. */
+document.getElementById('btn-apply-home-offset').addEventListener('click', async () => {
+    const v = parseFloat(document.getElementById('input-home-offset').value);
+    if (isNaN(v)) { log('Home offset value is invalid — enter a number first.', 'error'); return; }
+    sendCommand(`SET:HOME_OFFSET=${v}`);          // 1. persist the offset in firmware
+    log(`Offset saved (${v}°) → starting homing sequence…`);
+    await triggerHoming();                         // 2. clear E-stop if needed, then home
 });
 
 document.getElementById('send-tuning-btn').addEventListener('click', () => {
@@ -777,6 +832,7 @@ document.getElementById('send-tuning-btn').addEventListener('click', () => {
         'POS_KD': 'input-pos-kd',
         'MIN_PWM': 'input-min-pwm',
         'HOME_SPEED': 'input-home-speed',
+        'HOME_OFFSET': 'input-home-offset',
         'JOG_FINE': 'input-jog-fine',
         'STEP_COARSE': 'input-step-coarse',
         'STEP_FINE': 'input-step-fine',

@@ -201,6 +201,11 @@ int main(void)
 		extern volatile Control_SystemMode_t control_system_mode;
 		control_system_mode = CONTROL_MODE_JOYSTICK;
 	}
+	/* ModbusBridge_Init MUST run before LPUART1_SetMode arms the RX interrupt.
+	 * Any byte arriving on LPUART1 goes straight to ModbusBridge_RxCallback(),
+	 * which dereferences hmodbus.htim. If that pointer is still NULL the MCU
+	 * faults immediately. */
+	ModbusBridge_Init();
 	LPUART1_SetMode(false);
 
 	Motor_Init();
@@ -208,7 +213,6 @@ int main(void)
 	CurrentSensor_Init(&hadc1);
 	Motor_SetVoltageLimit(SUPPLY_VOLTAGE, SUPPLY_VOLTAGE); /* 24 V — must match params.h SUPPLY_VOLTAGE used by the FF math */
 	Motor_SetMotionProfile(250.0f, 500.0f, 0.1f);
-	ModbusBridge_Init();
 	Telemetry_Init(&hlpuart1);
 	Kalman_Init();
 	HAL_TIM_Base_Start_IT(&htim6); /* fires HAL_TIM_PeriodElapsedCallback at 1 kHz */

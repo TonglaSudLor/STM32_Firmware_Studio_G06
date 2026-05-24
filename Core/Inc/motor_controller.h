@@ -270,6 +270,13 @@ void Motor_ProcessPacket(char action, char safety, char status);
 bool Motor_RunHomingSequence(void);
 
 /**
+ * @brief Instantly declare the current encoder position as home (position 0).
+ *        Equivalent to the joystick A single-click. Safe to call from
+ *        telemetry or dashboard — does nothing while E-Stop is active.
+ */
+void Motor_SetHomeHere(void);
+
+/**
  * @brief Update selection button state
  * @param pressed True if button is pressed
  */

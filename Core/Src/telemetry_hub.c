@@ -103,7 +103,7 @@ void Telemetry_Update(void) {
         len = snprintf(tx_buffer, TX_BUFFER_SIZE,
             "$SKP:%.3f,SKI:%.3f,SKD:%.3f,KVFF:%.3f,KAFF:%.3f,PKP:%.3f,PKI:%.3f,PKD:%.3f,"
             "VMAX:%.2f,AMAX:%.2f,JMAX:%.1f,STEPC:%.1f,STEPF:%.1f,JOGF:%.1f,HOMES:%.1f,MINP:%.1f,PLOOP:%d,"
-            "SHPEN:%d,SHPWN:%.3f,SHPZT:%.4f*",
+            "SHPEN:%d,SHPWN:%.3f,SHPZT:%.4f,HOFS:%.2f*",
             tuning.speed_Kp, tuning.speed_Ki, tuning.speed_Kd,
             tuning.K_vff, tuning.K_aff,
             tuning.pos_Kp, tuning.pos_Ki, tuning.pos_Kd,
@@ -113,7 +113,8 @@ void Telemetry_Update(void) {
             position_loop_enabled ? 1 : 0,
             tuning.shaper_enable ? 1 : 0,
             tuning.shaper_omega_n,
-            tuning.shaper_zeta);
+            tuning.shaper_zeta,
+            tuning.home_offset_deg);
             
         if (len > 0) {
             HAL_UART_Transmit(t_huart, (uint8_t*)tx_buffer, len, 100);
@@ -259,6 +260,12 @@ static void Telemetry_HandleSet(char *payload) {
             else if (strcmp(key, "SHPEN")        == 0) tuning.shaper_enable  = (val > 0.5f);
             else if (strcmp(key, "SHPWN")        == 0) { tuning.shaper_omega_n = val; Motor_ShaperRecompute(); }
             else if (strcmp(key, "SHPZT")        == 0) { tuning.shaper_zeta    = val; Motor_ShaperRecompute(); }
+            /* Home offset: shifts encoder zero after sensor homing.
+             * +X deg → sensor centre maps to position +X → position 0 is X deg before sensor. */
+            else if (strcmp(key, "HOME_OFFSET")  == 0) {
+                tuning.home_offset_deg = val;
+                printf("[HOME] Home offset set to %.2f deg\r\n", tuning.home_offset_deg);
+            }
         }
         token = strtok(NULL, ",");
     }
@@ -288,5 +295,10 @@ static void Telemetry_HandleCmd(char *payload) {
         hw.out_gripper_down = 0;
     } else if (strcmp(payload, "TOGGLE_MODE") == 0) {
         Mode_Toggle();
+    } else if (strcmp(payload, "SET_HOME") == 0) {
+        /* Instantly declare current position as home (position 0).
+         * Same effect as a single A-button click on the joystick.
+         * Does nothing while E-Stop is active (Motor_SetHomeHere guards it). */
+        Motor_SetHomeHere();
     }
 }

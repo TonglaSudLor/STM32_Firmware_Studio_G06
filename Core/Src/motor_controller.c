@@ -707,27 +707,44 @@ bool Motor_RunHomingSequence(void)
         case H_CALCULATE_ZERO:
             {
                 float center = (h_edge_a + h_edge_b) / 2.0f;
+                /* Distance from current physical position to sensor centre
+                 * in the OLD encoder frame. */
                 float offset = encoder.current_position_deg - center;
-                
-                // Set the new zero
-                encoder.absolute_counts = (int32_t)((offset / 360.0f) * (MOTOR_ENCODER_PPR * 4));
+
+                /* Apply home_offset_deg — shift position 0 relative to sensor centre.
+                 *
+                 *   sensor centre maps to position  (-home_offset_deg)
+                 *   position 0 lands at             (sensor_centre + home_offset_deg)
+                 *
+                 * Sign rule (simple):
+                 *   +offset → position 0 is that many degrees PAST  the sensor
+                 *   -offset → position 0 is that many degrees BEFORE the sensor
+                 *
+                 * Examples:
+                 *   offset =  0.0  → home = sensor centre (default)
+                 *   offset = +5.0  → arm drives 5° past sensor, stops there as home
+                 *   offset = -5.0  → arm stops 5° before sensor as home
+                 */
+                encoder.absolute_counts = (int32_t)(
+                    ((offset - tuning.home_offset_deg) / 360.0f) * (MOTOR_ENCODER_PPR * 4));
                 Encoder_Update(); // Force recalculation
-                
+
                 trajectory.target_pos = 0.0f;
                 trajectory.current_setpoint_pos = encoder.current_position_deg;
                 trajectory.current_setpoint_vel = 0.0f;
-                
+
                 // Reset PID Integrals to prevent windup spikes
                 pid_speed.integral = 0.0f;
                 pid_speed.error_prev = 0.0f;
                 pid_position.integral = 0.0f;
                 pid_position.error_prev = 0.0f;
-                
+
                 current_mode = MOTOR_MODE_POSITION;
                 original_home_offset_deg = 0.0f; // Sync temp and original home
                 Motor_SetMotionProfile(tuning.move_speed_coarse, tuning.max_accel, 0.1f); // Restore speeds
-                
-                printf("[HOMING] SUCCESS. Center found. Home set to 0.0\r\n");
+
+                printf("[HOMING] SUCCESS. Center=%.2f, Offset=%.2f, Home=0.0\r\n",
+                       center, tuning.home_offset_deg);
                 Motor_SendAudioCommand('H');
                 h_state = H_IDLE;  // ready for next trigger
             }
@@ -778,6 +795,7 @@ void Motor_Init(void)
     tuning.shaper_enable  = false;
     tuning.shaper_omega_n = DEFAULT_SHAPER_OMEGA_N;
     tuning.shaper_zeta    = DEFAULT_SHAPER_ZETA;
+    tuning.home_offset_deg = DEFAULT_HOME_OFFSET;
     ZVD_UpdateCoefficients();
     ZVD_FlushBuffer(0.0f);
 
@@ -822,6 +840,47 @@ void Motor_Stop(void)
 {
     PWM_Apply(0.0f);
     current_mode = MOTOR_MODE_STOPPED;
+}
+
+/**
+ * @brief Instantly declare the current encoder position as home (position 0).
+ *        Safe to call from telemetry CMD handler or any non-ISR context.
+ *        Does nothing while E-Stop is active.
+ */
+void Motor_SetHomeHere(void)
+{
+    if (emergency_stop) return;
+
+    Motor_SendAudioCommand('T');
+
+    /* Accumulate the shift into original_home_offset_deg so a subsequent
+     * triple-click (or Go-Original-Home) still returns to the sensor-based
+     * homed position, not the new manual zero. */
+    original_home_offset_deg -= encoder.current_position_deg;
+
+    /* Zero the encoder counter and all derived state at the current position */
+    __HAL_TIM_SET_COUNTER(&htim3, 0);
+    encoder.count_prev            = 0;
+    encoder.absolute_counts       = 0;
+    encoder.current_position_deg  = 0.0f;
+    encoder.filtered_rpm          = 0.0f;
+
+    /* Snap trajectory to the new zero so no position error is commanded */
+    trajectory.target_pos             = 0.0f;
+    trajectory.current_setpoint_pos   = 0.0f;
+    trajectory.current_setpoint_vel   = 0.0f;
+    buffered_target_pos               = 0.0f;
+
+    /* Clear PID state to avoid integral windup spike */
+    pid_speed.integral    = 0.0f;
+    pid_speed.error_prev  = 0.0f;
+    pid_speed.d_filt      = 0.0f;
+    pid_position.integral = 0.0f;
+    pid_position.error_prev = 0.0f;
+    pid_position.d_filt   = 0.0f;
+
+    printf("[HOME] Home set here (was %.2f deg). Original home now at %.2f deg.\r\n",
+           -original_home_offset_deg, original_home_offset_deg);
 }
 
 void Motor_SendAudioCommand(char sound_code)
@@ -1408,7 +1467,10 @@ void Motor_ControlLoop(void)
     // the fault bit nor force STOPPED mode — the motor keeps running.
     if (!is_joystick_connected && safety_config.joystick_check) {
         fault_code |= FAULT_JOYSTICK_LOST;
-        if (current_mode != MOTOR_MODE_STOPPED) {
+        /* Do NOT interrupt the homing state machine — it drives MOTOR_MODE_HOMING
+         * intentionally and must complete to set encoder zero.  Any other active
+         * mode (POSITION, SPEED, JOG …) is stopped as before. */
+        if (current_mode != MOTOR_MODE_STOPPED && current_mode != MOTOR_MODE_HOMING) {
             current_mode = MOTOR_MODE_STOPPED;
             PWM_Apply(0.0f);
         }
