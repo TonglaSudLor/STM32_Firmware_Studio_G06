@@ -56,8 +56,8 @@ void HW_Init(void)
     hw.out_relay_motor  = 0; /* Motor power OFF until system is ready */
     hw.out_relay_mode   = 0; /* Base system mode lamp */
     hw.out_relay_status = 0; /* Green = System Ready */
-    hw.out_gripper_up   = 0; /* Gripper UP relay OFF */
-    hw.out_gripper_down = 0; /* Gripper DOWN relay OFF */
+    hw.out_gripper_up   = 0; /* Vertical: spring returns DOWN */
+    hw.out_gripper_down = 0; /* Claw: spring returns OPEN */
     /* Reed SW pins are inputs — no init needed */
 
     apply_outputs();
@@ -88,15 +88,28 @@ void HW_RefreshIO(void)
 
         /* Adaptive threshold: motor noise on PA5 only happens while the motor
          * power relay is ON (or just transitioned). When idle, respond fast
-         * (80 ms) for a snappy button. When the motor is running or recently
-         * was, demand a much longer continuous LOW (300 ms) so motor EMI
-         * cannot accumulate enough consecutive samples to trip. */
+         * for a snappy button press. When the motor is running, demand a much
+         * longer continuous LOW to reject EMI.
+         *
+         * Thresholds (see comment on threshold variable below for effective ms). */
         if (hw.out_relay_motor) {
             motor_active_ticks = 100;  /* hold strict mode 1 s past relay open */
         } else if (motor_active_ticks > 0) {
             motor_active_ticks--;
         }
-        uint8_t threshold = (motor_active_ticks > 0) ? 30 : 8;
+        /* HW_RefreshIO() is called from three contexts: the 100 Hz TIM6 ISR
+         * (via Motor_ControlLoop), the ~50 Hz main-loop tick, and the
+         * tight wait_for_reed() poll — so estop_debounce accumulates at
+         * roughly 150 Hz, not 100 Hz.  Actual window = threshold / 150 s.
+         *
+         * During homing the creep phase (HOMING_CREEP_RPM = 1 RPM) commands
+         * near-maximum PWM to overcome static friction, generating the worst
+         * possible EMI on PA5 for the longest time.  Use a 1 s window (150
+         * samples at ~150 Hz) so the startup transient can drain before
+         * accumulating enough counts.  Normal running stays at 300 ms. */
+        uint8_t threshold = (motor_active_ticks > 0)
+                          ? (current_mode == MOTOR_MODE_HOMING ? 150 : 30)
+                          : 8;
 
         if (estop_raw) {
             if (estop_debounce < threshold) estop_debounce++;
@@ -171,8 +184,18 @@ void HW_RefreshIO(void)
             emergency_stop = true;
             fault_code |= FAULT_ESTOP_PHYSICAL;
             /* Motor relay is about to open, encoder loses power → position
-             * cannot be trusted after recovery. Force a re-home. */
-            position_unknown = true;
+             * cannot be trusted after recovery. Force a re-home.
+             *
+             * Exception: if E-stop fires while ALREADY homing, we haven't
+             * established position yet anyway. Do NOT set position_unknown
+             * here — doing so causes Motor_ControlLoop to auto-arm homing
+             * again the instant Reset is pressed, which creates a noise-
+             * driven Reset→homing→E-stop→Reset infinite loop.
+             * With position_unknown = false, Reset goes to STOPPED and the
+             * user manually re-triggers Fine Home once the noise settles. */
+            if (current_mode != MOTOR_MODE_HOMING) {
+                position_unknown = true;
+            }
         } else if (hw.in_reset_btn) {
             /* Reset Pressed AND Emergency is Released: Enter Ready state */
             emergency_stop = false;
@@ -194,7 +217,9 @@ void HW_RefreshIO(void)
         if (hw.in_estop) {
             emergency_stop = true;
             fault_code |= FAULT_ESTOP_PHYSICAL;
-            position_unknown = true;
+            if (current_mode != MOTOR_MODE_HOMING) {
+                position_unknown = true;
+            }
         } else if (hw.in_reset_btn) emergency_stop = false;
     }
 

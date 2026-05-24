@@ -809,13 +809,22 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 int _write(int file, char *ptr, int len) {
 	extern volatile Control_SystemMode_t control_system_mode;
-	// Always go to USART3 (ESP32) for debug log
-	HAL_UART_Transmit(&huart3, (uint8_t*) ptr, len, 10);
-	// Only send to LPUART1 (Dashboard) when NOT in BASE_SYSTEM mode.
-	// In BASE_SYSTEM mode LPUART1 carries Modbus RTU — text would corrupt frames.
+	/* Route printf / debug output to LPUART1 (Dashboard) ONLY.
+	 *
+	 * USART3 connects to the ESP32 joystick module.  The only data the ESP32
+	 * expects to receive from the STM32 is a single-character echo sent by
+	 * HAL_UART_RxCpltCallback as an audio-handshake ACK.  Sending debug
+	 * strings to USART3 causes the ESP32 to receive unexpected data, which
+	 * makes it fire a 'D' (disconnect) status packet → FAULT_JOYSTICK_LOST
+	 * → emergency_stop = true, blocking all motor commands.
+	 *
+	 * Do NOT add huart3 back here.  Debug logs go to the dashboard only. */
 	if (control_system_mode != CONTROL_MODE_BASE_SYSTEM) {
+		/* JOYSTICK / normal mode: LPUART1 is the dashboard serial channel */
 		HAL_UART_Transmit(&hlpuart1, (uint8_t*) ptr, len, 10);
 	}
+	/* In BASE_SYSTEM mode LPUART1 carries Modbus RTU — suppress debug output
+	 * entirely so we never corrupt Modbus frames. */
 	return len;
 }
 
@@ -868,16 +877,34 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 		static bool line_too_long = false;
 		if (ch == '\n' || ch == '\r') {
 			if (rx_ptr == 3 && !line_too_long) {
-				// We have a valid 3-char packet: [Action][Safety][Status]
-				Motor_ProcessPacket(rx_packet[0], rx_packet[1], rx_packet[2]);
+				/* Validate: all 3 bytes must be printable ASCII (>= 0x20).
+				 * UART framing errors leave the data register as 0x00.
+				 * Three null bytes look like a packet with status=0 (not 'C'),
+				 * which calls Motor_ProcessPacket → is_joystick_connected=false
+				 * → FAULT_JOYSTICK_LOST → emergency_stop=true, permanently
+				 * re-latching the e-stop faster than Reset can clear it.
+				 * Reject any packet with non-printable bytes to block this. */
+				if ((uint8_t)rx_packet[0] >= 0x20 &&
+				    (uint8_t)rx_packet[1] >= 0x20 &&
+				    (uint8_t)rx_packet[2] >= 0x20)
+				{
+					// We have a valid 3-char packet: [Action][Safety][Status]
+					Motor_ProcessPacket(rx_packet[0], rx_packet[1], rx_packet[2]);
 
-				// Echo the action character back for the audio handshake
-				HAL_UART_Transmit(&huart3, (uint8_t*) &rx_packet[0], 1, 5);
+					// Echo the action character back for the audio handshake
+					HAL_UART_Transmit(&huart3, (uint8_t*) &rx_packet[0], 1, 5);
+				}
+				/* else: silently discard — null/garbage bytes from framing error */
 			}
 			rx_ptr = 0;
 			line_too_long = false;
 		} else {
-			if (rx_ptr < 3) {
+			/* Also reject non-printable mid-packet bytes immediately so a framing
+			 * error byte cannot contaminate an otherwise valid packet. */
+			if ((uint8_t)ch < 0x20) {
+				rx_ptr = 0;           /* flush partial packet */
+				line_too_long = false;
+			} else if (rx_ptr < 3) {
 				rx_packet[rx_ptr++] = ch;
 			} else {
 				line_too_long = true;

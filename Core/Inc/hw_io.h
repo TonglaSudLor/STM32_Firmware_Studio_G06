@@ -10,7 +10,8 @@
  *   Inputs  (Reed SW): PB0=Up, PC1=Down, PC0=Close, PC3=Open  (1=position reached)
  *   Inputs  (Current): PA0=WCS1800 via ADC1_IN1 (voltage divider R1=1k, R2=1.8k)
  *   Outputs (Relay):   PB12=MotorPower, PB11=ModeLight, PB2=StatusLight
- *   Outputs (Gripper): PA1=Up relay, PA4=Down relay
+ *   Outputs (Gripper): PA1=Up relay (spring-return vertical: 1=UP, 0=spring-DOWN)
+ *   Outputs (Claw):    PA4=Close relay (spring-return claw: 1=CLOSE, 0=spring-OPEN)
  */
 
 #ifndef HW_IO_H
@@ -43,9 +44,9 @@ typedef struct {
     volatile uint8_t out_relay_mode;   /* PB11 Relay CH2: Mode Lamp        (1=Joystick Blue, 0=Base Blue) */
     volatile uint8_t out_relay_status; /* PB2  Relay CH3: Status Lamp      (1=Red/Emergency, 0=Green/Ready) */
 
-    /* --- Gripper Outputs --- */
-    volatile uint8_t out_gripper_up;  /* PA1  Relay: Gripper UP           (1=energise UP relay) */
-    volatile uint8_t out_gripper_down;/* PA4  Relay: Gripper DOWN         (1=energise DOWN relay) */
+    /* --- Gripper / Claw Outputs (2 independent spring-return actuators) --- */
+    volatile uint8_t out_gripper_up;   /* PA1  Relay: Vertical UP   (1=energise → UP,    0=spring → DOWN) */
+    volatile uint8_t out_gripper_down; /* PA4  Relay: Claw CLOSE    (1=energise → CLOSE, 0=spring → OPEN) */
 
     /* --- Reed Switch Inputs (gripper position feedback) --- */
     volatile uint8_t in_reed_up;      /* PB0  Reed SW Up    (1=gripper is UP) */

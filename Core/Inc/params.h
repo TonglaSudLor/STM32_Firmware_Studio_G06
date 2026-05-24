@@ -72,6 +72,7 @@
  * SYSTEM TIMING & HOMING
  * ============================================================================ */
 #define HOME_HOLD_TIME_MS   1000
+#define DEFAULT_HOME_OFFSET  0.0f    /**< Angular offset (deg) added to encoder zero after sensor-based homing */
 
 #define HOMING_SEARCH_RPM    10.0f    /**< Speed for wiggle search */
 #define HOMING_CREEP_RPM     1.0f    /**< Speed for fine edge detection */
@@ -96,6 +97,14 @@
  * CURRENT SENSING — WCS1800 on PA0 (via 1kΩ/1.8kΩ voltage divider to 3.3V ADC)
  * ============================================================================ */
 #define OVERCURRENT_LIMIT_AMPS   15.0f  /**< Trip threshold — tune to motor nameplate rating */
+
+/* ============================================================================
+ * ZVD INPUT SHAPER
+ * Default system ID values: wn = 12.13 rad/s, zeta = 0.041
+ * Delay N = round(pi / (wn * sqrt(1-zeta^2)) * 100Hz) ≈ 26 ticks
+ * ============================================================================ */
+#define DEFAULT_SHAPER_OMEGA_N  12.13f  /**< Natural frequency (rad/s) */
+#define DEFAULT_SHAPER_ZETA     0.041f  /**< Damping ratio */
 
 /* ============================================================================
  * KALMAN FILTER

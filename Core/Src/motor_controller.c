@@ -77,6 +77,8 @@ static float last_rpm_for_accel = 0.0f;
 static uint32_t a_press_tick = 0;    
 static uint32_t stall_timer = 0;
 static uint32_t encoder_fault_timer = 0;
+static uint32_t homing_settle_tick    = 0;    /* relay-settle delay start tick */
+static bool     homing_settle_pending = false; /* waiting to arm re-home after E-stop clear */
 static uint32_t joystick_watchdog_timer = 0;
 static int32_t last_absolute_counts = 0;
 static bool a_button_is_held = false;
@@ -254,6 +256,53 @@ typedef struct {
 } SCurvePlan_t;
 
 static SCurvePlan_t s_plan = {0};
+
+/* ============================================================================
+ * ZVD Input Shaper
+ * Pre-computed amplitudes (A1, A2, A3) and delay-tick count (N) are updated
+ * only when parameters change — never inside the 100 Hz ISR — so expf/sqrtf
+ * never run per-tick.
+ * ========================================================================== */
+#define SHAPER_BUF_SIZE  100   /* 100 ticks @ 100 Hz = 1 s max total delay */
+
+static float    shaper_buf[SHAPER_BUF_SIZE];
+static uint32_t shaper_buf_idx = 0;
+static float    shaper_A1 = 1.0f, shaper_A2 = 0.0f, shaper_A3 = 0.0f;
+static uint32_t shaper_N  = 0;
+
+static void ZVD_UpdateCoefficients(void)
+{
+    float wn   = tuning.shaper_omega_n;
+    float zeta = tuning.shaper_zeta;
+    if (wn   <= 0.0f) wn   = 1.0f;
+    if (zeta <  0.0f) zeta = 0.0f;
+    if (zeta >= 1.0f) zeta = 0.999f;   /* underdamped only */
+
+    float sqrt1z2 = sqrtf(1.0f - zeta * zeta);
+    float K       = expf(-zeta * 3.14159265f / sqrt1z2);
+    float K2      = K * K;
+    float denom   = 1.0f + 2.0f * K + K2;
+
+    shaper_A1 = 1.0f      / denom;
+    shaper_A2 = 2.0f * K  / denom;
+    shaper_A3 = K2        / denom;
+
+    float    T_d = 3.14159265f / (wn * sqrt1z2);
+    uint32_t N   = (uint32_t)(T_d * (float)MOTOR_CONTROL_FREQ_HZ + 0.5f);
+    if (N < 1u) N = 1u;
+    if (2u * N >= (uint32_t)SHAPER_BUF_SIZE) N = ((uint32_t)SHAPER_BUF_SIZE - 1u) / 2u;
+    shaper_N = N;
+}
+
+static void ZVD_FlushBuffer(float val)
+{
+    for (int i = 0; i < SHAPER_BUF_SIZE; i++) shaper_buf[i] = val;
+}
+
+void Motor_ShaperRecompute(void)
+{
+    ZVD_UpdateCoefficients();
+}
 
 /* Conversion helpers — firmware is in RPM/RPM/s/RPM/s², planner is in
  * deg/s, deg/s², deg/s³. 1 RPM = 6 deg/s. */
@@ -725,7 +774,13 @@ void Motor_Init(void)
     tuning.min_pwm = DEFAULT_MIN_PWM;
     tuning.max_accel = DEFAULT_MAX_ACCEL;
     tuning.max_jerk  = DEFAULT_MAX_JERK;
-    
+
+    tuning.shaper_enable  = false;
+    tuning.shaper_omega_n = DEFAULT_SHAPER_OMEGA_N;
+    tuning.shaper_zeta    = DEFAULT_SHAPER_ZETA;
+    ZVD_UpdateCoefficients();
+    ZVD_FlushBuffer(0.0f);
+
     resolution_step = tuning.step_size_coarse;
     
     // Initialize PID instances
@@ -1192,12 +1247,27 @@ void Motor_ControlLoop(void)
         if (position_unknown) {
             /* Recovery from a physical (hardware) E-stop: motor relay was
              * open, encoder lost power, TIM3 quadrature counts are stale.
-             * Don't trust current_position_deg — kick off a re-home. */
-            position_unknown = false;
-            current_mode = MOTOR_MODE_POSITION;
-            trigger_homing_sequence = true;
+             * Don't trust current_position_deg — kick off a re-home.
+             *
+             * DO NOT arm homing immediately.  During the creep phase of homing
+             * the PID commands very high PWM at very low speed, causing strong
+             * PWM-switching noise on PA5 (E-Stop input, only 40 kΩ pull-up).
+             * If homing starts the instant the relay closes, noise accumulates
+             * for >300 ms and fires FAULT_ESTOP_PHYSICAL again — creating the
+             * Reset → E-stop → Reset infinite loop the user sees.
+             *
+             * Fix: hold motor STOPPED (PWM = 0) for 500 ms.  No switching means
+             * no noise → estop_debounce drains to 0 → relay fully settles.
+             * The settle timer cancels if emergency_stop re-triggers during the
+             * wait, so a real E-stop press is never masked. */
+            position_unknown      = false;
+            current_mode          = MOTOR_MODE_STOPPED;
+            trajectory.target_pos            = encoder.current_position_deg;
+            trajectory.current_setpoint_pos  = encoder.current_position_deg;
             Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
-            printf("[SAFETY] Physical E-Stop cleared — position unknown, re-homing.\r\n");
+            homing_settle_tick    = HAL_GetTick();
+            homing_settle_pending = true;
+            printf("[SAFETY] Physical E-Stop cleared — re-homing in 500 ms (relay settle).\r\n");
         } else {
             /* Soft E-stop (or boot): motor relay just closed this tick and the
              * user only asked to clear the latch — they did not request motion.
@@ -1210,9 +1280,29 @@ void Motor_ControlLoop(void)
             trajectory.current_setpoint_pos   = encoder.current_position_deg;
             printf("[SAFETY] E-Stop Cleared. Holding at current position (%.2f).\r\n", encoder.current_position_deg);
         }
+        /* Flush ZVD buffer so stale pre-E-Stop setpoints cannot leak into
+         * the shaper output on the first tick after resume. */
+        ZVD_FlushBuffer(encoder.current_position_deg);
     }
     last_emergency_stop = emergency_stop;
-    
+
+    /* ---- Relay-settle re-home: fire once the E-Stop pin is quiet for 500 ms -- */
+    if (homing_settle_pending) {
+        if (emergency_stop) {
+            /* E-stop re-triggered during settle (noise persisted or real press).
+             * hw_io.c has already set position_unknown = true again.
+             * Cancel the timer — it restarts on the next Reset clear. */
+            homing_settle_pending = false;
+        } else if ((HAL_GetTick() - homing_settle_tick) >= 500) {
+            homing_settle_pending = false;
+            if (current_mode == MOTOR_MODE_STOPPED) {  /* still in settle-hold state */
+                trigger_homing_sequence = true;
+                current_mode = MOTOR_MODE_POSITION;    /* RunHomingSequence() switches to HOMING */
+                printf("[SAFETY] Relay settled — starting re-home.\r\n");
+            }
+        }
+    }
+
     // M-button long press (3s) -> Test Mode
     if (m_button_active && current_mode != MOTOR_MODE_TEST && !emergency_stop) {
         if (HAL_GetTick() - m_button_hold_tick >= 3000) {
@@ -1678,7 +1768,27 @@ void Motor_ControlLoop(void)
             if (HAL_GetTick() - last_warn_dn > 1000) { Motor_SendAudioCommand('W'); last_warn_dn = HAL_GetTick(); }
         }
         Trajectory_Generator_Update();
-        
+
+        /* --- ZVD Input Shaper ---
+         * Filters the S-curve position setpoint before the outer PID so that
+         * the two-impulse (A2) and four-impulse (A3) delayed copies cancel the
+         * first resonant swing. Coefficients are pre-computed in
+         * ZVD_UpdateCoefficients() and never involve sqrtf/expf here. */
+        shaper_buf[shaper_buf_idx] = trajectory.current_setpoint_pos;
+        float shaped_pos;
+        if (tuning.shaper_enable && shaper_N > 0u) {
+            uint32_t i_n  = (shaper_buf_idx + (uint32_t)SHAPER_BUF_SIZE - shaper_N)
+                            % (uint32_t)SHAPER_BUF_SIZE;
+            uint32_t i_2n = (shaper_buf_idx + (uint32_t)SHAPER_BUF_SIZE - 2u * shaper_N)
+                            % (uint32_t)SHAPER_BUF_SIZE;
+            shaped_pos = shaper_A1 * shaper_buf[shaper_buf_idx]
+                       + shaper_A2 * shaper_buf[i_n]
+                       + shaper_A3 * shaper_buf[i_2n];
+        } else {
+            shaped_pos = trajectory.current_setpoint_pos;
+        }
+        shaper_buf_idx = (shaper_buf_idx + 1u) % (uint32_t)SHAPER_BUF_SIZE;
+
         // (Dynamic speed recovery removed — it was overwriting Live Expressions tuning)
 
         float target_rpm;
@@ -1687,7 +1797,7 @@ void Motor_ControlLoop(void)
 
         if (position_loop_enabled) {
             target_rpm = PID_Compute(&pid_position,
-                                     trajectory.current_setpoint_pos,
+                                     shaped_pos,
                                      encoder.current_position_deg);
         } else {
             /* Position loop bypassed — tune the velocity loop in isolation. */
@@ -1749,10 +1859,10 @@ float Motor_GetSpeed(void) { return encoder.filtered_rpm; }
  * Gripper & Sequence Functions
  * ============================================================================ */
 
-void Gripper_Up(void)    { hw.out_gripper_up = 1; hw.out_gripper_down = 0; printf("Gripper: UP\r\n"); }
-void Gripper_Down(void)  { hw.out_gripper_up = 0; hw.out_gripper_down = 1; printf("Gripper: DOWN\r\n"); }
-void Gripper_Open(void)  { hw.out_gripper_up = 1; hw.out_gripper_down = 0; printf("Gripper: OPEN\r\n"); }
-void Gripper_Close(void) { hw.out_gripper_up = 0; hw.out_gripper_down = 1; printf("Gripper: CLOSE\r\n"); }
+void Gripper_Up(void)    { hw.out_gripper_up = 1; printf("Gripper: UP\r\n"); }
+void Gripper_Down(void)  { hw.out_gripper_up = 0; printf("Gripper: DOWN\r\n"); }
+void Gripper_Open(void)  { hw.out_gripper_down = 0; printf("Claw: OPEN\r\n"); }
+void Gripper_Close(void) { hw.out_gripper_down = 1; printf("Claw: CLOSE\r\n"); }
 
 void Gripper_Toggle(void)
 {

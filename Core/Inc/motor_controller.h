@@ -116,6 +116,16 @@ typedef struct {
     float min_pwm;             /**< Minimum PWM to overcome friction */
     float max_accel;           /**< Maximum acceleration (RPM/s) — a_max for S-curve */
     float max_jerk;            /**< Maximum jerk (RPM/s²) — j_max for S-curve */
+
+    // ZVD Input Shaper
+    bool  shaper_enable;       /**< Enable ZVD input shaper */
+    float shaper_omega_n;      /**< Shaper natural frequency (rad/s) */
+    float shaper_zeta;         /**< Shaper damping ratio */
+
+    // Homing offset
+    float home_offset_deg;     /**< Shift encoder zero by this many degrees after sensor homing.
+                                 *   +X deg means sensor center maps to position +X, so position 0
+                                 *   is X degrees before the sensor (use to trim workspace origin). */
 } Motor_TuningParams_t;
 
 /**
@@ -302,6 +312,11 @@ void Motor_StartAutotuneSpeed(void);
  * @brief Main control loop ISR (100Hz)
  */
 void Motor_ControlLoop(void);
+
+/**
+ * @brief Recompute ZVD shaper coefficients after omega_n or zeta change
+ */
+void Motor_ShaperRecompute(void);
 
 /**
  * @brief Toggle between JOYSTICK (Dashboard, LPUART1=115200 8N1)

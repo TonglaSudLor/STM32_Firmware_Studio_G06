@@ -27,6 +27,11 @@ const state = {
     seqLoop: false,
     currentWaypointIdx: -1,
 
+    // ZVD Input Shaper
+    shaperEnabled: false,
+    shaperOmegaN: 12.13,
+    shaperZeta: 0.041,
+
     // Kalman filter telemetry
     kfEnabled: false,
     kfTheta: 0,         // deg
@@ -170,8 +175,8 @@ function processPacket(packet) {
             case 'FAULT': state.fault = decodeFault(val); break;
             case 'PROX': state.prox = val !== '1'; break;
             case 'GHOST': state.ghost = val === '1'; break;
-            case 'GUP': break;
-            case 'GDN': state.gripper_ud = val === '1'; state.gripper_co = val === '1'; break;
+            case 'GUP': state.gripper_ud = val === '0'; break;  // GUP=1 → UP relay ON → gripper is UP (ud=false=not-down)
+            case 'GDN': state.gripper_co = val === '1'; break;  // GDN=1 → claw CLOSE relay ON → claw is CLOSED
             case 'CURR': state.current = safeNum; break;
             case 'KFEN': state.kfEnabled = val === '1'; break;
             case 'KTH': state.kfTheta = safeNum; break;
@@ -214,6 +219,25 @@ function processPacket(packet) {
                 }
                 break;
             }
+            case 'SHPEN': {
+                if (Date.now() - shaperUserClickedAt < 2000) break;
+                const newShaper = val === '1';
+                if (newShaper !== state.shaperEnabled) {
+                    state.shaperEnabled = newShaper;
+                    updateShaperBtn();
+                }
+                break;
+            }
+            case 'SHPWN':
+                state.shaperOmegaN = safeNum;
+                syncTuning('input-shaper-wn', val);
+                updateShaperDelayInfo();
+                break;
+            case 'SHPZT':
+                state.shaperZeta = safeNum;
+                syncTuning('input-shaper-zeta', val);
+                updateShaperDelayInfo();
+                break;
         }
     });
 
@@ -394,7 +418,7 @@ btnGripperUD.addEventListener('click', () => {
 
 btnGripperCO.addEventListener('click', () => {
     state.gripper_co = 1 - state.gripper_co;
-    sendCommand(state.gripper_co ? "CMD:GRIP_CLOSE" : "CMD:GRIP_OPEN");
+    sendCommand(state.gripper_co ? "CMD:CLAW_CLOSE" : "CMD:CLAW_OPEN");
     updateUI();
 });
 
@@ -566,6 +590,60 @@ btnPosLoop.addEventListener('click', () => {
 });
 renderPosLoopBtn();
 
+// --- ZVD Input Shaper controls ---
+let shaperUserClickedAt = 0;
+
+function updateShaperBtn() {
+    const btn = document.getElementById('btn-shaper-toggle');
+    if (!btn) return;
+    btn.textContent = state.shaperEnabled ? 'Shaper: ON' : 'Shaper: OFF';
+    btn.classList.toggle('active', state.shaperEnabled);
+    btn.classList.toggle('warning', !state.shaperEnabled);
+}
+
+function updateShaperDelayInfo() {
+    const el = document.getElementById('shaper-info-delay');
+    if (!el) return;
+    const wn   = parseFloat(document.getElementById('input-shaper-wn').value)   || 12.13;
+    const zeta = parseFloat(document.getElementById('input-shaper-zeta').value) || 0.041;
+    if (wn <= 0 || zeta < 0 || zeta >= 1) { el.textContent = 'Invalid parameters'; return; }
+    const sqrt1z2 = Math.sqrt(1 - zeta * zeta);
+    const Td = Math.PI / (wn * sqrt1z2);
+    const N  = Math.round(Td * 100);
+    el.textContent = `N ≈ ${N} ticks · 2N ≈ ${2 * N} ticks  (Td = ${Td.toFixed(3)} s)`;
+}
+
+document.getElementById('btn-shaper-toggle').addEventListener('click', () => {
+    state.shaperEnabled = !state.shaperEnabled;
+    shaperUserClickedAt = Date.now();
+    sendCommand(`SET:SHPEN=${state.shaperEnabled ? 1 : 0}`);
+    updateShaperBtn();
+    log(`ZVD Input Shaper ${state.shaperEnabled ? 'ENABLED' : 'DISABLED'}`);
+});
+
+document.getElementById('input-shaper-wn').addEventListener('input', updateShaperDelayInfo);
+document.getElementById('input-shaper-zeta').addEventListener('input', updateShaperDelayInfo);
+
+document.getElementById('input-shaper-wn').addEventListener('change', e => {
+    const v = parseFloat(e.target.value);
+    if (!isNaN(v) && v > 0) {
+        sendCommand(`SET:SHPWN=${v}`);
+        state.shaperOmegaN = v;
+        updateShaperDelayInfo();
+    }
+});
+document.getElementById('input-shaper-zeta').addEventListener('change', e => {
+    const v = parseFloat(e.target.value);
+    if (!isNaN(v) && v >= 0 && v < 1) {
+        sendCommand(`SET:SHPZT=${v}`);
+        state.shaperZeta = v;
+        updateShaperDelayInfo();
+    }
+});
+
+// Seed the delay info display on load
+updateShaperDelayInfo();
+
 document.getElementById('btn-jog-mode').addEventListener('click', () => {
     const newJog = state.jogMode === 'COARSE' ? 1 : 0;
     sendCommand(`SET:JOG_MODE=${newJog}`);
@@ -702,6 +780,8 @@ document.getElementById('send-tuning-btn').addEventListener('click', () => {
         'JOG_FINE': 'input-jog-fine',
         'STEP_COARSE': 'input-step-coarse',
         'STEP_FINE': 'input-step-fine',
+        'SHPWN': 'input-shaper-wn',
+        'SHPZT': 'input-shaper-zeta',
     };
     for (const [key, id] of Object.entries(params)) {
         sendCommand(`SET:${key}=${document.getElementById(id).value}`);
@@ -1160,17 +1240,17 @@ async function gripperStep(cmd, confirmFn, simMs) {
 }
 
 async function runGripperPick() {
-    await gripperStep('CMD:GRIP_OPEN', () => !state.gripper_co, gripperConfig.delays.open);
-    await gripperStep('CMD:GRIP_DN', () => state.gripper_ud, gripperConfig.delays.down);
-    await gripperStep('CMD:GRIP_CLOSE', () => state.gripper_co, gripperConfig.delays.close);
-    await gripperStep('CMD:GRIP_UP', () => !state.gripper_ud, gripperConfig.delays.up);
+    await gripperStep('CMD:CLAW_OPEN',  () => !state.gripper_co, gripperConfig.delays.open);
+    await gripperStep('CMD:GRIP_DN',    () => state.gripper_ud,  gripperConfig.delays.down);
+    await gripperStep('CMD:CLAW_CLOSE', () => state.gripper_co,  gripperConfig.delays.close);
+    await gripperStep('CMD:GRIP_UP',    () => !state.gripper_ud, gripperConfig.delays.up);
 }
 
 async function runGripperPlace() {
-    await gripperStep('CMD:GRIP_DN', () => state.gripper_ud, gripperConfig.delays.down);
-    await gripperStep('CMD:GRIP_OPEN', () => !state.gripper_co, gripperConfig.delays.open);
-    await gripperStep('CMD:GRIP_UP', () => !state.gripper_ud, gripperConfig.delays.up);
-    await gripperStep('CMD:GRIP_CLOSE', () => state.gripper_co, gripperConfig.delays.close);
+    await gripperStep('CMD:GRIP_DN',    () => state.gripper_ud,  gripperConfig.delays.down);
+    await gripperStep('CMD:CLAW_OPEN',  () => !state.gripper_co, gripperConfig.delays.open);
+    await gripperStep('CMD:GRIP_UP',    () => !state.gripper_ud, gripperConfig.delays.up);
+    await gripperStep('CMD:CLAW_CLOSE', () => state.gripper_co,  gripperConfig.delays.close);
 }
 
 // --- Path Sequencer (Live mode) ---
@@ -1298,6 +1378,8 @@ const DEFAULTS = {
     'input-jmax-rad': 1400,
     'input-step-coarse': 10,
     'input-step-fine': 1.0,
+    'input-shaper-wn': 12.13,
+    'input-shaper-zeta': 0.041,
 };
 
 function applyDefaults() {

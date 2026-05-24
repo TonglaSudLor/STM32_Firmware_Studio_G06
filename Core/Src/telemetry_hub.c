@@ -102,14 +102,18 @@ void Telemetry_Update(void) {
         last_slow_sync_tick = now;
         len = snprintf(tx_buffer, TX_BUFFER_SIZE,
             "$SKP:%.3f,SKI:%.3f,SKD:%.3f,KVFF:%.3f,KAFF:%.3f,PKP:%.3f,PKI:%.3f,PKD:%.3f,"
-            "VMAX:%.2f,AMAX:%.2f,JMAX:%.1f,STEPC:%.1f,STEPF:%.1f,JOGF:%.1f,HOMES:%.1f,MINP:%.1f,PLOOP:%d*",
+            "VMAX:%.2f,AMAX:%.2f,JMAX:%.1f,STEPC:%.1f,STEPF:%.1f,JOGF:%.1f,HOMES:%.1f,MINP:%.1f,PLOOP:%d,"
+            "SHPEN:%d,SHPWN:%.3f,SHPZT:%.4f*",
             tuning.speed_Kp, tuning.speed_Ki, tuning.speed_Kd,
             tuning.K_vff, tuning.K_aff,
             tuning.pos_Kp, tuning.pos_Ki, tuning.pos_Kd,
             tuning.move_speed_coarse, tuning.max_accel, tuning.max_jerk,
             tuning.step_size_coarse,
             tuning.step_size_fine, tuning.jog_speed_fine, tuning.move_speed_return_home, tuning.min_pwm,
-            position_loop_enabled ? 1 : 0);
+            position_loop_enabled ? 1 : 0,
+            tuning.shaper_enable ? 1 : 0,
+            tuning.shaper_omega_n,
+            tuning.shaper_zeta);
             
         if (len > 0) {
             HAL_UART_Transmit(t_huart, (uint8_t*)tx_buffer, len, 100);
@@ -252,6 +256,9 @@ static void Telemetry_HandleSet(char *payload) {
             else if (strcmp(key, "SAFE_JOY")     == 0) safety_config.joystick_check      = (val > 0.5f);
             else if (strcmp(key, "SYS_MODE")     == 0) control_system_mode = (val > 0.5f) ? CONTROL_MODE_JOYSTICK : CONTROL_MODE_BASE_SYSTEM;
             else if (strcmp(key, "JOG_MODE")     == 0) jog_mode = (val > 0.5f) ? JOG_FINE : JOG_COARSE;
+            else if (strcmp(key, "SHPEN")        == 0) tuning.shaper_enable  = (val > 0.5f);
+            else if (strcmp(key, "SHPWN")        == 0) { tuning.shaper_omega_n = val; Motor_ShaperRecompute(); }
+            else if (strcmp(key, "SHPZT")        == 0) { tuning.shaper_zeta    = val; Motor_ShaperRecompute(); }
         }
         token = strtok(NULL, ",");
     }
@@ -267,13 +274,17 @@ static void Telemetry_HandleCmd(char *payload) {
     } else if (strcmp(payload, "HOME") == 0) {
         trigger_homing_sequence = true;
     } else if (strcmp(payload, "GRIP_UP") == 0) {
-        hw.out_gripper_up   = 1;
-        hw.out_gripper_down = 0;
+        Gripper_Up();
     } else if (strcmp(payload, "GRIP_DN") == 0) {
-        hw.out_gripper_up   = 0;
-        hw.out_gripper_down = 1;
+        Gripper_Down();
     } else if (strcmp(payload, "GRIP_STOP") == 0) {
         hw.out_gripper_up   = 0;
+        hw.out_gripper_down = 0;
+    } else if (strcmp(payload, "CLAW_OPEN") == 0) {
+        Gripper_Open();
+    } else if (strcmp(payload, "CLAW_CLOSE") == 0) {
+        Gripper_Close();
+    } else if (strcmp(payload, "CLAW_STOP") == 0) {
         hw.out_gripper_down = 0;
     } else if (strcmp(payload, "TOGGLE_MODE") == 0) {
         Mode_Toggle();

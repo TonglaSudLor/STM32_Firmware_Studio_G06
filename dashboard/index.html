@@ -394,6 +394,27 @@
                                     step="0.1" value="1.0"></div>
                         </div>
                     </div>
+
+                    <div class="tuning-section">
+                        <div class="section-head-row">
+                            <h4>ZVD Input Shaping</h4>
+                            <button id="btn-shaper-toggle" class="toggle-btn warning"
+                                title="Enable/disable ZVD input shaper. Requires omega_n and zeta from system identification.">Shaper: OFF</button>
+                        </div>
+                        <div class="input-row">
+                            <div class="input-group">
+                                <label>ωₙ (rad/s)</label>
+                                <input type="number" id="input-shaper-wn" step="0.1" min="0.1" value="12.13">
+                            </div>
+                            <div class="input-group">
+                                <label>ζ (damping)</label>
+                                <input type="number" id="input-shaper-zeta" step="0.001" min="0" max="0.999" value="0.041">
+                            </div>
+                        </div>
+                        <div class="input-row" style="margin-top:4px;font-size:0.78em;color:var(--text-dim,#888)">
+                            <span id="shaper-info-delay">N ≈ 26 ticks · 2N ≈ 52 ticks</span>
+                        </div>
+                    </div>
                 </div>
                 <button id="send-tuning-btn" class="secondary-btn">Apply All Parameters</button>
             </div>
