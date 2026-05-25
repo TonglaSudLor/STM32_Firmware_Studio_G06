@@ -33,7 +33,7 @@ Core/Src/motor_controller.o: ../Core/Src/motor_controller.c \
  ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_tim_ex.h \
  ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_uart.h \
  ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_uart_ex.h \
- ../Core/Inc/hw_io.h ../Core/Inc/params.h
+ ../Core/Inc/hw_io.h ../Core/Inc/params.h ../Core/Inc/kalman.h
 ../Core/Inc/motor_controller.h:
 ../Core/Inc/main.h:
 ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal.h:
@@ -71,3 +71,4 @@ Core/Src/motor_controller.o: ../Core/Src/motor_controller.c \
 ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_uart_ex.h:
 ../Core/Inc/hw_io.h:
 ../Core/Inc/params.h:
+../Core/Inc/kalman.h:

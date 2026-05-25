@@ -101,11 +101,11 @@ void Telemetry_Update(void) {
     if (now - last_slow_sync_tick >= 1000) {
         last_slow_sync_tick = now;
         len = snprintf(tx_buffer, TX_BUFFER_SIZE,
-            "$SKP:%.3f,SKI:%.3f,SKD:%.3f,KVFF:%.3f,KAFF:%.3f,PKP:%.3f,PKI:%.3f,PKD:%.3f,"
+            "$SKP:%.3f,SKI:%.3f,SKD:%.3f,KVFF:%.3f,KAFF:%.3f,KTFF:%.3f,PKP:%.3f,PKI:%.3f,PKD:%.3f,"
             "VMAX:%.2f,AMAX:%.2f,JMAX:%.1f,STEPC:%.1f,STEPF:%.1f,JOGF:%.1f,HOMES:%.1f,MINP:%.1f,PLOOP:%d,"
             "SHPEN:%d,SHPWN:%.3f,SHPZT:%.4f,HOFS:%.2f*",
             tuning.speed_Kp, tuning.speed_Ki, tuning.speed_Kd,
-            tuning.K_vff, tuning.K_aff,
+            tuning.K_vff, tuning.K_aff, tuning.K_tff,
             tuning.pos_Kp, tuning.pos_Ki, tuning.pos_Kd,
             tuning.move_speed_coarse, tuning.max_accel, tuning.max_jerk,
             tuning.step_size_coarse,
@@ -238,6 +238,7 @@ static void Telemetry_HandleSet(char *payload) {
             else if (strcmp(key, "SINE_FREQ")== 0) sine_freq_hz  = val;
             else if (strcmp(key, "K_VFF")    == 0) tuning.K_vff    = val;
             else if (strcmp(key, "K_AFF")    == 0) tuning.K_aff    = val;
+            else if (strcmp(key, "K_TFF")    == 0) tuning.K_tff    = val;
             else if (strcmp(key, "V_MAX") == 0 || strcmp(key, "MOVE_COARSE") == 0) tuning.move_speed_coarse = val;
             else if (strcmp(key, "A_MAX") == 0 || strcmp(key, "MAX_ACCEL") == 0) tuning.max_accel = val;
             else if (strcmp(key, "J_MAX") == 0 || strcmp(key, "MAX_JERK") == 0) tuning.max_jerk = val;

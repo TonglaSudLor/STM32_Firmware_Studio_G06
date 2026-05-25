@@ -101,6 +101,7 @@ typedef struct {
     float speed_Kd;
     float K_vff;               /**< Velocity feedforward — V per (rad/s). Multiplies trajectory v_ref. */
     float K_aff;               /**< Acceleration feedforward — V per (rad/s^2). Multiplies trajectory a_ref. */
+    float K_tff;               /**< Disturbance feedforward gain (0=off, 1=full). Scales Kalman τ_L → voltage. */
     
     // PID Position Loop
     float pos_Kp;

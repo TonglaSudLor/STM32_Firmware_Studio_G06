@@ -3,5 +3,5 @@
 ../Core/Src/telemetry_hub.c:49:6:Telemetry_Update	8
 ../Core/Src/telemetry_hub.c:125:6:Telemetry_ProcessByte	6
 ../Core/Src/telemetry_hub.c:150:13:Telemetry_ParseCommand	4
-../Core/Src/telemetry_hub.c:168:13:Telemetry_HandleSet	50
-../Core/Src/telemetry_hub.c:274:13:Telemetry_HandleCmd	13
+../Core/Src/telemetry_hub.c:168:13:Telemetry_HandleSet	51
+../Core/Src/telemetry_hub.c:275:13:Telemetry_HandleCmd	13

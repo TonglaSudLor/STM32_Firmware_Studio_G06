@@ -198,6 +198,7 @@ function processPacket(packet) {
             case 'SKD': syncTuning('input-speed-kd', val); break;
             case 'KVFF': syncTuning('input-k-vff', val); break;
             case 'KAFF': syncTuning('input-k-aff', val); break;
+            case 'KTFF': syncTuning('input-k-tff', val); break;
             case 'JMAX': syncTuning('input-max-jerk-rpm', val); /* legacy RPM/s² field if present */
                 /* Also convert to rad/s³ for the SI input box */
                 syncTuning('input-jmax-rad', (parseFloat(val) || 0) * (2 * Math.PI / 60)); break;
@@ -823,6 +824,7 @@ document.getElementById('send-tuning-btn').addEventListener('click', () => {
         'SPEED_KD': 'input-speed-kd',
         'K_VFF': 'input-k-vff',
         'K_AFF': 'input-k-aff',
+        'K_TFF': 'input-k-tff',
         /* SI-unit S-curve limits — firmware converts to RPM internally */
         'V_MAX_RAD': 'input-vmax-rad',
         'A_MAX_RAD': 'input-amax-rad',
@@ -1423,6 +1425,7 @@ const DEFAULTS = {
     'input-speed-kd': 0.0,
     'input-k-vff': 0.0,
     'input-k-aff': 0.0,
+    'input-k-tff': 0.0,
     'input-pos-kp': 0.4,
     'input-pos-ki': 0.05,
     'input-pos-kd': 0.1,

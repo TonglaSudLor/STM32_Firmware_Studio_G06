@@ -21,6 +21,7 @@
  */
 #define DEFAULT_K_VFF       0.0f
 #define DEFAULT_K_AFF       0.0f
+#define DEFAULT_K_TFF       0.0f  /* disturbance (load-torque) feedforward gain — tune 0→1 */
 
 /* Position Loop (Outer) */
 #define DEFAULT_POS_KP      0.4f

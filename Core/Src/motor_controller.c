@@ -9,6 +9,7 @@
 #include "motor_controller.h"
 #include "hw_io.h"
 #include "params.h"
+#include "kalman.h"
 #include <math.h>
 #include <stdio.h>
 
@@ -782,6 +783,7 @@ void Motor_Init(void)
     tuning.pos_Kd = DEFAULT_POS_KD;
     tuning.K_vff    = DEFAULT_K_VFF;
     tuning.K_aff    = DEFAULT_K_AFF;
+    tuning.K_tff    = DEFAULT_K_TFF;
     
     tuning.jog_speed_fine = JOG_SPEED_FINE; 
     tuning.move_speed_coarse = MOVE_SPEED_COARSE;
@@ -1809,8 +1811,10 @@ void Motor_ControlLoop(void)
         const float RPM_TO_RADS = 0.10471975512f;       // 2*pi/60
         const float V_TO_PWM    = 100.0f / SUPPLY_VOLTAGE;
         float v_ref_rads = trajectory.target_vel * RPM_TO_RADS;
+        float tau_L_s    = Kalman_GetEnabled() ? Kalman_GetLoadTorque() : 0.0f;
+        float ff_dist_s  = tuning.K_tff * (tau_L_s * MOT_R_ARM / (MOT_N_GEAR * MOT_ETA_GB * MOT_K_T)) * V_TO_PWM;
         float ff_volts   = tuning.K_vff * v_ref_rads;
-        float ff = ff_volts * V_TO_PWM;
+        float ff = ff_volts * V_TO_PWM + ff_dist_s;
         current_applied_pwm = PID_Compute(&pid_speed, trajectory.target_vel, encoder.filtered_rpm) + ff;
         PWM_Apply(current_applied_pwm);
         trajectory.target_pos = encoder.current_position_deg;
@@ -1887,8 +1891,12 @@ void Motor_ControlLoop(void)
         const float V_TO_PWM    = 100.0f / SUPPLY_VOLTAGE;
         float v_ref_rads = v_ref_rpm   * RPM_TO_RADS;
         float a_ref_rads = a_ref_rpmps * RPM_TO_RADS;
+        /* Disturbance feedforward: use Kalman τ_L estimate to pre-compensate load.
+         * V_ff = τ_L * R / (N * η * Kt)  →  PWM% via V_TO_PWM. */
+        float tau_L      = Kalman_GetEnabled() ? Kalman_GetLoadTorque() : 0.0f;
+        float ff_dist    = tuning.K_tff * (tau_L * MOT_R_ARM / (MOT_N_GEAR * MOT_ETA_GB * MOT_K_T)) * V_TO_PWM;
         float ff_volts   = tuning.K_vff * v_ref_rads + tuning.K_aff * a_ref_rads;
-        float ff = ff_volts * V_TO_PWM;
+        float ff = ff_volts * V_TO_PWM + ff_dist;
 
         current_applied_pwm = PID_Compute(&pid_speed, target_rpm, encoder.filtered_rpm) + ff;
         PWM_Apply(current_applied_pwm);
