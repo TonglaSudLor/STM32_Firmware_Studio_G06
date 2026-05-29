@@ -13,6 +13,9 @@ class TelemetryChart {
         this.tuningMaxVal = tuningMaxVal;
         this.absInTuning  = !!absInTuning;
 
+        // Paused state (freezes rendering)
+        this.paused = false;
+
         // Tuning mode
         this.tuningMode = false;
         this.tuningRuns = [];        // [{times[], vals[], vsets[], target, settleTime, overshoot}]
@@ -112,6 +115,7 @@ class TelemetryChart {
 
     // --- Shared draw ---
     draw() {
+        if (this.paused) return;
         if (this.tuningMode) this._drawTuning();
         else this._drawLive();
     }

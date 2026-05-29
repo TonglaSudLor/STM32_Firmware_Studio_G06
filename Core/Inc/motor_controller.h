@@ -323,6 +323,14 @@ void Motor_UpdateControlModeButton(bool pressed);
 void Motor_SetConnectionStatus(bool connected);
 
 /**
+ * @brief Clear the gamepad-disconnect debounce (streak + last-status latch).
+ *        Call when re-arming the joystick safety check after it was disabled
+ *        (e.g. at the end of DIAG) so a stale non-'C' streak cannot instantly
+ *        re-trip FAULT_JOYSTICK_LOST.
+ */
+void Motor_ResetJoystickDebounce(void);
+
+/**
  * @brief Stream telemetry data to MATLAB
  */
 void Motor_SendDataToMatlab(void);

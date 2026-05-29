@@ -202,6 +202,12 @@ static void ModbusBridge_HandleCommands(void)
         register_frame[0x01].U16 &= ~0x02;
     }
 
+    /* 0x01 bit 5 = Fine Home (Sensor-based search) */
+    if (register_frame[0x01].U16 & 0x20) {
+        trigger_homing_sequence = true;
+        register_frame[0x01].U16 &= ~0x20;
+    }
+
     /* 0x02: Manual Gripper — react to value changes (per spec). Up=0, Down=1, Open=2, Close=4.
      * Edge-triggered so we don't spam printf every cycle. */
     {

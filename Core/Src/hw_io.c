@@ -102,13 +102,11 @@ void HW_RefreshIO(void)
          * tight wait_for_reed() poll — so estop_debounce accumulates at
          * roughly 150 Hz, not 100 Hz.  Actual window = threshold / 150 s.
          *
-         * During homing the creep phase (HOMING_CREEP_RPM = 1 RPM) commands
-         * near-maximum PWM to overcome static friction, generating the worst
-         * possible EMI on PA5 for the longest time.  Use a 1.5 s window (225
-         * samples at ~150 Hz) so the startup transient can drain before
-         * accumulating enough counts.  Normal running stays at 500 ms. */
+         * During homing or diagnostic tests, high PWM commands generate 
+         * significant EMI on PA5. Use a 1.5 s window (225 samples at ~150 Hz) 
+         * so the startup transients are ignored. Normal running stays at 500 ms. */
         uint16_t threshold = (motor_active_ticks > 0)
-                           ? (current_mode == MOTOR_MODE_HOMING ? 225 : 75)
+                           ? ((current_mode == MOTOR_MODE_HOMING || current_mode == MOTOR_MODE_TEST) ? 225 : 75)
                            : 8;
 
         if (estop_raw) {
@@ -120,18 +118,29 @@ void HW_RefreshIO(void)
     }
     hw.in_proximity   = (HAL_GPIO_ReadPin(Proximity_Sensor_GPIO_Port, Proximity_Sensor_Pin) == GPIO_PIN_RESET) ? 1 : 0;
     hw.raw_prox_bit   = (HAL_GPIO_ReadPin(Proximity_Sensor_GPIO_Port, Proximity_Sensor_Pin) == GPIO_PIN_RESET) ? 1 : 0;
-    hw.in_select_mode = (HAL_GPIO_ReadPin(Selected_Mode_GPIO_Port, Selected_Mode_Pin) == GPIO_PIN_RESET) ? 1 : 0;
 
-    /* --- Slide switch edge detect → toggle system mode --- */
+    /* --- Slide switch debouncing (integrator) → toggle system mode ---
+     * The slide switch on PA6 is susceptible to motor-current EMI.
+     * Require a consistent state for 20 samples (~200ms) before toggling. */
     {
-        static int8_t prev_select = -1;  /* -1 = uninitialized */
-        if (prev_select < 0) {
-            prev_select = (int8_t)hw.in_select_mode;  /* sync on first read; no toggle */
-        } else if ((int8_t)hw.in_select_mode != prev_select) {
-            prev_select = (int8_t)hw.in_select_mode;
-            printf("[SLIDE SW] edge detected, toggling mode\r\n");
-            Mode_Toggle();
+        static uint8_t select_debounce = 0;
+        static int8_t  debounced_state = -1; /* -1 = uninitialized */
+        uint8_t raw_select = (HAL_GPIO_ReadPin(Selected_Mode_GPIO_Port, Selected_Mode_Pin) == GPIO_PIN_RESET) ? 1 : 0;
+
+        if (debounced_state < 0) {
+            debounced_state = (int8_t)raw_select;
+        } else if (raw_select != (uint8_t)debounced_state) {
+            select_debounce++;
+            if (select_debounce >= 20) {
+                debounced_state = (int8_t)raw_select;
+                select_debounce = 0;
+                printf("[SYSTEM] Slide switch toggled (Mode Switch)...\r\n");
+                Mode_Toggle();
+            }
+        } else {
+            select_debounce = 0;
         }
+        hw.in_select_mode = (uint8_t)debounced_state;
     }
     /* Debounce reset button: require 5 consecutive active reads (~100ms at 50Hz poll).
      * Prevents contact bounce from causing rapid relay oscillation. */
@@ -209,7 +218,6 @@ void HW_RefreshIO(void)
             if (current_mode != MOTOR_MODE_HOMING) {
                 position_unknown = true;
             }
-            } /* end if (safety_config.physical_estop_check) */
         } else if (hw.in_reset_btn) {
             /* Reset Pressed AND Emergency is Released: Enter Ready state */
             emergency_stop = false;

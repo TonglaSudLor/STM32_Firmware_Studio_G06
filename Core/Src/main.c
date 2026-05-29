@@ -192,18 +192,8 @@ void Mode_Toggle(void) {
  *        Toggles control_system_mode and reconfigures LPUART1.
  */
 static void Mode_Toggle_Impl(void) {
-	extern volatile Control_SystemMode_t control_system_mode;
-	if (control_system_mode == CONTROL_MODE_JOYSTICK) {
-		printf("MODE: BASE_SYSTEM (LPUART1 -> 230400 8E1)\r\n");
-		control_system_mode = CONTROL_MODE_BASE_SYSTEM;
-		Motor_SendAudioCommand('S');
-		LPUART1_SetMode(true);
-	} else {
-		printf("MODE: JOYSTICK (LPUART1 -> 115200 8N1)\r\n");
-		control_system_mode = CONTROL_MODE_JOYSTICK;
-		Motor_SendAudioCommand('J');
-		LPUART1_SetMode(false);
-	}
+	/* FORCE JOYSTICK ONLY: Mode switching disabled for now. */
+	return;
 }
 
 /* USER CODE END 0 */
@@ -315,7 +305,7 @@ int main(void)
 		}
 
 		if (HAL_GetTick() - last_matlab_tick >= 20) {
-			// Motor_SendDataToMatlab();
+			Motor_SendDataToMatlab();
 			/* HW_RefreshIO() is owned solely by the 100 Hz TIM6 ISR now (bug 1-A);
 			 * calling it here too made it reentrant and corrupted its static
 			 * debounce/ADC state. The ISR already refreshes hw at 100 Hz. */

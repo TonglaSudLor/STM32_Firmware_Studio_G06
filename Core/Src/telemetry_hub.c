@@ -150,6 +150,9 @@ void Telemetry_ProcessByte(uint8_t byte) {
 static void Telemetry_ParseCommand(char *cmd_str) {
     has_received_command = true;
     
+    /* Refresh joystick watchdog so dashboard activity counts as a valid control link */
+    Motor_RefreshWatchdog();
+    
     // Expected format: TYPE:PAYLOAD
     char *colon = strchr(cmd_str, ':');
     if (colon == NULL) return;
@@ -300,6 +303,8 @@ static void Telemetry_HandleCmd(char *payload) {
         hw.out_gripper_down = 0;
     } else if (strcmp(payload, "TOGGLE_MODE") == 0) {
         Mode_Toggle();
+    } else if (strcmp(payload, "DIAG") == 0 || strcmp(payload, "Z") == 0) {
+        Motor_ProcessCommand('Z');
     } else if (strcmp(payload, "SET_HOME") == 0) {
         /* Instantly declare current position as home (position 0).
          * Same effect as a single A-button click on the joystick.

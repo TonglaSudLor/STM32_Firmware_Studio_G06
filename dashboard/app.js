@@ -135,6 +135,19 @@ async function readLoop() {
                 s = inputBuffer.indexOf('$');
                 e = inputBuffer.indexOf('*');
             }
+
+            // Display plain-text firmware debug output ([DIAG], [SAFETY], [SYSTEM], etc.)
+            // Only shows lines that start with '[' to ignore high-frequency CSV/numeric data.
+            const dollarPos = inputBuffer.indexOf('$');
+            const plainPart = dollarPos !== -1 ? inputBuffer.substring(0, dollarPos) : inputBuffer;
+            const lastNewline = plainPart.lastIndexOf('\n');
+            if (lastNewline !== -1) {
+                plainPart.substring(0, lastNewline).split('\n').forEach(line => {
+                    const clean = line.replace(/\r/g, '').trim();
+                    if (clean.startsWith('[')) log('STM: ' + clean, 'info');
+                });
+                inputBuffer = inputBuffer.substring(lastNewline + 1);
+            }
         } catch (err) {
             log("Read error: " + err.message, "error");
             break;
@@ -1467,3 +1480,34 @@ window.addEventListener('DOMContentLoaded', async () => {
 });
 
 updateUI();
+
+/* ============================================================================
+ * Chart freezing toggle
+ * ========================================================================== */
+(function setupChartFreezing() {
+    const freezeBtn = document.getElementById('btn-freeze-charts');
+    if (!freezeBtn) return;
+
+    const charts = [chartPos, chartVel, chartAcc];
+    let isFrozen = false;
+
+    freezeBtn.addEventListener('click', () => {
+        isFrozen = !isFrozen;
+        
+        charts.forEach(c => c.paused = isFrozen);
+        
+        if (isFrozen) {
+            freezeBtn.innerText = 'Resume';
+            freezeBtn.classList.add('active');
+        } else {
+            freezeBtn.innerText = 'Freeze';
+            freezeBtn.classList.remove('active');
+            // Force a redraw to catch up to background data immediately
+            charts.forEach(c => c.draw());
+        }
+    });
+
+    document.getElementById('btn-run-diag').addEventListener('click', () => {
+        sendCommand('CMD:DIAG');
+    });
+})();
