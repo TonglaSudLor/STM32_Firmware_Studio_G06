@@ -181,15 +181,31 @@ void Kalman_Tick(float u_volts, float theta_meas_rad)
 
     for (int i = 0; i < 4; i++) xl[i] += K[i] * y;
 
-    /* P = (I - K H) P    where H selects column 0 */
-    float Pnew[4][4];
+    /* --- Covariance update: Joseph stabilized form ---
+     * P = (I - K H) P (I - K H)^T + K R K^T
+     * This is algebraically identical to the simple form P = (I - K H) P, but
+     * remains symmetric positive-semidefinite under float32 round-off even when
+     * R (4.9e-8) is many orders of magnitude smaller than the predicted P
+     * entries (~100). With H = [1 0 0 0], (I - K H) is the identity with its
+     * first COLUMN replaced by (e0 - K). We exploit that sparsity:
+     *   MP = (I - K H) P          -> MP[i][j] = P[i][j] - K[i] * P[0][j]
+     *   Then right-multiply by (I - K H)^T, whose first ROW is (e0 - K):
+     *     Pjos[i][j] = MP[i][j] - K[j] * MP[i][0] + R * K[i] * K[j]
+     */
+    float MP[4][4];
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++)
-            Pnew[i][j] = Pl[i][j] - K[i] * Pl[0][j];
-    /* Symmetrize to fight numerical drift */
+            MP[i][j] = Pl[i][j] - K[i] * Pl[0][j];
+
+    float Pjos[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            Pjos[i][j] = MP[i][j] - K[j] * MP[i][0] + R_meas * K[i] * K[j];
+
+    /* Symmetrize to fight residual numerical drift */
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
-            P[i][j] = 0.5f * (Pnew[i][j] + Pnew[j][i]);
+            P[i][j] = 0.5f * (Pjos[i][j] + Pjos[j][i]);
         }
         x[i] = xl[i];
     }

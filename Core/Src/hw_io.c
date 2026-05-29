@@ -104,12 +104,12 @@ void HW_RefreshIO(void)
          *
          * During homing the creep phase (HOMING_CREEP_RPM = 1 RPM) commands
          * near-maximum PWM to overcome static friction, generating the worst
-         * possible EMI on PA5 for the longest time.  Use a 1 s window (150
+         * possible EMI on PA5 for the longest time.  Use a 1.5 s window (225
          * samples at ~150 Hz) so the startup transient can drain before
-         * accumulating enough counts.  Normal running stays at 300 ms. */
-        uint8_t threshold = (motor_active_ticks > 0)
-                          ? (current_mode == MOTOR_MODE_HOMING ? 150 : 30)
-                          : 8;
+         * accumulating enough counts.  Normal running stays at 500 ms. */
+        uint16_t threshold = (motor_active_ticks > 0)
+                           ? (current_mode == MOTOR_MODE_HOMING ? 225 : 75)
+                           : 8;
 
         if (estop_raw) {
             if (estop_debounce < threshold) estop_debounce++;
@@ -209,6 +209,7 @@ void HW_RefreshIO(void)
             if (current_mode != MOTOR_MODE_HOMING) {
                 position_unknown = true;
             }
+            } /* end if (safety_config.physical_estop_check) */
         } else if (hw.in_reset_btn) {
             /* Reset Pressed AND Emergency is Released: Enter Ready state */
             emergency_stop = false;

@@ -256,6 +256,7 @@ static void Telemetry_HandleSet(char *payload) {
             else if (strcmp(key, "SAFE_ENCODER") == 0) safety_config.encoder_check       = (val > 0.5f);
             else if (strcmp(key, "SAFE_OVERROT") == 0) safety_config.over_rotation_check = (val > 0.5f);
             else if (strcmp(key, "SAFE_JOY")     == 0) safety_config.joystick_check      = (val > 0.5f);
+            else if (strcmp(key, "SAFE_ESTOP")   == 0) safety_config.physical_estop_check= (val > 0.5f);
             else if (strcmp(key, "SYS_MODE")     == 0) control_system_mode = (val > 0.5f) ? CONTROL_MODE_JOYSTICK : CONTROL_MODE_BASE_SYSTEM;
             else if (strcmp(key, "JOG_MODE")     == 0) jog_mode = (val > 0.5f) ? JOG_FINE : JOG_COARSE;
             else if (strcmp(key, "SHPEN")        == 0) tuning.shaper_enable  = (val > 0.5f);
@@ -274,6 +275,9 @@ static void Telemetry_HandleSet(char *payload) {
 
 static void Telemetry_HandleCmd(char *payload) {
     if (strcmp(payload, "ESTOP=1") == 0 || strcmp(payload, "ESTOP") == 0) {
+        if (!emergency_stop) {
+            printf("[SAFETY] E-Stop LATCHED via Dashboard Command\r\n");
+        }
         emergency_stop = true;
         FAULT_SET(FAULT_ESTOP_DASHBOARD);
     } else if (strcmp(payload, "CLEAR") == 0) {

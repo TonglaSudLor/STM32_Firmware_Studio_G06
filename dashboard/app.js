@@ -677,11 +677,13 @@ const FAULT_INFO = {
 function refreshFaultModal() {
     const list = document.getElementById('modal-fault-list');
     list.innerHTML = '';
-    if (state.fault === 'NONE') {
+    const hideEstopHw = !document.getElementById('chk-safe-estop-hw')?.checked;
+    const visibleFaults = state.fault === 'NONE' ? [] : state.fault.split(' | ').filter(f => !(f === 'ESTOP_HW' && hideEstopHw));
+    if (visibleFaults.length === 0) {
         list.innerHTML = '<div style="color:var(--accent-green);">No active faults.</div>';
         return;
     }
-    state.fault.split(' | ').forEach(f => {
+    visibleFaults.forEach(f => {
         const info = FAULT_INFO[f] || { name: f, desc: 'Unknown fault.' };
         const div = document.createElement('div');
         div.className = 'fault-item';

@@ -58,6 +58,7 @@ UART_HandleTypeDef huart3;
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim7;
 TIM_HandleTypeDef htim16;
 
 /* USER CODE BEGIN PV */
@@ -78,6 +79,12 @@ volatile uint8_t modbus_rx_byte;
 static volatile uint8_t  u3_txq[U3_TXQ_SIZE];
 static volatile uint16_t u3_txq_head = 0;   /* producer index */
 static volatile uint16_t u3_txq_tail = 0;   /* consumer index */
+
+/* Guard flag for Bug 1-D: set true while LPUART1 is being torn down and
+ * re-initialised during a baud-rate switch.  _write() checks this flag so
+ * that any printf that fires during the reconfiguration window returns
+ * immediately instead of writing to a half-torn-down peripheral. */
+volatile bool lpuart_reconfiguring = false;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -91,6 +98,7 @@ static void MX_TIM3_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_TIM16_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_TIM7_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -123,17 +131,22 @@ static void USART3_DrainTx(void) {
 }
 
 /**
- * @brief Reconfigure LPUART1 between Dashboard (115200 8N1) and Modbus (19200 8E1).
+ * @brief Reconfigure LPUART1 between Dashboard (115200 8N1) and Modbus (230400 8E1).
  * @param modbus_mode  true=Modbus/Base System, false=Dashboard/Joystick
  */
 void LPUART1_SetMode(bool modbus_mode) {
+	/* Block _write() for the entire DeInit→Init window (Bug 1-D).
+	 * Any printf that fires during this gap would write to a half-torn-down
+	 * peripheral and could hard-fault the MCU. */
+	lpuart_reconfiguring = true;
+
 	/* Flush pending TX before switching */
 	HAL_Delay(50);
 
 	HAL_UART_DeInit(&hlpuart1);
 
 	if (modbus_mode) {
-		hlpuart1.Init.BaudRate = 19200;
+		hlpuart1.Init.BaudRate = 230400;
 		hlpuart1.Init.WordLength = UART_WORDLENGTH_9B;
 		hlpuart1.Init.Parity = UART_PARITY_EVEN;
 	} else {
@@ -153,6 +166,9 @@ void LPUART1_SetMode(bool modbus_mode) {
 	HAL_UARTEx_SetTxFifoThreshold(&hlpuart1, UART_TXFIFO_THRESHOLD_1_8);
 	HAL_UARTEx_SetRxFifoThreshold(&hlpuart1, UART_RXFIFO_THRESHOLD_1_8);
 	HAL_UARTEx_DisableFifoMode(&hlpuart1);
+
+	/* Peripheral is fully configured — safe to transmit again (Bug 1-D). */
+	lpuart_reconfiguring = false;
 
 	/* Re-arm RX interrupt */
 	HAL_UART_Receive_IT(&hlpuart1, (uint8_t*) &modbus_rx_byte, 1);
@@ -178,7 +194,7 @@ void Mode_Toggle(void) {
 static void Mode_Toggle_Impl(void) {
 	extern volatile Control_SystemMode_t control_system_mode;
 	if (control_system_mode == CONTROL_MODE_JOYSTICK) {
-		printf("MODE: BASE_SYSTEM (LPUART1 -> 19200 8E1)\r\n");
+		printf("MODE: BASE_SYSTEM (LPUART1 -> 230400 8E1)\r\n");
 		control_system_mode = CONTROL_MODE_BASE_SYSTEM;
 		Motor_SendAudioCommand('S');
 		LPUART1_SetMode(true);
@@ -229,6 +245,7 @@ int main(void)
   MX_TIM6_Init();
   MX_TIM16_Init();
   MX_ADC1_Init();
+  MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
 	/* Force LPUART1 to JOYSTICK/Dashboard mode (115200 8N1) on boot regardless
 	 * of slide-switch position. Slide switch will only toggle on EDGE changes. */
@@ -250,7 +267,13 @@ int main(void)
 	Motor_SetMotionProfile(250.0f, 500.0f, 0.1f);
 	Telemetry_Init(&hlpuart1);
 	Kalman_Init();
-	HAL_TIM_Base_Start_IT(&htim6); /* fires HAL_TIM_PeriodElapsedCallback at 1 kHz */
+	HAL_TIM_Base_Start_IT(&htim6); /* fires HAL_TIM_PeriodElapsedCallback at 1 kHz — control loop */
+	/* Bug 1-H: start TIM7 so Kalman_Tick fires at 1 kHz.
+	 * PREREQUISITE: TIM7 must be enabled in CubeMX (.ioc) as a Basic Timer,
+	 * Prescaler=(170-1), Period=(1000-1), with "TIM7 global interrupt" checked
+	 * under NVIC settings.  Without that .ioc entry MX_TIM7_Init() and htim7
+	 * are not generated and this line will fail to compile. */
+	HAL_TIM_Base_Start_IT(&htim7);
 
 	HAL_UART_Receive_IT(&hlpuart1, (uint8_t*) &modbus_rx_byte, 1);
 	HAL_UART_Receive_IT(&huart3, (uint8_t*) &rx_byte, 1);
@@ -497,10 +520,10 @@ static void MX_LPUART1_UART_Init(void)
 
   /* USER CODE END LPUART1_Init 1 */
   hlpuart1.Instance = LPUART1;
-  hlpuart1.Init.BaudRate = 115200;
-  hlpuart1.Init.WordLength = UART_WORDLENGTH_8B;
+  hlpuart1.Init.BaudRate = 19200;
+  hlpuart1.Init.WordLength = UART_WORDLENGTH_9B;
   hlpuart1.Init.StopBits = UART_STOPBITS_1;
-  hlpuart1.Init.Parity = UART_PARITY_NONE;
+  hlpuart1.Init.Parity = UART_PARITY_EVEN;
   hlpuart1.Init.Mode = UART_MODE_TX_RX;
   hlpuart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   hlpuart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
@@ -747,6 +770,44 @@ static void MX_TIM6_Init(void)
 }
 
 /**
+  * @brief TIM7 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM7_Init(void)
+{
+
+  /* USER CODE BEGIN TIM7_Init 0 */
+
+  /* USER CODE END TIM7_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM7_Init 1 */
+
+  /* USER CODE END TIM7_Init 1 */
+  htim7.Instance = TIM7;
+  htim7.Init.Prescaler = 169;
+  htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim7.Init.Period = 999;
+  htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM7_Init 2 */
+
+  /* USER CODE END TIM7_Init 2 */
+
+}
+
+/**
   * @brief TIM16 Initialization Function
   * @param None
   * @retval None
@@ -876,7 +937,14 @@ int _write(int file, char *ptr, int len) {
 	 * makes it fire a 'D' (disconnect) status packet → FAULT_JOYSTICK_LOST
 	 * → emergency_stop = true, blocking all motor commands.
 	 *
-	 * Do NOT add huart3 back here.  Debug logs go to the dashboard only. */
+	 * Do NOT add huart3 back here.  Debug logs go to the dashboard only.
+	 *
+	 * Bug 1-D guard: if LPUART1 is mid-reconfiguration (DeInit called but
+	 * Init not yet complete), writing to the peripheral can hard-fault the
+	 * MCU.  Return immediately — the log message is sacrificed. */
+	if (lpuart_reconfiguring) {
+		return len;
+	}
 	if (control_system_mode != CONTROL_MODE_BASE_SYSTEM) {
 		/* JOYSTICK / normal mode: LPUART1 is the dashboard serial channel */
 		HAL_UART_Transmit(&hlpuart1, (uint8_t*) ptr, len, 10);

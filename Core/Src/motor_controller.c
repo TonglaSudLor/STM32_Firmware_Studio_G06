@@ -52,7 +52,8 @@ volatile SafetyConfig_t safety_config = {
     .stall_prevent = true,
     .encoder_check = true,
     .over_rotation_check = true,
-    .joystick_check = true
+    .joystick_check = true,
+    .physical_estop_check = true
 };
 volatile Motor_FaultCode_t fault_code = FAULT_NONE;
 volatile float target_position_deg = 0.0f;
@@ -145,7 +146,8 @@ Trajectory_State_t trajectory;
  * Private Function Prototypes
  * ============================================================================ */
 static float PID_Compute(PID_Controller_t *pid, float setpoint, float feedback);
-static void PWM_Apply(float duty_cycle);
+static float PWM_Apply(float duty_cycle);
+static float Motor_DriveWithAntiWindup(float pid_out, float ff);
 static void Encoder_Update(void);
 static void Trajectory_Generator_Update(void);
 void Motor_SendAudioCommand(char sound_code);
@@ -192,28 +194,72 @@ static float PID_Compute(PID_Controller_t *pid, float setpoint, float feedback)
 }
 
 /**
- * @brief Apply PWM duty cycle to motor
+ * @brief Apply PWM duty cycle to motor.
+ * @return The final signed duty (%) actually applied to TIM1 AFTER min_pwm
+ *         friction offset and hardware saturation. This is the true actuator
+ *         output; callers route it back to the Kalman observer (current_pwm)
+ *         and to anti-windup so the controller and observer never desync from
+ *         the physical PWM. (Fix 2-E)
  */
-static void PWM_Apply(float duty_cycle)
+static float PWM_Apply(float duty_cycle)
 {
     float min_p = tuning.min_pwm;
-    
-    if (fabsf(duty_cycle) < 0.1f) { 
-        duty_cycle = 0.0f; 
+
+    if (fabsf(duty_cycle) < 0.1f) {
+        duty_cycle = 0.0f;
     } else {
         if (duty_cycle > 0) duty_cycle += min_p;
         else duty_cycle -= min_p;
     }
-    
+
     if (duty_cycle > pid_speed.output_max) duty_cycle = pid_speed.output_max;
     else if (duty_cycle < pid_speed.output_min) duty_cycle = pid_speed.output_min;
 
-    bool forward = (duty_cycle >= 0); 
+    bool forward = (duty_cycle >= 0);
     uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim1);
     uint32_t pwm_value = (uint32_t)((arr * fabsf(duty_cycle)) / 100.0f);
-    
+
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_value);
     HAL_GPIO_WritePin(Motor_Direction_GPIO_Port, Motor_Direction_Pin, forward ? GPIO_PIN_RESET : GPIO_PIN_SET);
+
+    /* Publish the true applied voltage-equivalent to the Kalman observer.
+     * Every drive path that goes through PWM_Apply now keeps the observer's
+     * input u in sync with the physical PWM, including saturated commands. */
+    current_pwm = duty_cycle;
+    return duty_cycle;
+}
+
+/**
+ * @brief Drive the inner speed loop with feedforward and back-calculation
+ *        anti-windup. (Fixes 2-A)
+ *
+ * The speed PID clamps only its OWN output, so it is blind to the extra
+ * headroom consumed by the feedforward term: pid_out may be in-range while
+ * (pid_out + ff) saturates the actuator. Left uncorrected, the integrator
+ * winds up against a limit it cannot observe.
+ *
+ * Here we form the linear command u_cmd = pid_out + ff, compute the value the
+ * actuator can actually realise within its LINEAR limits (output_min/max, i.e.
+ * excluding the min_pwm friction offset, which is a feedforward not a windup
+ * source), and bleed the integrator by the un-realisable excess scaled by
+ * 1/Ki — the standard tracking back-calculation law. Returns the true applied
+ * PWM from PWM_Apply (which also clamps + adds friction offset).
+ */
+static float Motor_DriveWithAntiWindup(float pid_out, float ff)
+{
+    float u_cmd = pid_out + ff;
+
+    float u_sat = u_cmd;
+    if (u_sat > pid_speed.output_max)      u_sat = pid_speed.output_max;
+    else if (u_sat < pid_speed.output_min) u_sat = pid_speed.output_min;
+
+    if (pid_speed.Ki > 0.0f) {
+        pid_speed.integral -= (u_cmd - u_sat) / pid_speed.Ki;
+        if (pid_speed.integral > pid_speed.integral_max)        pid_speed.integral = pid_speed.integral_max;
+        else if (pid_speed.integral < -pid_speed.integral_max)  pid_speed.integral = -pid_speed.integral_max;
+    }
+
+    return PWM_Apply(u_cmd);
 }
 
 /**
@@ -299,6 +345,8 @@ static SCurvePlan_t s_plan = {0};
 #define SHAPER_BUF_SIZE  100   /* 100 ticks @ 100 Hz = 1 s max total delay */
 
 static float    shaper_buf[SHAPER_BUF_SIZE];
+static float    shaper_buf_v[SHAPER_BUF_SIZE];  /* velocity FF, same delay line (Fix 2-B) */
+static float    shaper_buf_a[SHAPER_BUF_SIZE];  /* accel FF,    same delay line (Fix 2-B) */
 static uint32_t shaper_buf_idx = 0;
 static float    shaper_A1 = 1.0f, shaper_A2 = 0.0f, shaper_A3 = 0.0f;
 static uint32_t shaper_N  = 0;
@@ -330,7 +378,11 @@ static void ZVD_UpdateCoefficients(void)
 
 static void ZVD_FlushBuffer(float val)
 {
-    for (int i = 0; i < SHAPER_BUF_SIZE; i++) shaper_buf[i] = val;
+    for (int i = 0; i < SHAPER_BUF_SIZE; i++) {
+        shaper_buf[i]   = val;
+        shaper_buf_v[i] = 0.0f;   /* velocity/accel delay lines start at rest */
+        shaper_buf_a[i] = 0.0f;
+    }
 }
 
 void Motor_ShaperRecompute(void)
@@ -1083,7 +1135,6 @@ void Motor_ProcessPacket(char action, char safety, char status)
     if (current_status) {
         disconnect_streak = 0;
         if (!last_joystick_status) {
-            printf("\r\n[SYSTEM] >>> JOYSTICK CONNECTED <<<\r\n");
         }
         last_joystick_status  = true;
         is_joystick_connected = true;
@@ -1141,6 +1192,9 @@ void Motor_ProcessCommand(char cmd)
 
     // PRIORITY 1: Manual Emergency Stop Command
     if (cmd == 'P' || cmd == 'X') {
+        if (!emergency_stop) {
+            printf("[SAFETY] Manual E-Stop triggered via Joystick (cmd=%c)\r\n", cmd);
+        }
         emergency_stop = true;
         FAULT_SET(FAULT_ESTOP_JOYSTICK);
         Motor_SendAudioCommand('E');
@@ -1883,8 +1937,8 @@ void Motor_ControlLoop(void)
         float ff_dist_s  = tuning.K_tff * (tau_L_s * MOT_R_ARM / (MOT_N_GEAR * MOT_ETA_GB * MOT_K_T)) * V_TO_PWM;
         float ff_volts   = tuning.K_vff * v_ref_rads;
         float ff = ff_volts * V_TO_PWM + ff_dist_s;
-        current_applied_pwm = PID_Compute(&pid_speed, trajectory.target_vel, encoder.filtered_rpm) + ff;
-        PWM_Apply(current_applied_pwm);
+        float pid_out = PID_Compute(&pid_speed, trajectory.target_vel, encoder.filtered_rpm);
+        current_applied_pwm = Motor_DriveWithAntiWindup(pid_out, ff);
         trajectory.target_pos = encoder.current_position_deg;
         trajectory.current_setpoint_pos = encoder.current_position_deg;
     }
@@ -1908,8 +1962,12 @@ void Motor_ControlLoop(void)
          * the two-impulse (A2) and four-impulse (A3) delayed copies cancel the
          * first resonant swing. Coefficients are pre-computed in
          * ZVD_UpdateCoefficients() and never involve sqrtf/expf here. */
-        shaper_buf[shaper_buf_idx] = trajectory.current_setpoint_pos;
+        shaper_buf[shaper_buf_idx]   = trajectory.current_setpoint_pos;
+        shaper_buf_v[shaper_buf_idx] = trajectory.current_setpoint_vel;
+        shaper_buf_a[shaper_buf_idx] = trajectory.current_setpoint_accel;
         float shaped_pos;
+        float shaped_vel;
+        float shaped_acc;
         if (tuning.shaper_enable && shaper_N > 0u) {
             uint32_t i_n  = (shaper_buf_idx + (uint32_t)SHAPER_BUF_SIZE - shaper_N)
                             % (uint32_t)SHAPER_BUF_SIZE;
@@ -1918,8 +1976,21 @@ void Motor_ControlLoop(void)
             shaped_pos = shaper_A1 * shaper_buf[shaper_buf_idx]
                        + shaper_A2 * shaper_buf[i_n]
                        + shaper_A3 * shaper_buf[i_2n];
+            /* The ZVD shaper is a linear FIR filter, so the shaped velocity and
+             * acceleration are exactly the same convolution applied to the
+             * trajectory derivatives. Routing these (instead of the raw
+             * trajectory v/a) into the feedforward keeps the FF phase-aligned
+             * with shaped_pos — they share the same group delay. (Fix 2-B) */
+            shaped_vel = shaper_A1 * shaper_buf_v[shaper_buf_idx]
+                       + shaper_A2 * shaper_buf_v[i_n]
+                       + shaper_A3 * shaper_buf_v[i_2n];
+            shaped_acc = shaper_A1 * shaper_buf_a[shaper_buf_idx]
+                       + shaper_A2 * shaper_buf_a[i_n]
+                       + shaper_A3 * shaper_buf_a[i_2n];
         } else {
             shaped_pos = trajectory.current_setpoint_pos;
+            shaped_vel = trajectory.current_setpoint_vel;
+            shaped_acc = trajectory.current_setpoint_accel;
         }
         shaper_buf_idx = (shaper_buf_idx + 1u) % (uint32_t)SHAPER_BUF_SIZE;
         shaper_last_output = shaped_pos;   /* expose commanded setpoint to the stall check (bug 0-I) */
@@ -1927,8 +1998,11 @@ void Motor_ControlLoop(void)
         // (Dynamic speed recovery removed — it was overwriting Live Expressions tuning)
 
         float target_rpm;
-        float v_ref_rpm = trajectory.current_setpoint_vel;
-        float a_ref_rpmps = trajectory.current_setpoint_accel;
+        /* Shaper-delayed trajectory derivatives so the velocity/accel
+         * feedforward stays phase-aligned with shaped_pos. (Fix 2-B)
+         * The sine-test bypass below overrides these with analytic values. */
+        float v_ref_rpm = shaped_vel;
+        float a_ref_rpmps = shaped_acc;
 
         if (position_loop_enabled) {
             target_rpm = PID_Compute(&pid_position,
@@ -1967,9 +2041,8 @@ void Motor_ControlLoop(void)
         float ff_volts   = tuning.K_vff * v_ref_rads + tuning.K_aff * a_ref_rads;
         float ff = ff_volts * V_TO_PWM + ff_dist;
 
-        current_applied_pwm = PID_Compute(&pid_speed, target_rpm, encoder.filtered_rpm) + ff;
-        PWM_Apply(current_applied_pwm);
-        current_pwm = current_applied_pwm;
+        float pid_out = PID_Compute(&pid_speed, target_rpm, encoder.filtered_rpm);
+        current_applied_pwm = Motor_DriveWithAntiWindup(pid_out, ff);
 
         // Ghost Mode settle check: Must be within 0.5 deg AND < 1.0 RPM for 3 seconds
         if (ghost_move_active) {

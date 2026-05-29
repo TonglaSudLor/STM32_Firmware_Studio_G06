@@ -149,6 +149,7 @@ typedef struct {
     bool encoder_check;        /**< Enable E-Stop on encoder loss/inversion */
     bool over_rotation_check;  /**< Enable E-Stop on soft limit breach */
     bool joystick_check;       /**< Enable E-Stop on joystick connection loss */
+    bool physical_estop_check; /**< Enable E-Stop from physical pin (PA5) */
 } SafetyConfig_t;
 
 /**

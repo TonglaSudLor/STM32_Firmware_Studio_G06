@@ -620,6 +620,20 @@
                             <em>Cause:</em> joystick power off, Bluetooth/wireless link lost, or ESP32 fault.
                         </div>
                     </details>
+                    <details class="safety-detail">
+                        <summary class="safety-row">
+                            <span><span class="caret">▸</span> E-Stop: Physical</span>
+                            <input type="checkbox" id="chk-safe-estop-hw" checked onclick="event.stopPropagation()">
+                        </summary>
+                        <div class="trigger-desc">
+                            <strong>Triggers when:</strong>
+                            <ul>
+                                <li>Hardware E-Stop button is pressed (GPIO EXTI)</li>
+                            </ul>
+                            <em>Action:</em> release the button and press the physical Reset.<br>
+                            <em>Note:</em> disabling this only hides the fault from the dashboard — the hardware interlock remains active.
+                        </div>
+                    </details>
                 </div>
             </div>
         </div>

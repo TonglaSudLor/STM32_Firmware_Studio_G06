@@ -270,6 +270,9 @@ static void ModbusBridge_HandleCommands(void)
 
     // 0x25: Safety / Soft Stop
     if (register_frame[0x25].U16 & 0x01) {
+        if (!emergency_stop) {
+            printf("[SAFETY] E-Stop LATCHED via Modbus (0x25)\r\n");
+        }
         emergency_stop = true;
         FAULT_SET(FAULT_ESTOP_MODBUS);   /* guarded RMW (bug 1-B) */
         register_frame[0x25].U16 &= ~0x01;
