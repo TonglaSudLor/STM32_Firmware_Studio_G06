@@ -63,6 +63,18 @@ typedef enum {
     FAULT_ESTOP_MODBUS      = 0x100    /**< Modbus 0x25 soft-stop request */
 } Motor_FaultCode_t;
 
+/* Atomic fault-bit helpers (bug 1-B). fault_code |= / &= are read-modify-write
+ * and are mutated from both thread context (main loop) and the TIM6 / UART RX
+ * ISRs. Guard each RMW with a PRIMASK save/disable/restore so a preempting
+ * context cannot lose a just-set or just-cleared bit. PRIMASK save-restore is
+ * nesting-safe (works whether called from thread or ISR context). */
+#define FAULT_SET(bits)  do { uint32_t _fpm = __get_PRIMASK(); __disable_irq(); \
+                              fault_code = (Motor_FaultCode_t)(fault_code | (bits)); \
+                              __set_PRIMASK(_fpm); } while (0)
+#define FAULT_CLR(bits)  do { uint32_t _fpm = __get_PRIMASK(); __disable_irq(); \
+                              fault_code = (Motor_FaultCode_t)(fault_code & ~(bits)); \
+                              __set_PRIMASK(_fpm); } while (0)
+
 /**
  * @brief Jog operation modes
  */
@@ -212,6 +224,7 @@ extern volatile bool ghost_move_active;
 extern volatile uint32_t ghost_settle_start_tick;
 extern volatile float original_home_offset_deg;
 extern volatile bool trigger_homing_sequence;
+extern volatile uint8_t gripper_seq_request;   /**< Deferred gripper sequence: 0=none, 1=pick, 2=place (bug 1-F) */
 
 extern Ghost_Buffer_t ghost_buffer[GHOST_BUFFER_MAX];
 extern volatile uint32_t ghost_buffer_idx;
@@ -269,6 +282,13 @@ void Motor_SendAudioCommand(char sound_code);
 void Motor_ProcessCommand(char cmd);
 void Motor_ProcessPacket(char action, char safety, char status);
 bool Motor_RunHomingSequence(void);
+
+/**
+ * @brief Drain deferred control-loop log events and gripper requests.
+ *        Call from the main loop (thread context). Prints the strings that
+ *        used to be printf'd inside the 100 Hz TIM6 ISR (bug 1-G).
+ */
+void Motor_DrainControlLog(void);
 
 /**
  * @brief Instantly declare the current encoder position as home (position 0).

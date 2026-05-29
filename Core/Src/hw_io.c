@@ -195,7 +195,7 @@ void HW_RefreshIO(void)
         if (hw.in_estop) {
             /* Emergency Pressed: Safe the system immediately */
             emergency_stop = true;
-            fault_code |= FAULT_ESTOP_PHYSICAL;
+            FAULT_SET(FAULT_ESTOP_PHYSICAL);
             /* Motor relay is about to open, encoder loses power → position
              * cannot be trusted after recovery. Force a re-home.
              *
@@ -212,9 +212,9 @@ void HW_RefreshIO(void)
         } else if (hw.in_reset_btn) {
             /* Reset Pressed AND Emergency is Released: Enter Ready state */
             emergency_stop = false;
-            fault_code &= ~(FAULT_ESTOP_PHYSICAL | FAULT_PROX_LOST |
-                            FAULT_ESTOP_JOYSTICK | FAULT_ESTOP_DASHBOARD |
-                            FAULT_ESTOP_MODBUS);
+            FAULT_CLR(FAULT_ESTOP_PHYSICAL | FAULT_PROX_LOST |
+                      FAULT_ESTOP_JOYSTICK | FAULT_ESTOP_DASHBOARD |
+                      FAULT_ESTOP_MODBUS);
         }
 
         /* Update Outputs based on emergency_stop state */
@@ -229,7 +229,7 @@ void HW_RefreshIO(void)
         /* In override mode, still update emergency_stop flag but don't force outputs */
         if (hw.in_estop) {
             emergency_stop = true;
-            fault_code |= FAULT_ESTOP_PHYSICAL;
+            FAULT_SET(FAULT_ESTOP_PHYSICAL);
             if (current_mode != MOTOR_MODE_HOMING) {
                 position_unknown = true;
             }
@@ -256,7 +256,7 @@ void HW_EStop_Trigger(void)
     hw.out_relay_motor  = 0; /* Must be 0 (OFF) for safe state! */
     if (!emergency_stop) {
         emergency_stop = true;
-        fault_code |= FAULT_ESTOP_PHYSICAL;
+        FAULT_SET(FAULT_ESTOP_PHYSICAL);
         position_unknown = true;
         Motor_SendAudioCommand('E');
     }

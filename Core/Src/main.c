@@ -276,9 +276,26 @@ int main(void)
 
 		USART3_DrainTx();   /* flush deferred ESP32 echo/audio bytes (bug 0-C) */
 
+		/* Emit strings deferred by the 100 Hz control ISR (bug 1-G). */
+		Motor_DrainControlLog();
+
+		/* Run the blocking gripper Pick/Place sequence at thread level (bug 1-F).
+		 * The joystick command arrives in the USART3 RX ISR and only sets
+		 * gripper_seq_request; the busy-wait on reed switches must happen here,
+		 * never in the ISR. Clear the request before running so a press during
+		 * execution is re-latched for the next loop. */
+		if (gripper_seq_request != 0) {
+			uint8_t req = gripper_seq_request;
+			gripper_seq_request = 0;
+			if      (req == 1) Gripper_Sequence_Pick();
+			else if (req == 2) Gripper_Sequence_Place();
+		}
+
 		if (HAL_GetTick() - last_matlab_tick >= 20) {
 			// Motor_SendDataToMatlab();
-			HW_RefreshIO(); // Listen to physical buttons and sensors
+			/* HW_RefreshIO() is owned solely by the 100 Hz TIM6 ISR now (bug 1-A);
+			 * calling it here too made it reentrant and corrupted its static
+			 * debounce/ADC state. The ISR already refreshes hw at 100 Hz. */
 			Telemetry_Update();
 			last_matlab_tick = HAL_GetTick();
 		}

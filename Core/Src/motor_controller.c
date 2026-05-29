@@ -62,6 +62,38 @@ volatile bool ghost_move_active = false;
 volatile uint32_t ghost_settle_start_tick = 0;
 volatile float original_home_offset_deg = 0.0f;
 volatile bool trigger_homing_sequence = false;
+/* Deferred gripper sequence request (bug 1-F): the joystick command arrives in
+ * the USART3 RX ISR; the blocking Pick/Place sequence must NOT run there (it
+ * busy-waits on reed switches for up to ~12 s, freezing the control loop). The
+ * ISR only sets this flag; the main loop runs the sequence at thread level.
+ * 0=none, 1=pick, 2=place. */
+volatile uint8_t gripper_seq_request = 0;
+
+/* Deferred control-loop logging (bug 1-G). printf blocks for milliseconds and
+ * must not run inside the 100 Hz TIM6 ISR. The ISR sets an event bit (and
+ * latches any value the message needs); the main loop calls
+ * Motor_DrainControlLog() to emit the strings at thread level. Only the TIM6
+ * ISR sets bits (single producer → plain |= is safe); the main loop snapshots
+ * and clears under a PRIMASK guard so a concurrent ISR set is never lost. */
+#define CLOG_ESTOP_PHYS_REHOME   0x0001u
+#define CLOG_ESTOP_CLEARED_HOLD  0x0002u
+#define CLOG_RELAY_SETTLED       0x0004u
+#define CLOG_TEST_START          0x0008u
+#define CLOG_TEST_FINISH         0x0010u
+#define CLOG_HOME_TEMP_SET       0x0020u
+#define CLOG_HOME_MOVE_TEMP      0x0040u
+#define CLOG_HOME_MOVE_ORIG      0x0080u
+#define CLOG_ENCODER_INVERTED    0x0100u
+#define CLOG_ENCODER_NOSIGNAL    0x0200u
+#define CLOG_MOTOR_STALLED       0x0400u
+#define CLOG_SOFT_LIMIT          0x0800u
+
+static volatile uint32_t clog_events         = 0;
+static volatile float    clog_hold_pos       = 0.0f;  /* CLOG_ESTOP_CLEARED_HOLD */
+static volatile float    clog_temp_home_orig = 0.0f;  /* CLOG_HOME_TEMP_SET */
+static volatile float    clog_move_orig_pos  = 0.0f;  /* CLOG_HOME_MOVE_ORIG */
+static volatile float    clog_move_speed     = 0.0f;  /* CLOG_HOME_MOVE_* RPM */
+
 Ghost_Buffer_t ghost_buffer[GHOST_BUFFER_MAX];
 volatile uint32_t ghost_buffer_idx = 0;
 volatile bool ghost_dump_requested = false;
@@ -1055,7 +1087,7 @@ void Motor_ProcessPacket(char action, char safety, char status)
         }
         last_joystick_status  = true;
         is_joystick_connected = true;
-        fault_code &= ~FAULT_JOYSTICK_LOST;
+        FAULT_CLR(FAULT_JOYSTICK_LOST);
     } else {
         if (disconnect_streak < 255) disconnect_streak++;
         if (disconnect_streak >= JOYSTICK_DISCONNECT_STREAK) {
@@ -1065,10 +1097,10 @@ void Motor_ProcessPacket(char action, char safety, char status)
             last_joystick_status  = false;
             is_joystick_connected = false;
             if (safety_config.joystick_check) {
-                fault_code |= FAULT_JOYSTICK_LOST;
+                FAULT_SET(FAULT_JOYSTICK_LOST);
                 emergency_stop = true;
             } else {
-                fault_code &= ~FAULT_JOYSTICK_LOST;
+                FAULT_CLR(FAULT_JOYSTICK_LOST);
             }
         }
         /* Below the streak threshold: ignore this packet's status and keep
@@ -1081,15 +1113,15 @@ void Motor_ProcessPacket(char action, char safety, char status)
         // Toggle Emergency Stop
         if (!emergency_stop) {
             emergency_stop = true;
-            fault_code |= FAULT_ESTOP_JOYSTICK;
+            FAULT_SET(FAULT_ESTOP_JOYSTICK);
             Motor_SendAudioCommand('E');
             printf("[SAFETY] E-Stop LATCHED via Joystick\r\n");
         } else if (!hw.in_estop && hw.raw_prox_bit) {
             // Only clear if physical hardware is also safe
             emergency_stop = false;
-            fault_code &= ~(FAULT_ESTOP_PHYSICAL | FAULT_PROX_LOST |
-                            FAULT_ESTOP_JOYSTICK | FAULT_ESTOP_DASHBOARD |
-                            FAULT_ESTOP_MODBUS);
+            FAULT_CLR(FAULT_ESTOP_PHYSICAL | FAULT_PROX_LOST |
+                      FAULT_ESTOP_JOYSTICK | FAULT_ESTOP_DASHBOARD |
+                      FAULT_ESTOP_MODBUS);
             Motor_SendAudioCommand('C');
             printf("[SAFETY] E-Stop CLEARED via Joystick\r\n");
         }
@@ -1105,12 +1137,12 @@ void Motor_ProcessCommand(char cmd)
     // RESET WATCHDOG: Receiving any character indicates the joystick is alive
     is_joystick_connected = true;
     joystick_watchdog_timer = HAL_GetTick();
-    fault_code &= ~FAULT_JOYSTICK_LOST;
+    FAULT_CLR(FAULT_JOYSTICK_LOST);
 
     // PRIORITY 1: Manual Emergency Stop Command
     if (cmd == 'P' || cmd == 'X') {
         emergency_stop = true;
-        fault_code |= FAULT_ESTOP_JOYSTICK;
+        FAULT_SET(FAULT_ESTOP_JOYSTICK);
         Motor_SendAudioCommand('E');
         trajectory.current_setpoint_vel = 0.0f;
         trajectory.current_setpoint_pos = encoder.current_position_deg;
@@ -1216,8 +1248,10 @@ void Motor_ProcessCommand(char cmd)
             Gripper_Toggle(); 
         }
         break;
-    case 'S': Gripper_Sequence_Pick(); break;
-    case 'G': Gripper_Sequence_Place(); break;
+    /* Defer the blocking sequences to the main loop (bug 1-F) — this runs in
+     * the USART3 RX ISR and must never busy-wait on reed switches here. */
+    case 'S': gripper_seq_request = 1; break;
+    case 'G': gripper_seq_request = 2; break;
     case 'L': 
         if (current_mode == MOTOR_MODE_GHOST) {
             buffered_target_pos -= resolution_step;
@@ -1318,7 +1352,7 @@ void Motor_ControlLoop(void)
         pid_position.d_filt   = 0.0f;
         trajectory.current_setpoint_vel   = 0.0f;
         trajectory.current_setpoint_accel = 0.0f;
-        fault_code &= ~FAULT_ENCODER_ERROR;  /* clear stale encoder fault from E-Stop relay bounce */
+        FAULT_CLR(FAULT_ENCODER_ERROR);  /* clear stale encoder fault from E-Stop relay bounce */
 
         if (position_unknown) {
             /* Recovery from a physical (hardware) E-stop: motor relay was
@@ -1343,7 +1377,7 @@ void Motor_ControlLoop(void)
             Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
             homing_settle_tick    = HAL_GetTick();
             homing_settle_pending = true;
-            printf("[SAFETY] Physical E-Stop cleared — re-homing in 500 ms (relay settle).\r\n");
+            clog_events |= CLOG_ESTOP_PHYS_REHOME;
         } else {
             /* Soft E-stop (or boot): motor relay just closed this tick and the
              * user only asked to clear the latch — they did not request motion.
@@ -1354,7 +1388,7 @@ void Motor_ControlLoop(void)
             current_mode = MOTOR_MODE_STOPPED;
             trajectory.target_pos             = encoder.current_position_deg;
             trajectory.current_setpoint_pos   = encoder.current_position_deg;
-            printf("[SAFETY] E-Stop Cleared. Holding at current position (%.2f).\r\n", encoder.current_position_deg);
+            clog_hold_pos = encoder.current_position_deg; clog_events |= CLOG_ESTOP_CLEARED_HOLD;
         }
         /* Flush ZVD buffer so stale pre-E-Stop setpoints cannot leak into
          * the shaper output on the first tick after resume. */
@@ -1374,7 +1408,7 @@ void Motor_ControlLoop(void)
             if (current_mode == MOTOR_MODE_STOPPED) {  /* still in settle-hold state */
                 trigger_homing_sequence = true;
                 current_mode = MOTOR_MODE_POSITION;    /* RunHomingSequence() switches to HOMING */
-                printf("[SAFETY] Relay settled — starting re-home.\r\n");
+                clog_events |= CLOG_RELAY_SETTLED;
             }
         }
     }
@@ -1382,7 +1416,7 @@ void Motor_ControlLoop(void)
     // M-button long press (3s) -> Test Mode
     if (m_button_active && current_mode != MOTOR_MODE_TEST && !emergency_stop) {
         if (HAL_GetTick() - m_button_hold_tick >= 3000) {
-            printf("START\r\n");
+            clog_events |= CLOG_TEST_START;
             open_loop_test_tick = HAL_GetTick();
             current_mode = MOTOR_MODE_TEST;
             m_button_active = false;
@@ -1458,21 +1492,21 @@ void Motor_ControlLoop(void)
             pid_position.error_prev = 0.0f;
             pid_position.d_filt = 0.0f;
             
-            printf("[HOME] Temporary Home Set. Original Home is now at %.2f deg.\r\n", original_home_offset_deg);
+            clog_temp_home_orig = original_home_offset_deg; clog_events |= CLOG_HOME_TEMP_SET;
         } else if (a_button_click_count == 2) {
             // DOUBLE CLICK: Go to Temporary Home
             Motor_SendAudioCommand('2');
             trajectory.target_pos = 0.0f;
             current_mode = MOTOR_MODE_POSITION;
             Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
-            printf("[HOME] Moving to Temporary Home (0.0) at %.1f RPM\r\n", tuning.move_speed_return_home);
+            clog_move_speed = tuning.move_speed_return_home; clog_events |= CLOG_HOME_MOVE_TEMP;
         } else if (a_button_click_count >= 3) {
             // TRIPLE CLICK: Go to Original Home
             Motor_SendAudioCommand('3');
             trajectory.target_pos = original_home_offset_deg;
             current_mode = MOTOR_MODE_POSITION;
             Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
-            printf("[HOME] Moving to Original Home (%.2f) at %.1f RPM\r\n", original_home_offset_deg, tuning.move_speed_return_home);
+            clog_move_orig_pos = original_home_offset_deg; clog_move_speed = tuning.move_speed_return_home; clog_events |= CLOG_HOME_MOVE_ORIG;
         }
         
         a_button_click_count = 0;
@@ -1493,7 +1527,7 @@ void Motor_ControlLoop(void)
     // Honour the "Joystick Check" safety toggle: when disabled, neither raise
     // the fault bit nor force STOPPED mode — the motor keeps running.
     if (!is_joystick_connected && safety_config.joystick_check) {
-        fault_code |= FAULT_JOYSTICK_LOST;
+        FAULT_SET(FAULT_JOYSTICK_LOST);
         /* Do NOT interrupt the homing state machine — it drives MOTOR_MODE_HOMING
          * intentionally and must complete to set encoder zero.  Any other active
          * mode (POSITION, SPEED, JOG …) is stopped as before. */
@@ -1502,7 +1536,7 @@ void Motor_ControlLoop(void)
             PWM_Apply(0.0f);
         }
     } else {
-        fault_code &= ~FAULT_JOYSTICK_LOST;
+        FAULT_CLR(FAULT_JOYSTICK_LOST);
     }
 
     /* --- Safety Monitoring --- */
@@ -1571,9 +1605,9 @@ void Motor_ControlLoop(void)
     bool encoder_inverted = (inversion_streak >= 30);   /* 300 ms continuous */
 
     if (safety_config.encoder_check && encoder_inverted) {
-        fault_code |= FAULT_ENCODER_ERROR;
+        FAULT_SET(FAULT_ENCODER_ERROR);
         emergency_stop = true;
-        printf("CRITICAL: ENCODER INVERTED / PHASE ERROR\r\n");
+        clog_events |= CLOG_ENCODER_INVERTED;
         PWM_Apply(0.0f);
     }
 
@@ -1605,9 +1639,9 @@ void Motor_ControlLoop(void)
     }
 
     if (safety_config.encoder_check && encoder_signal_lost) {
-        fault_code |= FAULT_ENCODER_ERROR;
+        FAULT_SET(FAULT_ENCODER_ERROR);
         emergency_stop = true;
-        printf("CRITICAL: ENCODER DISCONNECTED / NO SIGNAL\r\n");
+        clog_events |= CLOG_ENCODER_NOSIGNAL;
         PWM_Apply(0.0f);
     }
 
@@ -1616,9 +1650,9 @@ void Motor_ControlLoop(void)
     //  - neither inversion nor signal-loss conditions are currently active
     //    and the e-stop has been cleared (so a recovered link drops the fault).
     if (!safety_config.encoder_check) {
-        fault_code &= ~FAULT_ENCODER_ERROR;
+        FAULT_CLR(FAULT_ENCODER_ERROR);
     } else if (!encoder_inverted && !encoder_signal_lost && !emergency_stop) {
-        fault_code &= ~FAULT_ENCODER_ERROR;
+        FAULT_CLR(FAULT_ENCODER_ERROR);
     }
 
     // Stall Timer
@@ -1626,9 +1660,9 @@ void Motor_ControlLoop(void)
         if (stall_timer == 0) stall_timer = HAL_GetTick();
         else if (HAL_GetTick() - stall_timer >= STALL_TIME_MS) {
             if (safety_config.stall_prevent) {
-                fault_code |= FAULT_MOTOR_STALLED;
+                FAULT_SET(FAULT_MOTOR_STALLED);
                 emergency_stop = true;
-                printf("CRITICAL: MOTOR STALLED\r\n");
+                clog_events |= CLOG_MOTOR_STALLED;
                 PWM_Apply(0.0f);
             }
         }
@@ -1638,19 +1672,19 @@ void Motor_ControlLoop(void)
 
     // Clear stale stall fault when the check is disabled or condition has cleared and e-stop is released
     if (!safety_config.stall_prevent) {
-        fault_code &= ~FAULT_MOTOR_STALLED;
+        FAULT_CLR(FAULT_MOTOR_STALLED);
     } else if (!stall_condition && !emergency_stop) {
-        fault_code &= ~FAULT_MOTOR_STALLED;
+        FAULT_CLR(FAULT_MOTOR_STALLED);
     }
 
     // 4. Over-Rotation Protection (Virtual Wall Notification)
     if (fabsf(encoder.current_position_deg) > SOFT_LIMIT_DEG) {
         if (!(fault_code & FAULT_OVER_ROTATION)) {
-            fault_code |= FAULT_OVER_ROTATION;
-            printf("WARNING: SOFT LIMIT REACHED (HARD STOP ACTIVE)\r\n");
+            FAULT_SET(FAULT_OVER_ROTATION);
+            clog_events |= CLOG_SOFT_LIMIT;
         }
     } else {
-        fault_code &= ~FAULT_OVER_ROTATION;
+        FAULT_CLR(FAULT_OVER_ROTATION);
     }
 
     /* Fault-bit hygiene: clear stale automatic-safety fault bits when the
@@ -1658,9 +1692,9 @@ void Motor_ControlLoop(void)
      * dashboard keeps showing "Encoder Error" after the user unchecks
      * Encoder Check because the clear-path that lives later in this function
      * is unreachable while e-stop is active. */
-    if (!safety_config.encoder_check) fault_code &= ~FAULT_ENCODER_ERROR;
-    if (!safety_config.stall_prevent) fault_code &= ~FAULT_MOTOR_STALLED;
-    if (!safety_config.joystick_check) fault_code &= ~FAULT_JOYSTICK_LOST;
+    if (!safety_config.encoder_check) FAULT_CLR(FAULT_ENCODER_ERROR);
+    if (!safety_config.stall_prevent) FAULT_CLR(FAULT_MOTOR_STALLED);
+    if (!safety_config.joystick_check) FAULT_CLR(FAULT_JOYSTICK_LOST);
 
     /* If e-stop was raised solely by an automatic safety fault that the user
      * has now disabled, and no other fault (automatic or manual) remains,
@@ -1820,7 +1854,7 @@ void Motor_ControlLoop(void)
             PWM_Apply(25.0f);
         } else {
             PWM_Apply(0.0f);
-            printf("FINISH\r\n");
+            clog_events |= CLOG_TEST_FINISH;
             tuning.move_speed_coarse = 5.0f;
             trajectory.target_pos = 0.0f;
             current_mode = MOTOR_MODE_POSITION;
@@ -1960,6 +1994,37 @@ void Motor_ControlLoop(void)
 float Motor_GetPosition(void) { return encoder.current_position_deg; }
 float Motor_GetSpeed(void) { return encoder.filtered_rpm; }
 
+/* Emit the strings deferred by the 100 Hz control ISR (bug 1-G). Call from the
+ * main loop. Snapshot+clear the event word atomically so a TIM6-ISR set that
+ * lands between the read and the clear is preserved for the next drain. */
+void Motor_DrainControlLog(void)
+{
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
+    uint32_t ev      = clog_events;
+    clog_events      = 0;
+    float hold       = clog_hold_pos;
+    float th_orig    = clog_temp_home_orig;
+    float mo_pos     = clog_move_orig_pos;
+    float spd        = clog_move_speed;
+    __set_PRIMASK(pm);
+
+    if (ev == 0) return;
+
+    if (ev & CLOG_ESTOP_PHYS_REHOME)  printf("[SAFETY] Physical E-Stop cleared — re-homing in 500 ms (relay settle).\r\n");
+    if (ev & CLOG_ESTOP_CLEARED_HOLD) printf("[SAFETY] E-Stop Cleared. Holding at current position (%.2f).\r\n", hold);
+    if (ev & CLOG_RELAY_SETTLED)      printf("[SAFETY] Relay settled — starting re-home.\r\n");
+    if (ev & CLOG_TEST_START)         printf("START\r\n");
+    if (ev & CLOG_HOME_TEMP_SET)      printf("[HOME] Temporary Home Set. Original Home is now at %.2f deg.\r\n", th_orig);
+    if (ev & CLOG_HOME_MOVE_TEMP)     printf("[HOME] Moving to Temporary Home (0.0) at %.1f RPM\r\n", spd);
+    if (ev & CLOG_HOME_MOVE_ORIG)     printf("[HOME] Moving to Original Home (%.2f) at %.1f RPM\r\n", mo_pos, spd);
+    if (ev & CLOG_ENCODER_INVERTED)   printf("CRITICAL: ENCODER INVERTED / PHASE ERROR\r\n");
+    if (ev & CLOG_ENCODER_NOSIGNAL)   printf("CRITICAL: ENCODER DISCONNECTED / NO SIGNAL\r\n");
+    if (ev & CLOG_MOTOR_STALLED)      printf("CRITICAL: MOTOR STALLED\r\n");
+    if (ev & CLOG_SOFT_LIMIT)         printf("WARNING: SOFT LIMIT REACHED (HARD STOP ACTIVE)\r\n");
+    if (ev & CLOG_TEST_FINISH)        printf("FINISH\r\n");
+}
+
 /* ============================================================================
  * Gripper & Sequence Functions
  * ============================================================================ */
@@ -1977,12 +2042,14 @@ void Gripper_Toggle(void)
     is_open = !is_open;
 }
 
-/* Wait for a reed switch to read 1, or bail out after REED_SW_TIMEOUT_MS. */
+/* Wait for a reed switch to read 1, or bail out after REED_SW_TIMEOUT_MS.
+ * Runs at thread level (main loop) after bug 1-F. Reads the cached *reed value,
+ * which the 100 Hz TIM6 ISR refreshes via HW_RefreshIO — we must NOT call
+ * HW_RefreshIO here (bug 1-A): it is not reentrant and is owned by the ISR. */
 static void wait_for_reed(volatile uint8_t *reed, const char *name)
 {
     uint32_t t0 = HAL_GetTick();
     while (!(*reed)) {
-        HW_RefreshIO();
         if ((HAL_GetTick() - t0) >= REED_SW_TIMEOUT_MS) {
             printf("Reed SW timeout: %s\r\n", name);
             return;
