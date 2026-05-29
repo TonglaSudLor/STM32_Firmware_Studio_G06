@@ -163,15 +163,28 @@ void HW_RefreshIO(void)
     hw.current_amps    = CurrentSensor_Sample();
     hw.current_adc_raw = CurrentSensor_GetRaw();
 
-    /* Overcurrent trip: cut motor power immediately */
-    if (!hw.override_enabled &&
-        (hw.current_amps > OVERCURRENT_LIMIT_AMPS || hw.current_amps < -OVERCURRENT_LIMIT_AMPS))
+    /* Overcurrent trip with time debounce (bug 0-E): a single filtered sample
+     * over the limit must NOT latch the e-stop. Inrush, direction-reversal and
+     * gripper-relay transients legitimately spike past the limit for a few ms.
+     * Require the current to stay over the limit continuously for
+     * OVERCURRENT_TIME_MS before cutting motor power. */
     {
-        emergency_stop = true;
-        hw.out_relay_motor  = 0;
-        hw.out_relay_status = 1;
-        printf("[FAULT] Overcurrent: %.1f A (limit %.1f A)\r\n",
-               hw.current_amps, (float)OVERCURRENT_LIMIT_AMPS);
+        static uint32_t overcurrent_start_tick = 0;
+        bool over = (hw.current_amps > OVERCURRENT_LIMIT_AMPS ||
+                     hw.current_amps < -OVERCURRENT_LIMIT_AMPS);
+        if (!hw.override_enabled && over) {
+            if (overcurrent_start_tick == 0) overcurrent_start_tick = HAL_GetTick();
+            if ((HAL_GetTick() - overcurrent_start_tick) >= OVERCURRENT_TIME_MS) {
+                emergency_stop = true;
+                hw.out_relay_motor  = 0;
+                hw.out_relay_status = 1;
+                printf("[FAULT] Overcurrent: %.1f A (limit %.1f A, >%lu ms)\r\n",
+                       hw.current_amps, (float)OVERCURRENT_LIMIT_AMPS,
+                       (unsigned long)OVERCURRENT_TIME_MS);
+            }
+        } else {
+            overcurrent_start_tick = 0;   /* dropped below limit (or override) — reset */
+        }
     }
 
     /* --- Read motor direction pin state for monitoring --- */

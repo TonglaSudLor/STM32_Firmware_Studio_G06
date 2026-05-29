@@ -64,6 +64,10 @@
                                               * (covers normal PID overshoot/undershoot;
                                               *  genuine stall under load has error >> 15°) */
 
+/* --- Joystick link supervision (bugs 0-A/0-D) --- */
+#define JOYSTICK_TIMEOUT_MS        200   /**< Declare link lost if no valid packet for this long (silent link) */
+#define JOYSTICK_DISCONNECT_STREAK 5     /**< Consecutive non-'C' status packets before declaring gamepad lost */
+
 #define ENCODER_FAULT_PWM_THRESHOLD 50.0f   /**< PWM threshold for hardware check */
 #define ENCODER_INVERSION_RPM_LIMIT 5.0f    /**< RPM threshold for inversion check */
 
@@ -98,6 +102,7 @@
  * CURRENT SENSING — WCS1800 on PA0 (via 1kΩ/1.8kΩ voltage divider to 3.3V ADC)
  * ============================================================================ */
 #define OVERCURRENT_LIMIT_AMPS   15.0f  /**< Trip threshold — tune to motor nameplate rating */
+#define OVERCURRENT_TIME_MS      50     /**< Current must stay over limit this long to latch e-stop (bug 0-E) */
 
 /* ============================================================================
  * ZVD INPUT SHAPER

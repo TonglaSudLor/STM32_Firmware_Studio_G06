@@ -67,6 +67,17 @@ volatile int rx_ptr = 0;
 volatile char rx_debug_log[16]; // Circular log to see command history in Live Expressions
 volatile uint8_t debug_idx = 0;
 volatile uint8_t modbus_rx_byte;
+
+/* --- USART3 (ESP32) non-blocking TX queue (bug 0-C) -----------------------
+ * Both the RX-complete callback and Motor_SendAudioCommand run in ISR context
+ * (USART3 IRQ and the 100 Hz TIM6 control loop). A blocking HAL_UART_Transmit
+ * there stalls the ISR for milliseconds, delaying the Receive_IT re-arm →
+ * RX overrun → error-callback fault loop. Bytes are enqueued here; the main
+ * loop drains the queue at thread level where blocking is safe. */
+#define U3_TXQ_SIZE 64
+static volatile uint8_t  u3_txq[U3_TXQ_SIZE];
+static volatile uint16_t u3_txq_head = 0;   /* producer index */
+static volatile uint16_t u3_txq_tail = 0;   /* consumer index */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -86,6 +97,30 @@ static void MX_ADC1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* ISR-safe byte enqueue for USART3 TX (bug 0-C). Drops bytes if full — echo
+ * and audio commands are non-critical. PRIMASK guards the head update so a
+ * non-ISR caller (e.g. homing audio) cannot be preempted mid-enqueue. */
+void USART3_QueueTx(const uint8_t *data, uint16_t len) {
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    for (uint16_t i = 0; i < len; i++) {
+        uint16_t next = (uint16_t)((u3_txq_head + 1u) % U3_TXQ_SIZE);
+        if (next == u3_txq_tail) break;       /* full — drop remainder */
+        u3_txq[u3_txq_head] = data[i];
+        u3_txq_head = next;
+    }
+    __set_PRIMASK(primask);
+}
+
+/* Drain the USART3 TX queue from the main loop (thread context only). */
+static void USART3_DrainTx(void) {
+    while (u3_txq_tail != u3_txq_head) {
+        uint8_t b = u3_txq[u3_txq_tail];
+        if (HAL_UART_Transmit(&huart3, &b, 1, 5) != HAL_OK) break;
+        u3_txq_tail = (uint16_t)((u3_txq_tail + 1u) % U3_TXQ_SIZE);
+    }
+}
 
 /**
  * @brief Reconfigure LPUART1 between Dashboard (115200 8N1) and Modbus (19200 8E1).
@@ -238,6 +273,8 @@ int main(void)
 		// Dummy usage to force linker to keep these symbols for Live Expressions
 		if (debug_idx > 100)
 			rx_debug_log[0] = 0;
+
+		USART3_DrainTx();   /* flush deferred ESP32 echo/audio bytes (bug 0-C) */
 
 		if (HAL_GetTick() - last_matlab_tick >= 20) {
 			// Motor_SendDataToMatlab();
@@ -895,8 +932,9 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 					// We have a valid 3-char packet: [Action][Safety][Status]
 					Motor_ProcessPacket(rx_packet[0], rx_packet[1], rx_packet[2]);
 
-					// Echo the action character back for the audio handshake
-					HAL_UART_Transmit(&huart3, (uint8_t*) &rx_packet[0], 1, 5);
+					/* Echo the action character back for the audio handshake.
+					 * Enqueued (not blocking) — we are inside the USART3 RX ISR (bug 0-C). */
+					USART3_QueueTx((const uint8_t*) &rx_packet[0], 1);
 				}
 				/* else: silently discard — null/garbage bytes from framing error */
 			}

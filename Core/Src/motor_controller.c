@@ -270,6 +270,7 @@ static float    shaper_buf[SHAPER_BUF_SIZE];
 static uint32_t shaper_buf_idx = 0;
 static float    shaper_A1 = 1.0f, shaper_A2 = 0.0f, shaper_A3 = 0.0f;
 static uint32_t shaper_N  = 0;
+static float    shaper_last_output = 0.0f;   /* last shaped setpoint, for stall check (bug 0-I) */
 
 static void ZVD_UpdateCoefficients(void)
 {
@@ -887,8 +888,10 @@ void Motor_SetHomeHere(void)
 
 void Motor_SendAudioCommand(char sound_code)
 {
+    /* Enqueue for the main-loop TX drain — never block here. This is called
+     * from the 100 Hz control ISR and the USART3 RX ISR (bug 0-C). */
     uint8_t pkt[2] = {'@', (uint8_t)sound_code};
-    HAL_UART_Transmit(&huart3, pkt, 2, 10);
+    USART3_QueueTx(pkt, 2);
 }
 
 void Motor_SetVoltageLimit(float max_voltage, float supply_voltage)
@@ -1032,33 +1035,45 @@ void Motor_ProcessPacket(char action, char safety, char status)
 {
     bool current_status = (status == 'C');
 
-    // 1. Connection Event Notification
-    if (current_status && !last_joystick_status) {
-        printf("\r\n[SYSTEM] >>> JOYSTICK CONNECTED <<<\r\n");
-    } 
-    else if (!current_status && last_joystick_status) {
-        printf("\r\n[SYSTEM] !!! JOYSTICK DISCONNECTED !!!\r\n");
-    }
-    last_joystick_status = current_status;
+    /* Any validated packet (printable 3 bytes) means the ESP32 link itself is
+     * alive — refresh the silence watchdog unconditionally. Motor_ControlLoop
+     * uses this timestamp to detect a *silent* link (cable pulled / ESP32 hung). */
+    joystick_watchdog_timer = HAL_GetTick();
 
-    // 2. Connection Status Logic
-    if (!current_status) {
-        is_joystick_connected = false;
-        /* Only raise the fault + latch e-stop if the Joystick safety check is
-         * enabled. When the user has unchecked "Joystick Check" in the
-         * dashboard Faults modal, a dropped joystick link must NOT halt the
-         * motor — useful for bench testing without the joystick connected. */
-        if (safety_config.joystick_check) {
-            fault_code |= FAULT_JOYSTICK_LOST;
-            emergency_stop = true;
-        } else {
-            fault_code &= ~FAULT_JOYSTICK_LOST;
+    /* Debounce the gamepad-side connection flag the ESP32 reports in the status
+     * byte (bug 0-A). A single non-'C' — a noise byte, a dropped-byte frame
+     * shift, or a momentary BT hiccup — must NOT latch the e-stop. Require
+     * JOYSTICK_DISCONNECT_STREAK consecutive non-'C' packets before declaring
+     * the gamepad lost. The JOYSTICK_TIMEOUT_MS silence watchdog in the control
+     * loop handles a hard/dead link (bug 0-D). */
+    static uint8_t disconnect_streak = 0;
+
+    if (current_status) {
+        disconnect_streak = 0;
+        if (!last_joystick_status) {
+            printf("\r\n[SYSTEM] >>> JOYSTICK CONNECTED <<<\r\n");
         }
-        return;
-    } else {
+        last_joystick_status  = true;
         is_joystick_connected = true;
-        joystick_watchdog_timer = HAL_GetTick();
         fault_code &= ~FAULT_JOYSTICK_LOST;
+    } else {
+        if (disconnect_streak < 255) disconnect_streak++;
+        if (disconnect_streak >= JOYSTICK_DISCONNECT_STREAK) {
+            if (last_joystick_status) {
+                printf("\r\n[SYSTEM] !!! JOYSTICK DISCONNECTED !!!\r\n");
+            }
+            last_joystick_status  = false;
+            is_joystick_connected = false;
+            if (safety_config.joystick_check) {
+                fault_code |= FAULT_JOYSTICK_LOST;
+                emergency_stop = true;
+            } else {
+                fault_code &= ~FAULT_JOYSTICK_LOST;
+            }
+        }
+        /* Below the streak threshold: ignore this packet's status and keep
+         * running. Fall through so the safety-button and action fields are
+         * still processed — a single transient must not freeze control input. */
     }
 
     // 3. Safety / Emergency Button Toggle Logic (Rising Edge)
@@ -1464,6 +1479,16 @@ void Motor_ControlLoop(void)
         a_button_evaluating = false;
     }
 
+    /* Link silence watchdog (bug 0-D): declare the joystick link dead if no
+     * validated packet has arrived for JOYSTICK_TIMEOUT_MS, regardless of what
+     * the ESP32 status byte said. This is the authoritative detector for a
+     * physically dead/unplugged link. Only armed in JOYSTICK control mode so it
+     * does not trigger spuriously in BASE_SYSTEM (Modbus) mode. */
+    if (control_system_mode == CONTROL_MODE_JOYSTICK &&
+        (HAL_GetTick() - joystick_watchdog_timer) > JOYSTICK_TIMEOUT_MS) {
+        is_joystick_connected = false;
+    }
+
     // Joystick fault from ESP32 disconnect signal only (no timer).
     // Honour the "Joystick Check" safety toggle: when disabled, neither raise
     // the fault bit nor force STOPPED mode — the motor keeps running.
@@ -1486,7 +1511,16 @@ void Motor_ControlLoop(void)
     // 1. Stall Detection
     if (fabsf(current_applied_pwm) >= STALL_PWM_THRESHOLD && fabsf(encoder.filtered_rpm) < STALL_VELOCITY_THRESHOLD) {
         if (current_mode == MOTOR_MODE_POSITION || current_mode == MOTOR_MODE_GHOST) {
-            float pos_error = fabsf(trajectory.target_pos - encoder.current_position_deg);
+            /* Compare against the SHAPED (commanded) setpoint, not the final
+             * target (bug 0-I). The ZVD shaper delays the command by up to 2N
+             * ticks (~0.5 s at default wn); measuring error against the un-shaped
+             * final target causes the 2 s stall window to elapse while the shaper
+             * is still ramping up the command → spurious FAULT_MOTOR_STALLED.
+             * shaper_last_output holds the shaped setpoint from the previous tick
+             * (10 ms stale — negligible). When the shaper is disabled,
+             * shaper_last_output == trajectory.current_setpoint_pos, which is also
+             * correct (and stricter than using target_pos). */
+            float pos_error = fabsf(shaper_last_output - encoder.current_position_deg);
             if (pos_error > STALL_SETTLING_ERROR_DEG) stall_condition = true;
         } else if (current_mode == MOTOR_MODE_SPEED) {
             stall_condition = true;
@@ -1854,6 +1888,7 @@ void Motor_ControlLoop(void)
             shaped_pos = trajectory.current_setpoint_pos;
         }
         shaper_buf_idx = (shaper_buf_idx + 1u) % (uint32_t)SHAPER_BUF_SIZE;
+        shaper_last_output = shaped_pos;   /* expose commanded setpoint to the stall check (bug 0-I) */
 
         // (Dynamic speed recovery removed — it was overwriting Live Expressions tuning)
 

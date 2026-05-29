@@ -31,20 +31,29 @@ void CurrentSensor_Init(ADC_HandleTypeDef *hadc)
     }
     float raw_avg = (float)sum / 64.0f;
     _v_zero = (raw_avg * (CS_VREF / CS_ADC_COUNTS)) / CS_DIV_RATIO;
+
+    /* Prime the first conversion so CurrentSensor_Sample() can run fully
+     * non-blocking (consume-then-restart). The caller, HW_RefreshIO(), runs
+     * inside the 100 Hz TIM6 control ISR — a blocking poll there stalls the
+     * control loop, Kalman tick and Modbus timing (bug 0-G). */
+    HAL_ADC_Start(_hadc);
 }
 
 float CurrentSensor_Sample(void)
 {
     if (_hadc == NULL)
-        return 0.0f;
+        return _amps_filt;
 
-    HAL_ADC_Start(_hadc);
-
-    /* Timeout accounts for 16× oversampling: 16 × 653 cycles @ 42.5 MHz ≈ 246 µs.
-     * 20 ms is a safe upper bound; if it exceeds that, hardware is broken. */
-    if (HAL_ADC_PollForConversion(_hadc, 20) == HAL_OK)
+    /* Non-blocking (bug 0-G): if the conversion started on the previous call
+     * has finished, consume it and immediately kick off the next one. If it is
+     * not ready yet, return the cached filtered value WITHOUT waiting. Timeout=0
+     * makes HAL_ADC_PollForConversion return immediately either way. A conversion
+     * (~250 µs at 42.5 MHz) is always finished by the time this is called again
+     * (~6.7 ms later at 150 Hz effective), so in practice every call gets a
+     * fresh sample — but the ISR never blocks. */
+    if (HAL_ADC_PollForConversion(_hadc, 0) == HAL_OK)
     {
-        _raw = HAL_ADC_GetValue(_hadc);   /* 12-bit after hardware right-shift */
+        _raw = HAL_ADC_GetValue(_hadc);   /* reading DR clears EOC */
 
         /* Step 1: ADC counts → voltage at PA0 pin */
         float v_adc = (float)_raw * (CS_VREF / CS_ADC_COUNTS);
@@ -57,9 +66,10 @@ float CurrentSensor_Sample(void)
 
         /* Step 4: EMA low-pass filter to suppress PWM switching noise */
         _amps_filt = CS_EMA_ALPHA * i_raw + (1.0f - CS_EMA_ALPHA) * _amps_filt;
-    }
 
-    HAL_ADC_Stop(_hadc);
+        /* Re-arm for the next call (single-conversion, software-trigger mode). */
+        HAL_ADC_Start(_hadc);
+    }
     return _amps_filt;
 }
 
