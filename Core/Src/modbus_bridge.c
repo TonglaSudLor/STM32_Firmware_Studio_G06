@@ -180,6 +180,15 @@ static void ModbusBridge_HandleCommands(void)
 {
     if (!modbus_initialized) return;
 
+    /* Only execute motor-movement commands when the Base System owns the arm.
+     * In JOYSTICK mode LPUART1 is in dashboard mode (115200 8N1) so no valid
+     * Modbus frames arrive — but stale register bits (e.g. bit 0 "Home" written
+     * during a brief mode-switch) would still fire Motor_MoveToPosition(0)
+     * every main-loop iteration until cleared, causing an unexpected snap-to-0
+     * while the user controls the arm from the dashboard. */
+    extern volatile Control_SystemMode_t control_system_mode;
+    const bool base_active = (control_system_mode == CONTROL_MODE_BASE_SYSTEM);
+
     /* 0x00: Heartbeat — Base System writes HI (18537) back when alive */
     if (register_frame[0x00].U16 == HB_HI) {
         last_hb_ack_tick = HAL_GetTick();
@@ -191,12 +200,16 @@ static void ModbusBridge_HandleCommands(void)
         base_system_alive = false;
     }
 
+    /* All motor-movement and gripper commands below only execute in BASE_SYSTEM
+     * mode. In JOYSTICK mode the bits are cleared silently so stale register
+     * state cannot interfere with dashboard or joystick control. */
+
     // 0x01: Operating Mode Bits
     if (register_frame[0x01].U16 & 0x01) { // Home (Move to 0)
-        Motor_MoveToPosition(0.0f);
+        if (base_active) Motor_MoveToPosition(0.0f);
         register_frame[0x01].U16 &= ~0x01;
     }
-    
+
     /* 0x01 bit 1 = Manual/Jog mode (per spec - just acknowledge, no action) */
     if (register_frame[0x01].U16 & 0x02) {
         register_frame[0x01].U16 &= ~0x02;
@@ -204,13 +217,13 @@ static void ModbusBridge_HandleCommands(void)
 
     /* 0x01 bit 5 = Fine Home (Sensor-based search) */
     if (register_frame[0x01].U16 & 0x20) {
-        trigger_homing_sequence = true;
+        if (base_active) trigger_homing_sequence = true;
         register_frame[0x01].U16 &= ~0x20;
     }
 
     /* 0x02: Manual Gripper — react to value changes (per spec). Up=0, Down=1, Open=2, Close=4.
      * Edge-triggered so we don't spam printf every cycle. */
-    {
+    if (base_active) {
         static uint16_t last_grip_v = 0xFFFF; /* impossible value at boot */
         uint16_t v = register_frame[0x02].U16;
         if (v != last_grip_v) {
@@ -228,7 +241,7 @@ static void ModbusBridge_HandleCommands(void)
 
     /* P&P trigger: per spec, Base System writes slots first, then writes 0x22 (pair count).
      * Detect non-zero 0x22 while P&P is idle and start the sequence. */
-    if (pnp_state == PNP_IDLE && register_frame[0x22].U16 > 0) {
+    if (base_active && pnp_state == PNP_IDLE && register_frame[0x22].U16 > 0) {
         uint16_t pairs = register_frame[0x22].U16;
         if (pairs > 5) pairs = 5;
         pnp_total_pairs  = pairs;
@@ -241,30 +254,36 @@ static void ModbusBridge_HandleCommands(void)
         register_frame[0x22].U16 = 0; /* consume trigger so it doesn't re-fire */
     }
     if (register_frame[0x01].U16 & 0x08) { // Set Home (Reset Encoder)
-        __HAL_TIM_SET_COUNTER(&htim3, 0);
-        encoder.absolute_counts = 0;
-        encoder.current_position_deg = 0.0f;
-        trajectory.target_pos = 0.0f;
-        trajectory.current_setpoint_pos = 0.0f;
+        if (base_active) {
+            __HAL_TIM_SET_COUNTER(&htim3, 0);
+            encoder.absolute_counts = 0;
+            encoder.current_position_deg = 0.0f;
+            trajectory.target_pos = 0.0f;
+            trajectory.current_setpoint_pos = 0.0f;
+        }
         register_frame[0x01].U16 &= ~0x08;
     }
     if (register_frame[0x01].U16 & 0x10) { // Test mode
-        current_mode = MOTOR_MODE_TEST;
+        if (base_active) current_mode = MOTOR_MODE_TEST;
         register_frame[0x01].U16 &= ~0x10;
     }
 
     // 0x03: Gripper Sequence
     if (register_frame[0x03].U16 != 0) {
-        uint16_t val = register_frame[0x03].U16;
-        if (val == 1) Gripper_Sequence_Pick();
-        else if (val == 2) Gripper_Sequence_Place();
+        if (base_active) {
+            uint16_t val = register_frame[0x03].U16;
+            if (val == 1) Gripper_Sequence_Pick();
+            else if (val == 2) Gripper_Sequence_Place();
+        }
         register_frame[0x03].U16 = 0;
     }
 
     /* 0x05: Jog step (Base System: +=CCW, -=CW → invert to match firmware convention) */
     if (register_frame[0x05].U16 != 0) {
-        float step = -(float)((int16_t)register_frame[0x05].U16);
-        Motor_MoveToPosition(encoder.current_position_deg + step);
+        if (base_active) {
+            float step = -(float)((int16_t)register_frame[0x05].U16);
+            Motor_MoveToPosition(encoder.current_position_deg + step);
+        }
         register_frame[0x05].U16 = 0;
     }
 
