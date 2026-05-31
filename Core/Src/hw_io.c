@@ -123,22 +123,32 @@ void HW_RefreshIO(void)
      * The slide switch on PA6 is susceptible to motor-current EMI.
      * Require a consistent state for 20 samples (~200ms) before toggling. */
     {
-        static uint8_t select_debounce = 0;
-        static int8_t  debounced_state = -1; /* -1 = uninitialized */
+        static uint8_t  select_debounce = 0;
+        static int8_t   debounced_state = -1; /* -1 = uninitialized */
+        static uint16_t toggle_cooldown = 0;  /* ticks remaining before another toggle is allowed */
         uint8_t raw_select = (HAL_GPIO_ReadPin(Selected_Mode_GPIO_Port, Selected_Mode_Pin) == GPIO_PIN_RESET) ? 1 : 0;
+        hw.in_select_raw = raw_select;
+
+        if (toggle_cooldown > 0) toggle_cooldown--;
 
         if (debounced_state < 0) {
             debounced_state = (int8_t)raw_select;
         } else if (raw_select != (uint8_t)debounced_state) {
             select_debounce++;
-            if (select_debounce >= 20) {
+            hw.select_debounce_cnt = select_debounce;
+            if (select_debounce > hw.select_debounce_peak)
+                hw.select_debounce_peak = select_debounce;
+            if (select_debounce >= 5) {
                 debounced_state = (int8_t)raw_select;
                 select_debounce = 0;
-                printf("[SYSTEM] Slide switch toggled (Mode Switch)...\r\n");
-                Mode_Toggle();
+                hw.select_debounce_cnt = 0;
+                /* Mode change is handled level-triggered in the main loop
+                 * by comparing hw.in_select_mode to control_system_mode.
+                 * No Mode_Toggle() call needed here. */
             }
         } else {
             select_debounce = 0;
+            hw.select_debounce_cnt = 0;
         }
         hw.in_select_mode = (uint8_t)debounced_state;
     }

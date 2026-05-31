@@ -302,6 +302,12 @@ static void ModbusBridge_HandleCommands(void)
         FAULT_SET(FAULT_ESTOP_MODBUS);   /* guarded RMW (bug 1-B) */
         register_frame[0x25].U16 &= ~0x01;
     } else if (register_frame[0x25].U16 & 0x02) {
+        /* Full release: clear all latched fault sources including startup latch
+         * so the PLC can release the system without requiring a DIAG run. */
+        extern volatile bool startup_estop_pending;
+        FAULT_CLR(FAULT_ESTOP_PHYSICAL | FAULT_ESTOP_MODBUS | FAULT_ESTOP_DASHBOARD |
+                  FAULT_ESTOP_JOYSTICK | FAULT_STARTUP_ESTOP | FAULT_JOYSTICK_LOST);
+        startup_estop_pending = false;
         emergency_stop = false;
         register_frame[0x25].U16 &= ~0x02;
     }
@@ -409,4 +415,14 @@ void ModbusBridge_TimerCallback(void)
 {
     hmodbus.flag_t35_timeout = 1;
     HAL_TIM_Base_Stop_IT(hmodbus.htim);
+}
+
+bool ModbusBridge_IsBaseAlive(void)
+{
+    return base_system_alive;
+}
+
+int ModbusBridge_GetPnPState(void)
+{
+    return (int)pnp_state;
 }

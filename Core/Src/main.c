@@ -135,15 +135,19 @@ static void USART3_DrainTx(void) {
  * @param modbus_mode  true=Modbus/Base System, false=Dashboard/Joystick
  */
 void LPUART1_SetMode(bool modbus_mode) {
-	/* Block _write() for the entire DeInit→Init window (Bug 1-D).
-	 * Any printf that fires during this gap would write to a half-torn-down
-	 * peripheral and could hard-fault the MCU. */
+	/* Block _write() while the peripheral is being reconfigured (Bug 1-D). */
 	lpuart_reconfiguring = true;
 
-	/* Flush pending TX before switching */
-	HAL_Delay(50);
-
-	HAL_UART_DeInit(&hlpuart1);
+	/* Abort any ongoing Receive_IT — do NOT DeInit.
+	 * HAL_UART_DeInit calls HAL_UART_MspDeInit which disables the LPUART1
+	 * RCC clock and reconfigures the GPIO pins to analog.  The subsequent
+	 * HAL_UART_MspInit then calls HAL_RCCEx_PeriphCLKConfig which can time
+	 * out or return HAL_ERROR on a live re-init → Error_Handler → infinite
+	 * loop → IWDG reset.  Calling HAL_UART_Init on a non-RESET-state handle
+	 * skips MspInit entirely and just reconfigures the peripheral registers
+	 * in-place, which is all we need for a baud-rate change. */
+	HAL_UART_Abort(&hlpuart1);
+	HAL_Delay(5);   /* let any in-flight TX byte finish (~44 µs at 115200) */
 
 	if (modbus_mode) {
 		hlpuart1.Init.BaudRate = 230400;
@@ -167,10 +171,7 @@ void LPUART1_SetMode(bool modbus_mode) {
 	HAL_UARTEx_SetRxFifoThreshold(&hlpuart1, UART_RXFIFO_THRESHOLD_1_8);
 	HAL_UARTEx_DisableFifoMode(&hlpuart1);
 
-	/* Peripheral is fully configured — safe to transmit again (Bug 1-D). */
 	lpuart_reconfiguring = false;
-
-	/* Re-arm RX interrupt */
 	HAL_UART_Receive_IT(&hlpuart1, (uint8_t*) &modbus_rx_byte, 1);
 }
 
@@ -192,8 +193,28 @@ void Mode_Toggle(void) {
  *        Toggles control_system_mode and reconfigures LPUART1.
  */
 static void Mode_Toggle_Impl(void) {
-	/* FORCE JOYSTICK ONLY: Mode switching disabled for now. */
-	return;
+	extern volatile Control_SystemMode_t control_system_mode;
+	extern volatile bool emergency_stop;
+	extern volatile bool startup_estop_pending;
+	hw.mode_toggle_fired++;   /* visible in Live Expressions — confirms this function ran */
+
+	if (control_system_mode == CONTROL_MODE_JOYSTICK) {
+		control_system_mode = CONTROL_MODE_BASE_SYSTEM;
+		LPUART1_SetMode(true);   /* switch to 230400 8E1 for Modbus */
+		Motor_SendAudioCommand('S');
+		printf("[DBG] Mode -> BASE_SYSTEM (fired=%lu)\r\n", (unsigned long)hw.mode_toggle_fired);
+
+		FAULT_CLR(FAULT_STARTUP_ESTOP | FAULT_JOYSTICK_LOST);
+		startup_estop_pending = false;
+		if (!hw.in_estop && fault_code == FAULT_NONE) {
+			emergency_stop = false;
+		}
+	} else {
+		control_system_mode = CONTROL_MODE_JOYSTICK;
+		LPUART1_SetMode(false);  /* switch back to 115200 8N1 for dashboard */
+		Motor_SendAudioCommand('J');
+		printf("[DBG] Mode -> JOYSTICK (fired=%lu)\r\n", (unsigned long)hw.mode_toggle_fired);
+	}
 }
 
 /* USER CODE END 0 */
@@ -284,7 +305,9 @@ int main(void)
 	IWDG->KR  = 0x5555U;   /* unlock PR and RLR */
 	IWDG->PR  = 6U;         /* prescaler /256 */
 	IWDG->RLR = 1875U;      /* 256 × 1875 / 32000 Hz ≈ 15 s nominal */
-	while (IWDG->SR & 0x7U) {}  /* wait for PVU + RVU + WVU */
+	/* Wait for register update to propagate through LSI domain (normally < 300 µs).
+	 * Cap at 10 ms so a stuck SR bit cannot block the main loop from starting. */
+	{ uint32_t _t = HAL_GetTick(); while ((IWDG->SR & 0x7U) && (HAL_GetTick() - _t < 10)) {} }
 	IWDG->KR  = 0xCCCCU;   /* start IWDG */
   /* USER CODE END 2 */
 
@@ -295,6 +318,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+		hw.dbg_loop_top++;   /* DIAG: proves the main loop is alive and iterating */
 		IWDG->KR = 0xAAAAU;  /* kick watchdog — loop is alive */
 
 		// Dummy usage to force linker to keep these symbols for Live Expressions
@@ -327,7 +351,46 @@ int main(void)
 			last_matlab_tick = HAL_GetTick();
 		}
 
-		/* Handle deferred mode-toggle requests from ISR/button/slide-sw/dashboard.
+		/* Slide-switch debounce and mode sync — runs entirely in the main loop.
+		 * Reads Selected_Mode_Pin directly every 10 ms. Requires 5 consecutive
+		 * consistent reads (50 ms) before committing — fast enough for a slide
+		 * switch but rejects brief EMI spikes. Mode change is blocked while
+		 * emergency_stop is active so relay-arc noise cannot cause a spurious
+		 * mode flip during or just after an E-stop event. */
+		{
+			static uint32_t sw_last_tick    = 0;
+			static uint8_t  sw_stable_state = 0xFF; /* 0xFF = uninitialized */
+			static uint8_t  sw_candidate    = 0;
+			static uint8_t  sw_count        = 0;
+
+			if (HAL_GetTick() - sw_last_tick >= 10) {
+				sw_last_tick = HAL_GetTick();
+				uint8_t sw_raw = (HAL_GPIO_ReadPin(Selected_Mode_GPIO_Port, Selected_Mode_Pin)
+				                  == GPIO_PIN_RESET) ? 1 : 0;
+
+				if (sw_stable_state == 0xFF) {
+					sw_stable_state = sw_raw;
+					sw_candidate    = sw_raw;
+				} else if (sw_raw == sw_candidate) {
+					if (sw_count < 5) sw_count++;           /* 5 × 10 ms = 50 ms */
+					if (sw_count == 5 && sw_raw != sw_stable_state && !emergency_stop) {
+						sw_stable_state = sw_raw;
+						bool sw_wants_base = (sw_raw == 1);
+						bool is_base = (control_system_mode == CONTROL_MODE_BASE_SYSTEM);
+						if (sw_wants_base != is_base) {
+							Mode_Toggle_Impl();
+						}
+					}
+				} else {
+					sw_candidate = sw_raw;
+					sw_count     = 0;
+				}
+			}
+		}
+
+		hw.dbg_loop_premode++;  /* DIAG: proves the loop reaches the mode-toggle check */
+
+		/* Handle deferred mode-toggle requests from dashboard / joystick button.
 		 * Doing the actual switch here (main loop) is safe because HAL_Delay
 		 * works correctly outside of higher-priority interrupts. */
 		if (mode_toggle_request) {
