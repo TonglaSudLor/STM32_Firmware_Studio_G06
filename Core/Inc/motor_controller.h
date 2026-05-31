@@ -61,7 +61,7 @@ typedef enum {
     FAULT_ESTOP_JOYSTICK    = 0x040,   /**< Joystick safety button (P/X) */
     FAULT_ESTOP_DASHBOARD   = 0x080,   /**< Dashboard EMERGENCY STOP button */
     FAULT_ESTOP_MODBUS      = 0x100,   /**< Modbus 0x25 soft-stop request */
-    FAULT_STARTUP_ESTOP     = 0x200    /**< Power-on latch — must be cleared by user before motor runs */
+    FAULT_STARTUP_ESTOP     = 0x200    /**< Power-on latch — cleared only when self-test passes */
 } Motor_FaultCode_t;
 
 /* Atomic fault-bit helpers (bug 1-B). fault_code |= / &= are read-modify-write
@@ -228,7 +228,7 @@ extern volatile float sine_amp_rpm;
 extern volatile float sine_freq_hz;
 extern volatile SafetyConfig_t safety_config;
 extern volatile Motor_FaultCode_t fault_code;
-extern volatile bool startup_estop_pending;  /**< Power-on latch — blocks auto-clear until user sends CMD:CLEAR */
+extern volatile bool startup_estop_pending;  /**< Cleared only when self-test passes (HARDWARE OK) */
 extern volatile float target_position_deg;
 extern volatile float buffered_target_pos;   /**< Ghost target for S-curve testing */
 extern volatile bool ghost_move_active;

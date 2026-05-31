@@ -72,8 +72,8 @@
                                               *  genuine stall under load has error >> 15°) */
 
 /* --- Joystick link supervision (bugs 0-A/0-D) --- */
-#define JOYSTICK_TIMEOUT_MS        200   /**< Declare link lost if no valid packet for this long (silent link) */
-#define JOYSTICK_DISCONNECT_STREAK 5     /**< Consecutive non-'C' status packets before declaring gamepad lost */
+#define JOYSTICK_TIMEOUT_MS        1000  /**< Declare link lost if no valid packet for this long (silent link) */
+#define JOYSTICK_DISCONNECT_STREAK 15    /**< Consecutive non-'C' status packets before declaring gamepad lost */
 
 #define ENCODER_FAULT_PWM_THRESHOLD 50.0f   /**< PWM threshold for hardware check */
 #define ENCODER_INVERSION_RPM_LIMIT 5.0f    /**< RPM threshold for inversion check */

@@ -295,7 +295,6 @@ static void Telemetry_HandleCmd(char *payload) {
         FAULT_CLR(FAULT_STARTUP_ESTOP);
         fault_code = FAULT_NONE;
         emergency_stop = false;
-        printf("[SAFETY] Startup E-Stop cleared by user.\r\n");
     } else if (strcmp(payload, "HOME") == 0) {
         trigger_homing_sequence = true;
     } else if (strcmp(payload, "GRIP_UP") == 0) {

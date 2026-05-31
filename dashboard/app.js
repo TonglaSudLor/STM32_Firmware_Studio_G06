@@ -2642,7 +2642,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     }
 });
 
-document.addEventListener('focusin', e => {
+document.addEventListener('pointerdown', e => {
     if (e.target.matches('input[type="number"], input[type="text"]')) {
         const el = e.target;
         requestAnimationFrame(() => el.select());
@@ -2743,8 +2743,8 @@ function updateReadinessUI() {
 
     const diagBtn = document.getElementById('btn-run-diag');
     const homeBtn = document.getElementById('btn-readiness-home');
-    if (diagBtn) diagBtn.disabled = !state.connected;
-    if (homeBtn) homeBtn.disabled = !state.connected;
+    if (diagBtn) diagBtn.disabled = !state.connected || readiness.diag === 'running';
+    if (homeBtn) homeBtn.disabled = !state.connected || readiness.home === 'homing';
 
     applyMotionGate();
 }

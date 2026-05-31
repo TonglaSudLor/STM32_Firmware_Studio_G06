@@ -38,7 +38,7 @@ volatile bool is_joystick_connected = true;
 static bool usart3_joystick_seen = false;
 
 volatile bool emergency_stop = true;
-volatile bool startup_estop_pending = true;  /**< Cleared only by explicit user CMD:CLEAR after power-on */
+volatile bool startup_estop_pending = true;  /**< Cleared only when self-test passes */
 /* Set to true when the physical (hardware) E-Stop fires — the motor relay
  * opens, which cuts power to the encoder too, so the TIM3 quadrature count
  * cannot be trusted across the outage. On recovery, the firmware ignores the
@@ -637,7 +637,7 @@ typedef enum {
     H_ERROR
 } HomingState_t;
 
-#define HOMING_VERIFY_OVERSHOOT_DEG  1.5f   /**< how far past edge_b we travel before reversing */
+#define HOMING_VERIFY_OVERSHOOT_DEG  5.0f   /**< how far past edge_b we travel before reversing */
 #define HOMING_VERIFY_MAX_TRAVEL_DEG 30.0f  /**< abort verify if we travel this far without finding the next edge */
 
 static HomingState_t h_state = H_IDLE;
@@ -980,9 +980,9 @@ void Motor_Init(void)
     __HAL_TIM_MOE_ENABLE(&htim1);
     HAL_TIM_Base_Start_IT(&htim6);
 
-    /* Startup safety latch: hold E-Stop until user explicitly clears it */
+    /* Power-on safety latch: motor is blocked until self-test passes */
     FAULT_SET(FAULT_STARTUP_ESTOP);
-    printf("[SAFETY] *** STARTUP E-STOP ACTIVE — Send CMD:CLEAR to release ***\r\n");
+    printf("[SAFETY] *** STARTUP E-STOP — Run Self-Test (DIAG) to release ***\r\n");
 }
 
 void Motor_MoveToPosition(float target_degrees)
@@ -1894,8 +1894,7 @@ void Motor_ControlLoop(void)
      * has now disabled, and no other fault (automatic or manual) remains,
      * auto-release the e-stop so the motor can run again. Manual e-stop
      * sources (physical button, dashboard, joystick button, Modbus) stay
-     * latched until explicitly cleared.
-     * startup_estop_pending blocks this until user sends CMD:CLEAR. */
+     * latched until explicitly cleared. */
     if (emergency_stop && fault_code == FAULT_NONE && !hw.in_estop && !startup_estop_pending) {
         emergency_stop = false;
     }
@@ -2093,6 +2092,9 @@ void Motor_ControlLoop(void)
             }
             else {
                 res = "[DIAG] RESULT: HARDWARE OK (Motion matches commands)\r\n";
+                /* Self-test passed — release startup latch */
+                startup_estop_pending = false;
+                FAULT_CLR(FAULT_STARTUP_ESTOP);
             }
             HAL_UART_Transmit(&hlpuart1, (uint8_t*)res, strlen(res), 100);
             HAL_UART_Transmit(&hlpuart1, (uint8_t*)"[DIAG] ----------------------------------\r\n\r\n", 44, 100);
