@@ -184,6 +184,7 @@ void HW_RefreshIO(void)
         if (!hw.override_enabled && over) {
             if (overcurrent_start_tick == 0) overcurrent_start_tick = HAL_GetTick();
             if ((HAL_GetTick() - overcurrent_start_tick) >= OVERCURRENT_TIME_MS) {
+                FAULT_SET(FAULT_OVERCURRENT);
                 emergency_stop = true;
                 hw.out_relay_motor  = 0;
                 hw.out_relay_status = 1;
@@ -193,6 +194,7 @@ void HW_RefreshIO(void)
             }
         } else {
             overcurrent_start_tick = 0;   /* dropped below limit (or override) — reset */
+            if (!emergency_stop) FAULT_CLR(FAULT_OVERCURRENT);
         }
     }
 

@@ -13,6 +13,7 @@
 #include "telemetry_hub.h"
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 /* ============================================================================
  * Private System Variables
@@ -38,7 +39,8 @@ volatile bool is_joystick_connected = true;
 static bool usart3_joystick_seen = false;
 
 volatile bool emergency_stop = true;
-volatile bool startup_estop_pending = true;  /**< Cleared only when self-test passes */
+volatile bool startup_estop_pending = true;
+static SafetyConfig_t diag_saved_safety;   /* saved before DIAG, restored after */  /**< Cleared only when self-test passes */
 /* Set to true when the physical (hardware) E-Stop fires — the motor relay
  * opens, which cuts power to the encoder too, so the TIM3 quadrature count
  * cannot be trusted across the outage. On recovery, the firmware ignores the
@@ -124,6 +126,7 @@ static float last_rpm_for_accel = 0.0f;
 static uint32_t a_press_tick = 0;    
 static uint32_t stall_timer = 0;
 static uint32_t encoder_fault_timer = 0;
+static uint32_t over_rot_esc_tick = 0;  /* over-rotation escalation timer */
 static uint32_t homing_settle_tick    = 0;    /* relay-settle delay start tick */
 static bool     homing_settle_pending = false; /* waiting to arm re-home after E-stop clear */
 static uint32_t joystick_watchdog_timer = 0;
@@ -637,7 +640,7 @@ typedef enum {
     H_ERROR
 } HomingState_t;
 
-#define HOMING_VERIFY_OVERSHOOT_DEG  5.0f   /**< how far past edge_b we travel before reversing */
+#define HOMING_VERIFY_OVERSHOOT_DEG  1.5f   /**< how far past edge_b we travel before reversing */
 #define HOMING_VERIFY_MAX_TRAVEL_DEG 30.0f  /**< abort verify if we travel this far without finding the next edge */
 
 static HomingState_t h_state = H_IDLE;
@@ -988,6 +991,7 @@ void Motor_Init(void)
 void Motor_MoveToPosition(float target_degrees)
 {
     if (emergency_stop) return;
+    if (position_unknown) return;  /* encoder zeroed before moving is mandatory */
     trajectory.target_pos = target_degrees;
     current_mode = MOTOR_MODE_POSITION;
     motion_config.max_velocity    = tuning.move_speed_coarse;
@@ -1070,6 +1074,7 @@ void Motor_SetMotionProfile(float max_rpm, float max_accel, float smoothing)
 void Motor_SetJogVelocity(float rpm)
 {
     if (emergency_stop) return;
+    if (position_unknown) return;  /* encoder zeroed before jogging is mandatory */
     trajectory.target_vel = rpm;
     current_mode = MOTOR_MODE_SPEED;
 }
@@ -1311,9 +1316,9 @@ void Motor_ProcessCommand(char cmd)
             emergency_stop = false;
             fault_code = FAULT_NONE;
 
-            /* DISABLE SAFETY CHECKS: We are testing hardware health; we 
-             * don't want the stall or encoder monitors to abort the 
-             * very test that is trying to diagnose them. */
+            /* DISABLE SAFETY CHECKS: Save current user config first so we
+             * can restore it exactly after the test (not hardcode true). */
+            diag_saved_safety = safety_config;
             safety_config.stall_prevent = false;
             safety_config.encoder_check = false;
             safety_config.joystick_check = false;
@@ -1869,15 +1874,24 @@ void Motor_ControlLoop(void)
         FAULT_CLR(FAULT_MOTOR_STALLED);
     }
 
-    // 4. Over-Rotation Protection (Virtual Wall Notification)
+    // 4. Over-Rotation Protection (Virtual Wall Notification + Escalation)
     if (safety_config.over_rotation_check &&
         fabsf(encoder.current_position_deg) > safety_config.soft_limit_deg) {
         if (!(fault_code & FAULT_OVER_ROTATION)) {
             FAULT_SET(FAULT_OVER_ROTATION);
             clog_events |= CLOG_SOFT_LIMIT;
         }
+        /* Escalate to E-Stop after 1 s sustained breach. Normal PID overshoot
+         * clears within one tick; 1 s means the arm is pressing a hard end-stop. */
+        if (over_rot_esc_tick == 0) over_rot_esc_tick = HAL_GetTick();
+        else if (HAL_GetTick() - over_rot_esc_tick >= 1000) {
+            emergency_stop = true;
+            over_rot_esc_tick = 0;
+            printf("[SAFETY] Over-rotation sustained >1s — E-Stop\r\n");
+        }
     } else {
         FAULT_CLR(FAULT_OVER_ROTATION);
+        over_rot_esc_tick = 0;
     }
 
     /* Fault-bit hygiene: clear stale automatic-safety fault bits when the
@@ -1906,6 +1920,13 @@ void Motor_ControlLoop(void)
             ghost_dump_requested = true;
         }
         PWM_Apply(0.0f);
+        /* On E-Stop: release gripper relays to safe rest state.
+         * Spring returns gripper DOWN (out_gripper_up=0) and claw OPEN (out_gripper_down=0).
+         * Once E-Stop is cleared the user must explicitly re-command the gripper. */
+        if (emergency_stop) {
+            hw.out_gripper_up   = 0;
+            hw.out_gripper_down = 0;
+        }
         /* CRITICAL: also reset the module-level PWM monitor variable. Without
          * this, current_applied_pwm holds the last large value commanded just
          * before the fault (e.g. -80% from the corrective brake), the early-
@@ -2103,10 +2124,10 @@ void Motor_ControlLoop(void)
             trajectory.target_pos = encoder.current_position_deg;
             trajectory.current_setpoint_pos = encoder.current_position_deg;
 
-            /* RESTORE SAFETY CHECKS */
-            safety_config.stall_prevent = true;
-            safety_config.encoder_check = true;
-            safety_config.joystick_check = true;
+            /* RESTORE SAFETY CHECKS to whatever the user had before the test */
+            safety_config.stall_prevent  = diag_saved_safety.stall_prevent;
+            safety_config.encoder_check  = diag_saved_safety.encoder_check;
+            safety_config.joystick_check = diag_saved_safety.joystick_check;
 
             /* Refresh watchdog so it doesn't trip immediately upon restoration.
              * Also clear the gamepad-disconnect debounce: a non-'C' streak that
@@ -2335,6 +2356,7 @@ static void wait_for_reed(volatile uint8_t *reed, const char *name)
 {
     uint32_t t0 = HAL_GetTick();
     while (!(*reed)) {
+        IWDG->KR = 0xAAAAU;  /* keep watchdog alive — gripper wait can take up to REED_SW_TIMEOUT_MS */
         if ((HAL_GetTick() - t0) >= REED_SW_TIMEOUT_MS) {
             printf("Reed SW timeout: %s\r\n", name);
             return;

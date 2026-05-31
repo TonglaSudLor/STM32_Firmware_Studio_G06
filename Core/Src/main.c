@@ -274,6 +274,18 @@ int main(void)
 		emergency_stop = false;
 		printf("\r\n>>> System Ready (skipped startup menu) <<<\r\n");
 	}
+
+	/* IWDG — 15-second independent hardware watchdog.
+	 * If the firmware hangs, TIM1 keeps generating PWM in hardware (motor runs
+	 * uncontrolled). IWDG resets the MCU; Motor_Init() then latches startup ESTOP
+	 * which cuts PWM immediately.  15 s is safely longer than the worst-case
+	 * gripper sequence (4 × REED_SW_TIMEOUT_MS = 12 s); wait_for_reed() also
+	 * kicks the IWDG on each loop iteration. */
+	IWDG->KR  = 0x5555U;   /* unlock PR and RLR */
+	IWDG->PR  = 6U;         /* prescaler /256 */
+	IWDG->RLR = 1875U;      /* 256 × 1875 / 32000 Hz ≈ 15 s nominal */
+	while (IWDG->SR & 0x7U) {}  /* wait for PVU + RVU + WVU */
+	IWDG->KR  = 0xCCCCU;   /* start IWDG */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -283,6 +295,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+		IWDG->KR = 0xAAAAU;  /* kick watchdog — loop is alive */
+
 		// Dummy usage to force linker to keep these symbols for Live Expressions
 		if (debug_idx > 100)
 			rx_debug_log[0] = 0;
@@ -510,7 +524,7 @@ static void MX_LPUART1_UART_Init(void)
 
   /* USER CODE END LPUART1_Init 1 */
   hlpuart1.Instance = LPUART1;
-  hlpuart1.Init.BaudRate = 19200;
+  hlpuart1.Init.BaudRate = 230400;
   hlpuart1.Init.WordLength = UART_WORDLENGTH_9B;
   hlpuart1.Init.StopBits = UART_STOPBITS_1;
   hlpuart1.Init.Parity = UART_PARITY_EVEN;

@@ -61,7 +61,8 @@ typedef enum {
     FAULT_ESTOP_JOYSTICK    = 0x040,   /**< Joystick safety button (P/X) */
     FAULT_ESTOP_DASHBOARD   = 0x080,   /**< Dashboard EMERGENCY STOP button */
     FAULT_ESTOP_MODBUS      = 0x100,   /**< Modbus 0x25 soft-stop request */
-    FAULT_STARTUP_ESTOP     = 0x200    /**< Power-on latch — cleared only when self-test passes */
+    FAULT_STARTUP_ESTOP     = 0x200,   /**< Power-on latch — cleared only when self-test passes */
+    FAULT_OVERCURRENT       = 0x400    /**< WCS1800 current exceeded OVERCURRENT_LIMIT_AMPS */
 } Motor_FaultCode_t;
 
 /* Atomic fault-bit helpers (bug 1-B). fault_code |= / &= are read-modify-write
@@ -339,6 +340,7 @@ void Motor_SetConnectionStatus(bool connected);
  *        re-trip FAULT_JOYSTICK_LOST.
  */
 void Motor_ResetJoystickDebounce(void);
+void Motor_RefreshWatchdog(void);
 
 /**
  * @brief Stream telemetry data to MATLAB

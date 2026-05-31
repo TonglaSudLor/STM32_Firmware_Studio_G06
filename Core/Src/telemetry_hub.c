@@ -2,6 +2,7 @@
 #include "motor_controller.h"
 #include "hw_io.h"
 #include "kalman.h"
+#include "modbus_bridge.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -66,11 +67,12 @@ void Telemetry_Update(void) {
     float acc_set = trajectory.current_setpoint_accel;
 
     int len = snprintf(tx_buffer, TX_BUFFER_SIZE,
-        "$POS:%.2f,VEL:%.2f,ACC:%.2f,TAR:%.2f,VSET:%.2f,ASET:%.2f,PWM:%.1f,MODE:%d,SYSM:%d,JOGM:%d,JOY:%d,ESTOP:%d,FAULT:%d,PROX:%d,GHOST:%d,GUP:%d,GDN:%d,CURR:%.2f,RSUP:%d,RSDN:%d,RSCL:%d,RSOP:%d*",
+        "$POS:%.2f,VEL:%.2f,ACC:%.2f,TAR:%.2f,VSET:%.2f,ASET:%.2f,PWM:%.1f,MODE:%d,SYSM:%d,JOGM:%d,JOY:%d,ESTOP:%d,FAULT:%d,PROX:%d,GHOST:%d,GUP:%d,GDN:%d,CURR:%.2f,RSUP:%d,RSDN:%d,RSCL:%d,RSOP:%d,BSALV:%d,PNPS:%d,PUNK:%d*",
         pos, vel, acc, target, vel_set, acc_set, current_pwm, (int)current_mode, (int)control_system_mode, (int)jog_mode, (int)is_joystick_connected,
         (int)emergency_stop, (int)fault_code, (int)hw.raw_prox_bit, (int)current_mode == MOTOR_MODE_GHOST,
         (int)hw.out_gripper_up, (int)hw.out_gripper_down, hw.current_amps,
-        (int)hw.in_reed_up, (int)hw.in_reed_down, (int)hw.in_reed_close, (int)hw.in_reed_open);
+        (int)hw.in_reed_up, (int)hw.in_reed_down, (int)hw.in_reed_close, (int)hw.in_reed_open,
+        (int)ModbusBridge_IsBaseAlive(), ModbusBridge_GetPnPState(), (int)position_unknown);
 
     if (len > 0) {
         HAL_UART_Transmit(t_huart, (uint8_t*)tx_buffer, len, 100);

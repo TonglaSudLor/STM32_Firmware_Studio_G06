@@ -18,6 +18,7 @@ const state = {
     ghost: false,
     prox: false,
     estop: false,
+    positionUnknown: false,
     gripper_ud: 0,
     gripper_co: 0,
     current: 0,
@@ -27,6 +28,8 @@ const state = {
     reed_down: -1,
     reed_close: -1,
     reed_open: -1,
+    baseAlive: false,
+    pnpState: 0,
     connectTime: null,
     waypoints: [],
     seqActive: false,
@@ -282,6 +285,17 @@ function processPacket(packet) {
             case 'RSDN': state.reed_down  = parseInt(val); break;
             case 'RSCL': state.reed_close = parseInt(val); break;
             case 'RSOP': state.reed_open  = parseInt(val); break;
+            case 'PUNK': {
+                const wasUnknown = state.positionUnknown;
+                state.positionUnknown = val === '1';
+                if (state.positionUnknown && !wasUnknown && readiness.home === 'done') {
+                    readiness.home = 'fail';
+                    readiness.homeText = 'Position unknown after relay cut — re-home required.';
+                }
+                break;
+            }
+            case 'BSALV': state.baseAlive = val === '1'; break;
+            case 'PNPS': state.pnpState = parseInt(val); break;
             case 'KFEN': state.kfEnabled = val === '1'; break;
             case 'KTH': state.kfTheta = safeNum; break;
             case 'KOM': state.kfOmega = safeNum; break;
@@ -393,7 +407,14 @@ function updateUI() {
     }[state.mode] ?? '');
     statFault.innerText = state.fault;
     statFault.className = "value " + (state.fault === 'NONE' ? "ok" : "error");
-    statModbus.innerText = state.modbus;
+    const baseText = state.sysMode === 'BASE' ? (state.baseAlive ? 'ALIVE' : 'TIMEOUT') : '--';
+    statModbus.innerText = baseText;
+    statModbus.className = 'value ' + (state.baseAlive ? 'ok' : (state.sysMode === 'BASE' ? 'error' : ''));
+    const statPnp = document.getElementById('stat-pnp');
+    if (statPnp) {
+        statPnp.innerText = decodePnP(state.pnpState);
+        statPnp.className = 'value ' + (state.pnpState > 0 ? 'warn' : '');
+    }
     statSysmode.innerText = state.sysMode;
     statSysmode.className = "value " + (state.sysMode === 'JOYSTICK' ? "ok" : "");
     statJogmode.innerText = state.jogMode;
@@ -424,6 +445,8 @@ function updateUI() {
 
     if (typeof updateReadinessUI === 'function') updateReadinessUI();
     updateHeartbeat();
+    // Keep the fault modal live while it's open
+    if (!document.getElementById('fault-modal')?.classList.contains('hidden')) refreshFaultModal();
 }
 
 function setHbTile(id, status, val) {
@@ -528,6 +551,16 @@ function updateHeartbeat() {
     setHbTile('hbt-sys', 'ok',
         state.sysMode === 'BASE' ? 'BASE' : 'JOY'
     );
+
+    // BASE — Modbus master heartbeat + P&P task
+    {
+        const pnpLabel = decodePnP(state.pnpState).substring(0, 4);
+        const baseStatus = state.baseAlive ? 'ok' : (state.sysMode === 'BASE' ? 'fault' : 'warn');
+        setHbTile('hbt-base',
+            baseStatus,
+            state.pnpState > 0 ? pnpLabel : (state.baseAlive ? 'IDLE' : 'OFF')
+        );
+    }
 }
 
 function log(msg, type = "info") {
@@ -535,7 +568,10 @@ function log(msg, type = "info") {
     const div = document.createElement('div');
     div.innerHTML = `<span style="color:#555">[${time}]</span> ${msg}`;
     if (type === "error") div.style.color = "#ff3131";
-    logContent.prepend(div);
+    logContent.appendChild(div);
+    // Keep at most 200 entries
+    while (logContent.children.length > 200) logContent.removeChild(logContent.firstChild);
+    logContent.scrollTop = logContent.scrollHeight;
 }
 
 let _tuningReceivedFromFirmware = false;
@@ -560,6 +596,10 @@ function decodeMode(val) {
     return ['STOPPED', 'SPEED', 'POSITION', 'AUTOTUNE_P', 'AUTOTUNE_S', 'TEST', 'GHOST', 'HOMING'][parseInt(val)] || 'UNKNOWN';
 }
 
+function decodePnP(n) {
+    return ['IDLE','→PICK','WAIT♦','OPEN','↓','CLOSE','↑','→PLACE','WAIT♦','↓','OPEN','↑','CLOSE','NEXT','DONE'][n] || '??';
+}
+
 function decodeFault(val) {
     const bits = parseInt(val);
     if (bits === 0) return 'NONE';
@@ -573,6 +613,8 @@ function decodeFault(val) {
     if (bits & 0x040) f.push('ESTOP_JOY');
     if (bits & 0x080) f.push('ESTOP_DASH');
     if (bits & 0x100) f.push('ESTOP_MBUS');
+    if (bits & 0x200) f.push('STARTUP_ESTOP');
+    if (bits & 0x400) f.push('OVERCURRENT');
     return f.join(' | ');
 }
 
@@ -592,10 +634,8 @@ estopBtn.addEventListener('click', () => {
         state.estop = true;
         state.vel = 0;
         state.acc = 0;
-        chartVel.history = [];
-        chartAcc.history = [];
-        chartVel.draw();
-        chartAcc.draw();
+        chartVel.clearLiveData();
+        chartAcc.clearLiveData();
     }
     updateUI();
 });
@@ -899,30 +939,73 @@ btnOverride.addEventListener('click', () => {
 // --- Fault Modal ---
 const FAULT_INFO = {
     /* Automatic faults (gated by safety_config) */
-    'STALL': { name: 'Motor Stalled', desc: 'PWM high but rotor not moving for 2 s. Source: automatic safety monitor. Check obstruction or wiring.' },
-    'ENCODER': { name: 'Encoder Error', desc: 'Encoder signal lost or phase inverted. Source: automatic safety monitor. Check encoder cable.' },
-    'JOY_LOST': { name: 'Joystick Lost', desc: 'ESP32 joystick disconnected. Source: automatic safety monitor (Joystick Check).' },
-    'OVER_ROT': { name: 'Over-Rotation', desc: 'Exceeded ±720° from home. Source: soft-limit watchdog (wire-twist protection).' },
-    /* User / external e-stop sources (informational; not gated by safety_config) */
-    'ESTOP_HW': { name: 'E-Stop: Physical', desc: 'Hardware E-Stop button was pressed (GPIO EXTI). Release the button and press the physical Reset.' },
-    'PROX_LOST': { name: 'Proximity Lost', desc: 'Proximity sensor reported open. Source: physical interlock.' },
-    'ESTOP_JOY': { name: 'E-Stop: Joystick', desc: 'E-Stop triggered by the joystick safety button (P) or command (X). Source: ESP32 joystick.' },
-    'ESTOP_DASH': { name: 'E-Stop: Dashboard', desc: 'EMERGENCY STOP button on the dashboard was clicked. Source: user via dashboard.' },
-    'ESTOP_MBUS': { name: 'E-Stop: Modbus', desc: 'Modbus register 0x25 requested soft stop. Source: Base System / Modbus master.' },
+    'STALL':        { name: 'Motor Stalled',         desc: 'PWM high but rotor not moving for the stall sustain time. Check for obstruction, mechanical jam, or wiring fault.' },
+    'ENCODER':      { name: 'Encoder Error',          desc: 'Encoder signal lost or phase inverted. Check encoder cable and connector.' },
+    'JOY_LOST':     { name: 'Joystick Lost',          desc: 'ESP32 joystick link timed out or reported disconnected. Check joystick power and Bluetooth.' },
+    'OVER_ROT':     { name: 'Over-Rotation',          desc: 'Absolute position exceeded the soft limit. Virtual hard-stop active. Sustained >1 s escalates to E-Stop.' },
+    /* User / external e-stop sources */
+    'ESTOP_HW':     { name: 'E-Stop: Physical Button',desc: 'Hardware E-Stop button held down. Release button, then clear fault.' },
+    'PROX_LOST':    { name: 'Proximity Sensor Lost',  desc: 'Proximity sensor input opened. Check sensor wiring and power.' },
+    'ESTOP_JOY':    { name: 'E-Stop: Joystick',       desc: 'E-Stop triggered by joystick safety button (P/X). Source: ESP32.' },
+    'ESTOP_DASH':   { name: 'E-Stop: Dashboard',      desc: 'EMERGENCY STOP button clicked on the dashboard.' },
+    'ESTOP_MBUS':   { name: 'E-Stop: Modbus',         desc: 'Modbus register 0x25 soft-stop request from Base System.' },
+    'STARTUP_ESTOP':{ name: 'Startup E-Stop Latch',   desc: 'Power-on safety latch. Run Self-Test (DIAG) to release. Prevents motion before hardware is verified.' },
+    'OVERCURRENT':  { name: 'Overcurrent Trip',       desc: 'Motor current exceeded the hardware limit for 50 ms. Motor relay opened. Check for jam, short circuit, or overload. Clear fault once safe.' },
 };
 
 function refreshFaultModal() {
+    // ── Status strip ───────────────────────────────────────────────────────
+    const posEl  = document.getElementById('modal-pos-status');
+    const wdgEl  = document.getElementById('modal-wdg-status');
+    const currEl = document.getElementById('modal-curr-status');
+    if (wdgEl) {
+        wdgEl.textContent = state.connected ? 'IWDG Active (15 s)' : 'IWDG: --';
+        wdgEl.className   = `modal-status-pill ${state.connected ? 'ok' : 'neutral'}`;
+    }
+    if (posEl) {
+        if (!state.connected) {
+            posEl.textContent = 'Position: Disconnected';
+            posEl.className   = 'modal-status-pill neutral';
+        } else if (state.positionUnknown) {
+            posEl.textContent = 'Position UNKNOWN — Re-home required';
+            posEl.className   = 'modal-status-pill warn';
+        } else {
+            posEl.textContent = 'Position KNOWN';
+            posEl.className   = 'modal-status-pill ok';
+        }
+    }
+    if (currEl) {
+        const amps = typeof state.current === 'number' ? state.current : 0;
+        const pct  = Math.min(100, Math.abs(amps) / 15 * 100);
+        const cls  = pct > 80 ? 'warn' : (pct > 50 ? 'caution' : 'ok');
+        currEl.textContent = state.connected ? `Current: ${amps.toFixed(1)} A` : 'Current: --';
+        currEl.className   = `modal-status-pill ${state.connected ? cls : 'neutral'}`;
+    }
+    // Live current in the overcurrent info block
+    const ocCurr = document.getElementById('disp-oc-current');
+    if (ocCurr) ocCurr.textContent = state.connected ? (state.current ?? 0).toFixed(2) : '--';
+
+    // ── Active faults ───────────────────────────────────────────────────────
     const list = document.getElementById('modal-fault-list');
     list.innerHTML = '';
-    const visibleFaults = state.fault === 'NONE' ? [] : state.fault.split(' | ');
+    const visibleFaults = (state.fault && state.fault !== 'NONE') ? state.fault.split(' | ') : [];
+
+    // Treat positionUnknown as a fault-level condition
+    if (state.positionUnknown) visibleFaults.unshift('_PUNK');
+
     if (visibleFaults.length === 0) {
         list.innerHTML = '<div style="color:var(--accent-green);">No active faults.</div>';
         return;
     }
     visibleFaults.forEach(f => {
-        const info = FAULT_INFO[f] || { name: f, desc: 'Unknown fault.' };
+        let info;
+        if (f === '_PUNK') {
+            info = { name: 'Position Unknown', desc: 'Physical E-Stop cut power to the encoder. Arm may have moved. Run the homing sequence before commanding motion.' };
+        } else {
+            info = FAULT_INFO[f] || { name: f, desc: 'Unknown fault code.' };
+        }
         const div = document.createElement('div');
-        div.className = 'fault-item';
+        div.className = 'fault-item' + (f === '_PUNK' ? ' fault-item-warn' : '');
         div.innerHTML = `<div class="fault-name">${info.name}</div><div class="fault-desc">${info.desc}</div>`;
         list.appendChild(div);
     });
@@ -980,10 +1063,11 @@ document.getElementById('fault-modal').addEventListener('click', (e) => {
 });
 
 const SAFETY_TOGGLES = {
-    'chk-safe-stall': 'SAFE_STALL',
-    'chk-safe-encoder': 'SAFE_ENCODER',
-    'chk-safe-overrot': 'SAFE_OVERROT',
-    'chk-safe-joy': 'SAFE_JOY',
+    'chk-safe-stall':      'SAFE_STALL',
+    'chk-safe-encoder':    'SAFE_ENCODER',
+    'chk-safe-overrot':    'SAFE_OVERROT',
+    'chk-safe-joy':        'SAFE_JOY',
+    'chk-safe-phys-estop': 'SAFE_ESTOP',
 };
 /* Editable numeric thresholds → firmware SET keys. */
 const SAFETY_THRESHOLDS = {
@@ -2727,9 +2811,10 @@ function updateReadinessUI() {
 
     const badge = document.getElementById('rd-ready-badge');
     if (badge) {
-        if (state.override) { badge.textContent = 'OVERRIDE — gate bypassed'; badge.className = 'rd-ready-badge override'; }
+        if (state.override)       { badge.textContent = 'OVERRIDE — gate bypassed'; badge.className = 'rd-ready-badge override'; }
+        else if (state.positionUnknown) { badge.textContent = 'RE-HOME REQUIRED'; badge.className = 'rd-ready-badge warn'; }
         else if (readinessReady()) { badge.textContent = 'READY'; badge.className = 'rd-ready-badge ready'; }
-        else { badge.textContent = 'MOTION LOCKED'; badge.className = 'rd-ready-badge not-ready'; }
+        else                       { badge.textContent = 'MOTION LOCKED'; badge.className = 'rd-ready-badge not-ready'; }
     }
 
     const dt = document.getElementById('rd-diag-text');

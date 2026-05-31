@@ -6,6 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ROBO-COOK PRO | Telemetry & Control</title>
     <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link
@@ -91,8 +92,12 @@
                         <span id="stat-sysmode" class="value">BASE</span>
                     </div>
                     <div class="status-item">
-                        <label>Modbus</label>
-                        <span id="stat-modbus" class="value">IDLE</span>
+                        <label>Base Sys</label>
+                        <span id="stat-modbus" class="value">--</span>
+                    </div>
+                    <div class="status-item">
+                        <label>P&amp;P Task</label>
+                        <span id="stat-pnp" class="value">IDLE</span>
                     </div>
                     <div class="status-item">
                         <label>Jog Mode</label>
@@ -263,7 +268,7 @@
                                 <span class="lg-chip lg-sanity">Model</span>
                             </span>
                         </div>
-                        <canvas id="chart-pos"></canvas>
+                        <div id="chart-pos"></div>
                     </div>
                     <div class="chart-wrapper" id="wrap-chart-vel">
                         <div class="chart-header-row">
@@ -275,7 +280,7 @@
                                 <span class="lg-chip lg-sanity">Model</span>
                             </span>
                         </div>
-                        <canvas id="chart-vel"></canvas>
+                        <div id="chart-vel"></div>
                     </div>
                     <div class="chart-wrapper" id="wrap-chart-acc">
                         <div class="chart-header-row">
@@ -285,7 +290,7 @@
                                 <span class="lg-chip lg-target">Setpoint</span>
                             </span>
                         </div>
-                        <canvas id="chart-acc"></canvas>
+                        <div id="chart-acc"></div>
                     </div>
                 </div>
 
@@ -461,6 +466,11 @@
                         <div class="hb-tile hb-stm-tile" id="hbt-sys" data-status="idle">
                             <div class="hb-dot"></div>
                             <div class="hb-name">SYS</div>
+                            <div class="hb-val">--</div>
+                        </div>
+                        <div class="hb-tile hb-stm-tile" id="hbt-base" data-status="idle">
+                            <div class="hb-dot"></div>
+                            <div class="hb-name">BASE</div>
                             <div class="hb-val">--</div>
                         </div>
                     </div>
@@ -784,6 +794,13 @@
                 <h3>Fault Info & Safety Config</h3>
                 <button id="btn-close-modal" class="modal-close">×</button>
             </div>
+            <!-- Live system status strip -->
+            <div class="modal-section modal-status-strip">
+                <div id="modal-pos-status" class="modal-status-pill ok">Position KNOWN</div>
+                <div id="modal-wdg-status" class="modal-status-pill ok">IWDG Active</div>
+                <div id="modal-curr-status" class="modal-status-pill ok">Current OK</div>
+            </div>
+
             <div class="modal-section">
                 <h4>Active Faults</h4>
                 <div id="modal-fault-list">No active faults.</div>
@@ -822,8 +839,7 @@
                             <strong>Triggers when (either):</strong>
                             <ul>
                                 <li><b>Phase inversion:</b> PWM &gt; 50% one way, RPM &gt; 5 RPM the other way</li>
-                                <li><b>Signal loss:</b> PWM &gt; 50%, RPM near 0, encoder counts frozen for 1 second
-                                </li>
+                                <li><b>Signal loss:</b> PWM &gt; 50%, RPM near 0, encoder counts frozen for 1 second</li>
                             </ul>
                             <em>Cause:</em> encoder cable disconnected, A/B swapped, or hardware fault.
                         </div>
@@ -835,13 +851,13 @@
                         </summary>
                         <div class="trigger-desc">
                             <strong>Triggers when:</strong> absolute position exceeds <b>±Limit</b> from home.
-                            Also acts as a virtual hard-stop that clamps motion at the limit.
+                            Acts as a virtual hard-stop (clamps target). Escalates to E-Stop after 1 s sustained breach.
                             <div class="safety-threshold-grid">
                                 <label class="thr-item"><span>Max rotation (± °)</span>
                                     <input type="number" id="cfg-max-rot" step="10" min="10" value="720"></label>
                             </div>
                             <em>Cause:</em> wire-twist protection — prevents internal wiring from snapping.
-                            <br><em>Note:</em> disabling this removes both the fault and the virtual hard-stop (free rotation).
+                            <br><em>Note:</em> disabling this removes both the fault, the virtual hard-stop, and the 1 s E-Stop escalation.
                         </div>
                     </details>
                     <details class="safety-detail">
@@ -852,11 +868,46 @@
                         <div class="trigger-desc">
                             <strong>Triggers when:</strong>
                             <ul>
-                                <li>ESP32 sends a packet with status byte indicating disconnected</li>
+                                <li>ESP32 sends a disconnect status packet, OR</li>
+                                <li>No valid packet received for 1000 ms (link silence watchdog)</li>
                             </ul>
                             <em>Cause:</em> joystick power off, Bluetooth/wireless link lost, or ESP32 fault.
                         </div>
                     </details>
+                    <details class="safety-detail">
+                        <summary class="safety-row">
+                            <span><span class="caret">▸</span> Physical E-Stop Button</span>
+                            <input type="checkbox" id="chk-safe-phys-estop" checked onclick="event.stopPropagation()">
+                        </summary>
+                        <div class="trigger-desc">
+                            <strong>Triggers when:</strong> PA5 E-Stop input is held LOW for the debounce window
+                            (80 ms idle, 500 ms while motor running, 1500 ms during homing/diagnostic).
+                            <br><em>Cause:</em> physical red E-Stop button pressed on the control panel.
+                            <br><em>Warning:</em> disabling this makes the hardware E-Stop button non-functional in software.
+                            Only disable for bench testing without the button wired.
+                        </div>
+                    </details>
+                    <!-- Overcurrent — always-on hardware protection, not a software toggle -->
+                    <div class="safety-detail safety-hw-fixed">
+                        <div class="safety-row safety-row-fixed">
+                            <span>⚡ Overcurrent Protection</span>
+                            <span class="safety-hw-badge">HARDWARE</span>
+                        </div>
+                        <div class="trigger-desc">
+                            <strong>Always active.</strong> Motor relay opens if |current| exceeds the limit for the debounce time.
+                            Sets <code>FAULT_OVERCURRENT</code>.
+                            <div class="safety-threshold-grid safety-threshold-readonly">
+                                <label class="thr-item"><span>Limit (A)</span>
+                                    <span class="thr-fixed" id="disp-oc-limit">15.0</span></label>
+                                <label class="thr-item"><span>Debounce (ms)</span>
+                                    <span class="thr-fixed" id="disp-oc-time">50</span></label>
+                                <label class="thr-item"><span>Live current (A)</span>
+                                    <span class="thr-fixed" id="disp-oc-current">--</span></label>
+                            </div>
+                            <em>Cause:</em> motor jammed under load, short circuit, or H-bridge fault.
+                            <br><em>Note:</em> cannot be disabled in software — requires a firmware recompile to change limits.
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -983,6 +1034,7 @@
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
     <script src="visualizer.js"></script>
     <script src="charts.js"></script>
     <script src="app.js"></script>
