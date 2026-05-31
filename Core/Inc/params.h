@@ -18,7 +18,7 @@
  * ============================================================================ */
 
 /* Speed Loop (Inner) */
-#define DEFAULT_SPEED_KP    1.0f
+#define DEFAULT_SPEED_KP    1.58f
 #define DEFAULT_SPEED_KI    2.0f
 #define DEFAULT_SPEED_KD    0.0f
 /* Trajectory feedforward (matches cascade-control block diagram).
@@ -26,12 +26,12 @@
  *   Kaff units: V / (rad/s^2) — compensates inertia
  * Firmware converts trajectory RPM/(RPM/s) into rad/s/(rad/s^2) and Volts into PWM%.
  */
-#define DEFAULT_K_VFF       0.0f
-#define DEFAULT_K_AFF       0.0f
+#define DEFAULT_K_VFF       3.03f
+#define DEFAULT_K_AFF       0.1f
 #define DEFAULT_K_TFF       0.0f  /* disturbance (load-torque) feedforward gain — tune 0→1 */
 
 /* Position Loop (Outer) */
-#define DEFAULT_POS_KP      0.4f
+#define DEFAULT_POS_KP      3.0f
 #define DEFAULT_POS_KI      0.05f
 #define DEFAULT_POS_KD      0.1f
 

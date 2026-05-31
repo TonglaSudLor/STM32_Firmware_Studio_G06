@@ -289,7 +289,7 @@ static void ModbusBridge_HandleCommands(void)
 
     /* 0x24: Point-to-Point Target (sign inverted to match firmware direction) */
     if (register_frame[0x24].U16 != 0) {
-        Motor_MoveToPosition(-(float)((int16_t)register_frame[0x24].U16));
+        if (base_active) Motor_MoveToPosition(-(float)((int16_t)register_frame[0x24].U16));
         register_frame[0x24].U16 = 0;
     }
 

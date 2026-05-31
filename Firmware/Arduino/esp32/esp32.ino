@@ -22,12 +22,21 @@ void setup() {
     pinMode(LED_PIN, OUTPUT);
     pinMode(BUZZER_PIN, OUTPUT);
 
-    // Boot melody
-    tone(BUZZER_PIN, 1000, 100); delay(120);
-    tone(BUZZER_PIN, 1500, 100); delay(120);
-    tone(BUZZER_PIN, 2000, 200);
+    playOdeToJoy();
     
     BP32.setup(&onConnectedController, &onDisconnectedController);
+}
+
+void playOdeToJoy() {
+    const int C4=262, D4=294, E4=330, F4=349, G4=392;
+    const int q = 180;  // quarter note ms
+    // E  E  F  G  G  F  E  D  C  C  D  E  E.    D/8  D(half)
+    int n[] = {E4,E4,F4,G4, G4,F4,E4,D4, C4,C4,D4,E4, E4,D4,D4};
+    int d[] = { q, q, q, q,  q, q, q, q,  q, q, q, q, q*3/2, q/2, q*2};
+    for (int i = 0; i < 15; i++) {
+        tone(BUZZER_PIN, n[i], d[i]);
+        delay(d[i] + 20);
+    }
 }
 
 void playGhostOn() {
@@ -153,7 +162,7 @@ void loop() {
             else if (ly > 150)      baseChar = 'D';
             else if (lx < -150)     baseChar = 'L';
             else if (lx > 150)      baseChar = 'R';
-            else if (ry > 0)        baseChar = 'F';
+            else if (ry > 150)      baseChar = 'F';
 
             if (btns & 0x0020) emergencyChar = 'P';
 
@@ -175,7 +184,11 @@ void loop() {
         }
 
         controlState = currentState;
-        Serial.println(controlState); 
+        Serial.println(controlState);
+        // Short blip = command transmitted to STM32 (2800Hz blip = STM32 ACK'd it back)
+        if (baseChar != 'O' || emergencyChar != 'O') {
+            tone(BUZZER_PIN, 2200, 15);
+        }
     }
 
     if (isControllerConnected) {
@@ -193,7 +206,7 @@ void onConnectedController(ControllerPtr ctl) {
             myControllers[i] = ctl;
             tone(BUZZER_PIN, 2000, 100); delay(150);
             tone(BUZZER_PIN, 2500, 150);
-            ctl->setRumble(0xFF, 0xFF); 
+            ctl->setRumble(0xFF, 0xFF);
             delay(300);
             ctl->setRumble(0x00, 0x00);
             break;

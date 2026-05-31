@@ -247,11 +247,15 @@ void HW_RefreshIO(void)
                 position_unknown = true;
             }
         } else if (hw.in_reset_btn) {
-            /* Reset Pressed AND Emergency is Released: Enter Ready state */
+            /* Reset Pressed AND Emergency is Released: Enter Ready state.
+             * Also clear the startup latch so the board does not require a
+             * DIAG run after every power cycle when the hardware is known good. */
+            extern volatile bool startup_estop_pending;
+            startup_estop_pending = false;
             emergency_stop = false;
             FAULT_CLR(FAULT_ESTOP_PHYSICAL | FAULT_PROX_LOST |
                       FAULT_ESTOP_JOYSTICK | FAULT_ESTOP_DASHBOARD |
-                      FAULT_ESTOP_MODBUS);
+                      FAULT_ESTOP_MODBUS   | FAULT_STARTUP_ESTOP);
         }
 
         /* Update Outputs based on emergency_stop state */
@@ -270,7 +274,12 @@ void HW_RefreshIO(void)
             if (current_mode != MOTOR_MODE_HOMING) {
                 position_unknown = true;
             }
-        } else if (hw.in_reset_btn) emergency_stop = false;
+        } else if (hw.in_reset_btn) {
+            extern volatile bool startup_estop_pending;
+            startup_estop_pending = false;
+            FAULT_CLR(FAULT_STARTUP_ESTOP);
+            emergency_stop = false;
+        }
     }
 
     /* --- Update Mode lamp if not overridden --- */
