@@ -20,6 +20,46 @@
 #define KALMAN_H
 
 #include <stdbool.h>
+#include <stdint.h>
+
+/* ==========================================================================
+ * Named global variables — add these by exact name in STM32CubeMonitor.
+ *
+ * Q variables store VARIANCE (σ²).  The dashboard SET command takes σ and
+ * squares it internally, so KF_Q_THETA=0.001 → kf_q_theta = 1e-6 here.
+ * When writing directly in CubeMonitor, write the variance, not sigma.
+ * ========================================================================== */
+
+/* Kalman state estimates */
+extern volatile float    kf_theta;        /* angle (rad) */
+extern volatile float    kf_omega;        /* velocity (rad/s) */
+extern volatile float    kf_tau_l;        /* load torque (N·m) */
+extern volatile float    kf_ia;           /* armature current (A) */
+
+/* Covariance diagonal (filter confidence) */
+extern volatile float    kf_p00;
+extern volatile float    kf_p11;
+extern volatile float    kf_p22;
+extern volatile float    kf_p33;
+
+/* Process noise variances — WRITE to tune (CubeMonitor writes variance σ²) */
+extern volatile float    kf_q_theta;      /* position drift */
+extern volatile float    kf_q_omega;      /* velocity noise */
+extern volatile float    kf_q_tau;        /* load-torque random walk */
+extern volatile float    kf_q_ia;         /* current imperfection */
+
+/* Measurement noise variance */
+extern volatile float    kf_r;            /* encoder quantisation (rad²) */
+
+/* Control */
+extern volatile uint8_t  kf_enable;       /* 0 = off, 1 = on */
+
+/* Diagnostic */
+extern volatile float    kf_innovation;   /* measurement residual (rad) */
+
+/* Open-loop sanity model */
+extern volatile float    kf_sanity_theta; /* model angle (rad) */
+extern volatile float    kf_sanity_omega; /* model velocity (rad/s) */
 
 void  Kalman_Init(void);
 void  Kalman_Tick(float u_volts, float theta_meas_rad);   /* call at 1 kHz */

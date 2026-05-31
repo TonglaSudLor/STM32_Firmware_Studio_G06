@@ -11,6 +11,9 @@
  *   K = P[:,0] / S
  *   x += K * y
  *   P  = (I - K H) P
+ *
+ * All tunable parameters and state estimates are named global volatile scalars
+ * so STM32CubeMonitor can read and write them directly by name.
  */
 
 #include "kalman.h"
@@ -31,59 +34,82 @@
 #define A43  (-MOT_R_ARM / MOT_L_ARM)                                   /* di/dt term in i_a */
 #define B4   (1.0f / MOT_L_ARM)                                         /* di/dt term in u */
 
-/* --------------------------------------------------------------------------
- * State, covariance, and tunables
- * -------------------------------------------------------------------------- */
-static volatile float x[4];           /* theta, omega, tau_L, i_a */
-static volatile float P[4][4];
-static volatile float Qc_diag[4];     /* continuous process noise (variances) */
-static volatile float R_meas;
-static volatile bool  enabled = false;
-static volatile float last_innovation = 0.0f;
+/* ==========================================================================
+ * Named global variables — STM32CubeMonitor: add these by exact name.
+ *
+ * NOTE on units for Q variables:
+ *   CubeMonitor writes VARIANCE (σ²) directly.
+ *   The dashboard SET command (KF_Q_THETA=x) takes SIGMA (σ) and squares it.
+ *   Example: dashboard KF_Q_THETA=0.001 → CubeMonitor shows kf_q_theta=1e-6
+ * ========================================================================== */
 
-/* Open-loop sanity model (same RK4, no correction) */
-static volatile float xs[4];
+/* --- Kalman state estimates (read-only in normal use) --- */
+volatile float kf_theta      = 0.0f;  /* angle              (rad)   */
+volatile float kf_omega      = 0.0f;  /* angular velocity   (rad/s) */
+volatile float kf_tau_l      = 0.0f;  /* load torque        (N·m)   */
+volatile float kf_ia         = 0.0f;  /* armature current   (A)     */
+
+/* --- Covariance diagonal: filter confidence (read-only) --- */
+volatile float kf_p00        = 1.0f;
+volatile float kf_p11        = 100.0f;
+volatile float kf_p22        = 100.0f;
+volatile float kf_p33        = 100.0f;
+
+/* --- Process noise variances (read/write from CubeMonitor) --- */
+volatile float kf_q_theta    = 0.0f;  /* position drift variance    (rad²/s)    */
+volatile float kf_q_omega    = 0.0f;  /* velocity noise variance    (rad²/s³)   */
+volatile float kf_q_tau      = 0.0f;  /* load-torque random walk    (N²m²/s)    */
+volatile float kf_q_ia       = 0.0f;  /* current imperfection var.  (A²/s)      */
+
+/* --- Measurement noise variance (read/write from CubeMonitor) --- */
+volatile float kf_r          = KF_R_DEFAULT;   /* encoder quantisation  (rad²) */
+
+/* --- Control flags (read/write from CubeMonitor) --- */
+volatile uint8_t kf_enable   = 0;     /* 0 = filter off, 1 = filter on */
+
+/* --- Diagnostic (read-only) --- */
+volatile float kf_innovation = 0.0f;  /* latest measurement residual (rad) */
+
+/* --- Open-loop sanity model (read-only) --- */
+volatile float kf_sanity_theta = 0.0f;  /* model-predicted angle      (rad)   */
+volatile float kf_sanity_omega = 0.0f;  /* model-predicted velocity   (rad/s) */
+
+/* --------------------------------------------------------------------------
+ * Internal-only storage (not needed in CubeMonitor)
+ * -------------------------------------------------------------------------- */
+static volatile float P[4][4];   /* full 4×4 covariance matrix */
+static volatile float xs[4];     /* full sanity-model state vector */
 
 /* --------------------------------------------------------------------------
  * Continuous-time derivatives
  * -------------------------------------------------------------------------- */
 static inline void state_deriv(const float xi[4], float u, float dx[4])
 {
-    /* dtheta/dt = omega                                                   */
     dx[0] = A11 * xi[1];
-    /* domega/dt = -b/J * omega - 1/J * tau_L + N*eta*Kt/J * i             */
     dx[1] = A21 * xi[1] + A22 * xi[2] + A23 * xi[3];
-    /* dtau_L/dt = 0 (random walk; the noise drives it, mean is zero)       */
     dx[2] = 0.0f;
-    /* di/dt = -Ke*N/L * omega - R/L * i + 1/L * u                          */
     dx[3] = A41 * xi[1] + A43 * xi[3] + B4 * u;
 }
 
-/* dP/dt = A P + P A^T + Qc.
- * We never explicitly store A as a matrix; we open up the non-zero rows
- * inline. A is structurally:
- *   row0 = [0, 1, 0, 0]
- *   row1 = [0, A21, A22, A23]
- *   row2 = [0, 0,   0,   0]
- *   row3 = [0, A41, 0,   A43]
- * So (A P)[i][j] = sum_k A[i][k] * P[k][j]. */
 static inline void cov_deriv(const float Pin[4][4], float dP[4][4])
 {
     float AP[4][4];
-    /* AP rows */
     for (int j = 0; j < 4; j++) {
-        AP[0][j] = Pin[1][j];                                                       /* A row 0 = e1 */
+        AP[0][j] = Pin[1][j];
         AP[1][j] = A21 * Pin[1][j] + A22 * Pin[2][j] + A23 * Pin[3][j];
         AP[2][j] = 0.0f;
         AP[3][j] = A41 * Pin[1][j] + A43 * Pin[3][j];
     }
-    /* dP = AP + AP^T + diag(Qc) */
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
             dP[i][j] = AP[i][j] + AP[j][i];
         }
-        dP[i][i] += Qc_diag[i];
     }
+    /* Add process noise from named globals (variances) */
+    dP[0][0] += kf_q_theta;
+    dP[1][1] += kf_q_omega;
+    dP[2][2] += kf_q_tau;
+    dP[3][3] += kf_q_ia;
 }
 
 /* --------------------------------------------------------------------------
@@ -126,72 +152,62 @@ static void rk4_cov(float Pi[4][4], float dt)
  * -------------------------------------------------------------------------- */
 void Kalman_Init(void)
 {
+    kf_theta = 0.0f; kf_omega = 0.0f; kf_tau_l = 0.0f; kf_ia = 0.0f;
+
     for (int i = 0; i < 4; i++) {
-        x[i]  = 0.0f;
         xs[i] = 0.0f;
         for (int j = 0; j < 4; j++) P[i][j] = 0.0f;
     }
-    /* Big initial uncertainty so the first encoder reading slams the state */
-    P[0][0] = 1.0f;
-    P[1][1] = 100.0f;
-    P[2][2] = 100.0f;
-    P[3][3] = 100.0f;
+    P[0][0] = 1.0f; P[1][1] = 100.0f; P[2][2] = 100.0f; P[3][3] = 100.0f;
+    kf_p00 = 1.0f; kf_p11 = 100.0f; kf_p22 = 100.0f; kf_p33 = 100.0f;
 
-    Qc_diag[0] = KF_SIGMA_THETA_DEF * KF_SIGMA_THETA_DEF;
-    Qc_diag[1] = KF_SIGMA_OMEGA_DEF * KF_SIGMA_OMEGA_DEF;
-    Qc_diag[2] = KF_SIGMA_TAU_DEF   * KF_SIGMA_TAU_DEF;
-    Qc_diag[3] = KF_SIGMA_I_DEF     * KF_SIGMA_I_DEF;
-    R_meas = KF_R_DEFAULT;
-    enabled = false;
-    last_innovation = 0.0f;
+    kf_q_theta = KF_SIGMA_THETA_DEF * KF_SIGMA_THETA_DEF;
+    kf_q_omega = KF_SIGMA_OMEGA_DEF * KF_SIGMA_OMEGA_DEF;
+    kf_q_tau   = KF_SIGMA_TAU_DEF   * KF_SIGMA_TAU_DEF;
+    kf_q_ia    = KF_SIGMA_I_DEF     * KF_SIGMA_I_DEF;
+    kf_r       = KF_R_DEFAULT;
+
+    kf_enable    = 0;
+    kf_innovation = 0.0f;
+    kf_sanity_theta = 0.0f;
+    kf_sanity_omega = 0.0f;
 }
 
 void Kalman_Reset(float theta_meas_rad)
 {
-    for (int i = 0; i < 4; i++) {
-        x[i] = 0.0f;
+    kf_theta = theta_meas_rad; kf_omega = 0.0f; kf_tau_l = 0.0f; kf_ia = 0.0f;
+
+    for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) P[i][j] = 0.0f;
-    }
-    x[0] = theta_meas_rad;
-    P[0][0] = R_meas * 10.0f;
-    P[1][1] = 100.0f;
-    P[2][2] = 100.0f;
-    P[3][3] = 100.0f;
-    last_innovation = 0.0f;
+
+    P[0][0] = kf_r * 10.0f;
+    P[1][1] = 100.0f; P[2][2] = 100.0f; P[3][3] = 100.0f;
+    kf_p00 = P[0][0]; kf_p11 = 100.0f; kf_p22 = 100.0f; kf_p33 = 100.0f;
+
+    kf_innovation = 0.0f;
 }
 
 void Kalman_Tick(float u_volts, float theta_meas_rad)
 {
     /* --- Predict --- */
-    float xl[4];
+    float xl[4] = { kf_theta, kf_omega, kf_tau_l, kf_ia };
     float Pl[4][4];
-    for (int i = 0; i < 4; i++) {
-        xl[i] = x[i];
+    for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) Pl[i][j] = P[i][j];
-    }
+
     rk4_state(xl, u_volts, KF_DT);
     rk4_cov(Pl, KF_DT);
 
     /* --- Update (H = [1 0 0 0]) --- */
-    float y = theta_meas_rad - xl[0];           /* innovation */
-    float S = Pl[0][0] + R_meas;
-    if (S < 1e-12f) S = 1e-12f;                 /* numerical guard */
+    float y = theta_meas_rad - xl[0];
+    float S = Pl[0][0] + kf_r;
+    if (S < 1e-12f) S = 1e-12f;
     float K[4];
     for (int i = 0; i < 4; i++) K[i] = Pl[i][0] / S;
 
     for (int i = 0; i < 4; i++) xl[i] += K[i] * y;
 
-    /* --- Covariance update: Joseph stabilized form ---
-     * P = (I - K H) P (I - K H)^T + K R K^T
-     * This is algebraically identical to the simple form P = (I - K H) P, but
-     * remains symmetric positive-semidefinite under float32 round-off even when
-     * R (4.9e-8) is many orders of magnitude smaller than the predicted P
-     * entries (~100). With H = [1 0 0 0], (I - K H) is the identity with its
-     * first COLUMN replaced by (e0 - K). We exploit that sparsity:
-     *   MP = (I - K H) P          -> MP[i][j] = P[i][j] - K[i] * P[0][j]
-     *   Then right-multiply by (I - K H)^T, whose first ROW is (e0 - K):
-     *     Pjos[i][j] = MP[i][j] - K[j] * MP[i][0] + R * K[i] * K[j]
-     */
+    /* --- Covariance update: Joseph stabilized form --- */
     float MP[4][4];
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++)
@@ -200,16 +216,17 @@ void Kalman_Tick(float u_volts, float theta_meas_rad)
     float Pjos[4][4];
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++)
-            Pjos[i][j] = MP[i][j] - K[j] * MP[i][0] + R_meas * K[i] * K[j];
+            Pjos[i][j] = MP[i][j] - K[j] * MP[i][0] + kf_r * K[i] * K[j];
 
-    /* Symmetrize to fight residual numerical drift */
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
+    /* Symmetrize and write back */
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
             P[i][j] = 0.5f * (Pjos[i][j] + Pjos[j][i]);
-        }
-        x[i] = xl[i];
-    }
-    last_innovation = y;
+
+    /* Publish state and diagnostics to named globals */
+    kf_theta = xl[0]; kf_omega = xl[1]; kf_tau_l = xl[2]; kf_ia = xl[3];
+    kf_p00 = P[0][0]; kf_p11 = P[1][1]; kf_p22 = P[2][2]; kf_p33 = P[3][3];
+    kf_innovation = y;
 }
 
 void Kalman_SanityTick(float u_volts)
@@ -218,34 +235,41 @@ void Kalman_SanityTick(float u_volts)
     for (int i = 0; i < 4; i++) xl[i] = xs[i];
     rk4_state(xl, u_volts, KF_DT);
     for (int i = 0; i < 4; i++) xs[i] = xl[i];
+    kf_sanity_theta = xs[0];
+    kf_sanity_omega = xs[1];
 }
 
 void Kalman_SanityReset(float theta_meas_rad)
 {
     for (int i = 0; i < 4; i++) xs[i] = 0.0f;
     xs[0] = theta_meas_rad;
+    kf_sanity_theta = theta_meas_rad;
+    kf_sanity_omega = 0.0f;
 }
 
-void  Kalman_SetEnabled(bool en) { enabled = en; }
-bool  Kalman_GetEnabled(void)    { return enabled; }
+/* --- Enable / disable --- */
+void  Kalman_SetEnabled(bool en) { kf_enable = en ? 1u : 0u; }
+bool  Kalman_GetEnabled(void)    { return kf_enable != 0u; }
 
-void  Kalman_SetSigmaTheta(float s) { Qc_diag[0] = s * s; }
-void  Kalman_SetSigmaOmega(float s) { Qc_diag[1] = s * s; }
-void  Kalman_SetSigmaTau  (float s) { Qc_diag[2] = s * s; }
-void  Kalman_SetSigmaI    (float s) { Qc_diag[3] = s * s; }
-void  Kalman_SetR         (float r) { R_meas = (r > 1e-15f) ? r : 1e-15f; }
+/* --- Noise setters: dashboard takes sigma, we store variance --- */
+void  Kalman_SetSigmaTheta(float s) { kf_q_theta = s * s; }
+void  Kalman_SetSigmaOmega(float s) { kf_q_omega = s * s; }
+void  Kalman_SetSigmaTau  (float s) { kf_q_tau   = s * s; }
+void  Kalman_SetSigmaI    (float s) { kf_q_ia    = s * s; }
+void  Kalman_SetR         (float r) { kf_r = (r > 1e-15f) ? r : 1e-15f; }
 
-float Kalman_GetTheta(void)       { return x[0]; }
-float Kalman_GetOmega(void)       { return x[1]; }
-float Kalman_GetOmegaRPM(void)    { return x[1] * (60.0f / (2.0f * 3.14159265f)); }
-float Kalman_GetLoadTorque(void)  { return x[2]; }
-float Kalman_GetCurrent(void)     { return x[3]; }
-float Kalman_GetInnovation(void)  { return last_innovation; }
+/* --- State getters --- */
+float Kalman_GetTheta(void)      { return kf_theta; }
+float Kalman_GetOmega(void)      { return kf_omega; }
+float Kalman_GetOmegaRPM(void)   { return kf_omega * (60.0f / (2.0f * 3.14159265f)); }
+float Kalman_GetLoadTorque(void) { return kf_tau_l; }
+float Kalman_GetCurrent(void)    { return kf_ia; }
+float Kalman_GetInnovation(void) { return kf_innovation; }
 
-float Kalman_GetP00(void) { return P[0][0]; }
-float Kalman_GetP11(void) { return P[1][1]; }
-float Kalman_GetP22(void) { return P[2][2]; }
-float Kalman_GetP33(void) { return P[3][3]; }
+float Kalman_GetP00(void) { return kf_p00; }
+float Kalman_GetP11(void) { return kf_p11; }
+float Kalman_GetP22(void) { return kf_p22; }
+float Kalman_GetP33(void) { return kf_p33; }
 
-float Kalman_SanityGetTheta(void) { return xs[0]; }
-float Kalman_SanityGetOmega(void) { return xs[1]; }
+float Kalman_SanityGetTheta(void) { return kf_sanity_theta; }
+float Kalman_SanityGetOmega(void) { return kf_sanity_omega; }
