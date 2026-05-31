@@ -1041,6 +1041,7 @@ void Motor_SetHomeHere(void)
     pid_position.error_prev = 0.0f;
     pid_position.d_filt   = 0.0f;
 
+    position_unknown = false;   /* encoder is now valid — dashboard PUNK→0 satisfies home gate */
     printf("[HOME] Home set here (was %.2f deg). Original home now at %.2f deg.\r\n",
            -original_home_offset_deg, original_home_offset_deg);
 }

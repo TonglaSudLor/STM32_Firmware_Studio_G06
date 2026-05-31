@@ -152,17 +152,33 @@ void HW_RefreshIO(void)
         }
         hw.in_select_mode = (uint8_t)debounced_state;
     }
-    /* Debounce reset button: require 5 consecutive active reads (~100ms at 50Hz poll).
-     * Prevents contact bounce from causing rapid relay oscillation. */
+    /* Debounce reset button with adaptive threshold — same EMI that trips the
+     * E-stop (PA5) also couples onto PA7 (Reset) through the board's ground
+     * plane during relay switching. A fixed 5-tick threshold (50 ms) is short
+     * enough that relay-arc transients satisfy it, auto-clearing the E-stop
+     * without the user touching anything.
+     *
+     * Adaptive thresholds (same motor_active_ticks guard used by E-stop):
+     *   Motor relay recently ON : 50 ticks (~500 ms) — long enough to outlast
+     *                             relay-arc + PWM-switching noise bursts.
+     *   Motor relay idle        :  8 ticks (~80 ms)  — snappy for real presses.
+     * A real button press easily sustains LOW for 500 ms; EMI bursts do not. */
     {
-        static uint8_t reset_debounce = 0;
+        static uint8_t  reset_debounce      = 0;
+        static uint16_t reset_motor_ticks   = 0;   /* mirrors E-stop's motor_active_ticks */
+        if (hw.out_relay_motor) {
+            reset_motor_ticks = 100;   /* hold strict mode 1 s past relay open */
+        } else if (reset_motor_ticks > 0) {
+            reset_motor_ticks--;
+        }
         uint8_t reset_raw = (HAL_GPIO_ReadPin(Reset_Btn_GPIO_Port, Reset_Btn_Pin) == GPIO_PIN_RESET) ? 1 : 0;
+        uint8_t reset_threshold = (reset_motor_ticks > 0) ? 50u : 8u;
         if (reset_raw) {
-            if (reset_debounce < 5) reset_debounce++;
+            if (reset_debounce < reset_threshold) reset_debounce++;
         } else {
             reset_debounce = 0;
         }
-        hw.in_reset_btn = (reset_debounce >= 5) ? 1 : 0;
+        hw.in_reset_btn = (reset_debounce >= reset_threshold) ? 1 : 0;
     }
 
     /* --- Read Reed Switch inputs (gripper position feedback) --- */

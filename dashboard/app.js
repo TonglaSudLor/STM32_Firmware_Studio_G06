@@ -272,8 +272,29 @@ function processPacket(packet) {
             }
             case 'FAULT': {
                 const prevFault = state.fault;
-                state.fault = decodeFault(val);
+                const prevBits  = state.faultRaw ?? 0xFFFF; /* 0xFFFF = unknown at start */
+                state.faultRaw  = parseInt(val);
+                state.fault     = decodeFault(val);
+
+                /* Fault appeared → invalidate home */
                 if (state.fault !== 'NONE' && (prevFault === 'NONE' || prevFault === undefined)) onFaultOrEstop();
+
+                /* STARTUP_ESTOP bit just cleared → firmware confirmed DIAG passed.
+                 * Using the FAULT field is race-free (50 Hz telemetry) unlike the
+                 * HAL_UART_Transmit plain-text path which drops silently when UART
+                 * is busy with a telemetry packet from the main loop. */
+                if ((prevBits & 0x200) && !(state.faultRaw & 0x200) && readiness.diag !== 'pass') {
+                    readiness.diag     = 'pass';
+                    readiness.diagText = '✓ Hardware OK — startup latch released.';
+                    readiness.diagHint = '';
+                    /* If position is already known (PUNK=0, no prior E-stop), grant
+                     * the home step immediately — encoder is valid from boot. */
+                    if (!state.positionUnknown && readiness.home !== 'done') {
+                        readiness.home     = 'done';
+                        readiness.homeText = '✓ Position known.';
+                    }
+                    updateReadinessUI();
+                }
                 break;
             }
             case 'PROX': state.prox = val !== '1'; break;
@@ -291,6 +312,15 @@ function processPacket(packet) {
                 if (state.positionUnknown && !wasUnknown && readiness.home === 'done') {
                     readiness.home = 'fail';
                     readiness.homeText = 'Position unknown after relay cut — re-home required.';
+                    updateReadinessUI();
+                }
+                /* Position became known (PUNK→0) AND diag passed → accept any home
+                 * method (Fine Home or Set Home) as satisfying the readiness gate. */
+                if (!state.positionUnknown && wasUnknown && readiness.diag === 'pass'
+                        && readiness.home !== 'done') {
+                    readiness.home     = 'done';
+                    readiness.homeText = '✓ Homed.';
+                    updateReadinessUI();
                 }
                 break;
             }
