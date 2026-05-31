@@ -60,7 +60,8 @@ typedef enum {
     FAULT_PROX_LOST         = 0x020,   /**< Proximity sensor open */
     FAULT_ESTOP_JOYSTICK    = 0x040,   /**< Joystick safety button (P/X) */
     FAULT_ESTOP_DASHBOARD   = 0x080,   /**< Dashboard EMERGENCY STOP button */
-    FAULT_ESTOP_MODBUS      = 0x100    /**< Modbus 0x25 soft-stop request */
+    FAULT_ESTOP_MODBUS      = 0x100,   /**< Modbus 0x25 soft-stop request */
+    FAULT_STARTUP_ESTOP     = 0x200    /**< Power-on latch — must be cleared by user before motor runs */
 } Motor_FaultCode_t;
 
 /* Atomic fault-bit helpers (bug 1-B). fault_code |= / &= are read-modify-write
@@ -150,6 +151,14 @@ typedef struct {
     bool over_rotation_check;  /**< Enable E-Stop on soft limit breach */
     bool joystick_check;       /**< Enable E-Stop on joystick connection loss */
     bool physical_estop_check; /**< Enable E-Stop from physical pin (PA5) */
+    /* Runtime-tunable thresholds (defaults seeded from params.h #defines).
+     * Settable from the dashboard via SET:MAX_ROT / STALL_PWM / STALL_VEL /
+     * STALL_TIME / STALL_ERR. */
+    float    soft_limit_deg;   /**< Over-rotation soft limit (deg from home) */
+    float    stall_pwm_pct;    /**< Min |PWM| % to consider a stall */
+    float    stall_vel_rpm;    /**< Max |RPM| to consider a stall */
+    uint32_t stall_time_ms;    /**< Sustain time before stall trips */
+    float    stall_error_deg;  /**< Min position error to allow stall trip */
 } SafetyConfig_t;
 
 /**
@@ -219,6 +228,7 @@ extern volatile float sine_amp_rpm;
 extern volatile float sine_freq_hz;
 extern volatile SafetyConfig_t safety_config;
 extern volatile Motor_FaultCode_t fault_code;
+extern volatile bool startup_estop_pending;  /**< Power-on latch — blocks auto-clear until user sends CMD:CLEAR */
 extern volatile float target_position_deg;
 extern volatile float buffered_target_pos;   /**< Ghost target for S-curve testing */
 extern volatile bool ghost_move_active;

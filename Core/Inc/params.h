@@ -7,6 +7,13 @@
 #define PARAMS_H
 
 /* ============================================================================
+ * HARDWARE WIRING CORRECTIONS
+ * ============================================================================ */
+/* Set to 1 if the encoder counts opposite to the PWM drive direction.
+ * Negates the count delta in software — no rewiring needed. */
+#define ENCODER_PHASE_INVERTED  1
+
+/* ============================================================================
  * PID GAINS (Tuning)
  * ============================================================================ */
 

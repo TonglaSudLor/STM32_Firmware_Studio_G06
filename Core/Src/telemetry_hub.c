@@ -66,10 +66,11 @@ void Telemetry_Update(void) {
     float acc_set = trajectory.current_setpoint_accel;
 
     int len = snprintf(tx_buffer, TX_BUFFER_SIZE,
-        "$POS:%.2f,VEL:%.2f,ACC:%.2f,TAR:%.2f,VSET:%.2f,ASET:%.2f,PWM:%.1f,MODE:%d,SYSM:%d,JOGM:%d,JOY:%d,ESTOP:%d,FAULT:%d,PROX:%d,GHOST:%d,GUP:%d,GDN:%d,CURR:%.2f*",
+        "$POS:%.2f,VEL:%.2f,ACC:%.2f,TAR:%.2f,VSET:%.2f,ASET:%.2f,PWM:%.1f,MODE:%d,SYSM:%d,JOGM:%d,JOY:%d,ESTOP:%d,FAULT:%d,PROX:%d,GHOST:%d,GUP:%d,GDN:%d,CURR:%.2f,RSUP:%d,RSDN:%d,RSCL:%d,RSOP:%d*",
         pos, vel, acc, target, vel_set, acc_set, current_pwm, (int)current_mode, (int)control_system_mode, (int)jog_mode, (int)is_joystick_connected,
         (int)emergency_stop, (int)fault_code, (int)hw.raw_prox_bit, (int)current_mode == MOTOR_MODE_GHOST,
-        (int)hw.out_gripper_up, (int)hw.out_gripper_down, hw.current_amps);
+        (int)hw.out_gripper_up, (int)hw.out_gripper_down, hw.current_amps,
+        (int)hw.in_reed_up, (int)hw.in_reed_down, (int)hw.in_reed_close, (int)hw.in_reed_open);
 
     if (len > 0) {
         HAL_UART_Transmit(t_huart, (uint8_t*)tx_buffer, len, 100);
@@ -260,6 +261,12 @@ static void Telemetry_HandleSet(char *payload) {
             else if (strcmp(key, "SAFE_OVERROT") == 0) safety_config.over_rotation_check = (val > 0.5f);
             else if (strcmp(key, "SAFE_JOY")     == 0) safety_config.joystick_check      = (val > 0.5f);
             else if (strcmp(key, "SAFE_ESTOP")   == 0) safety_config.physical_estop_check= (val > 0.5f);
+            /* Runtime-tunable safety thresholds (dashboard Safety Config). */
+            else if (strcmp(key, "MAX_ROT")      == 0) safety_config.soft_limit_deg  = val;
+            else if (strcmp(key, "STALL_PWM")    == 0) safety_config.stall_pwm_pct    = val;
+            else if (strcmp(key, "STALL_VEL")    == 0) safety_config.stall_vel_rpm    = val;
+            else if (strcmp(key, "STALL_TIME")   == 0) safety_config.stall_time_ms    = (uint32_t)val;
+            else if (strcmp(key, "STALL_ERR")    == 0) safety_config.stall_error_deg  = val;
             else if (strcmp(key, "SYS_MODE")     == 0) control_system_mode = (val > 0.5f) ? CONTROL_MODE_JOYSTICK : CONTROL_MODE_BASE_SYSTEM;
             else if (strcmp(key, "JOG_MODE")     == 0) jog_mode = (val > 0.5f) ? JOG_FINE : JOG_COARSE;
             else if (strcmp(key, "SHPEN")        == 0) tuning.shaper_enable  = (val > 0.5f);
@@ -284,8 +291,11 @@ static void Telemetry_HandleCmd(char *payload) {
         emergency_stop = true;
         FAULT_SET(FAULT_ESTOP_DASHBOARD);
     } else if (strcmp(payload, "CLEAR") == 0) {
+        startup_estop_pending = false;
+        FAULT_CLR(FAULT_STARTUP_ESTOP);
         fault_code = FAULT_NONE;
         emergency_stop = false;
+        printf("[SAFETY] Startup E-Stop cleared by user.\r\n");
     } else if (strcmp(payload, "HOME") == 0) {
         trigger_homing_sequence = true;
     } else if (strcmp(payload, "GRIP_UP") == 0) {

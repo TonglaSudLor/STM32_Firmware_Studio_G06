@@ -38,6 +38,7 @@ volatile bool is_joystick_connected = true;
 static bool usart3_joystick_seen = false;
 
 volatile bool emergency_stop = true;
+volatile bool startup_estop_pending = true;  /**< Cleared only by explicit user CMD:CLEAR after power-on */
 /* Set to true when the physical (hardware) E-Stop fires — the motor relay
  * opens, which cuts power to the encoder too, so the TIM3 quadrature count
  * cannot be trusted across the outage. On recovery, the firmware ignores the
@@ -60,7 +61,12 @@ volatile SafetyConfig_t safety_config = {
     .encoder_check = true,
     .over_rotation_check = true,
     .joystick_check = true,
-    .physical_estop_check = true
+    .physical_estop_check = true,
+    .soft_limit_deg  = SOFT_LIMIT_DEG,
+    .stall_pwm_pct   = STALL_PWM_THRESHOLD,
+    .stall_vel_rpm   = STALL_VELOCITY_THRESHOLD,
+    .stall_time_ms   = STALL_TIME_MS,
+    .stall_error_deg = STALL_SETTLING_ERROR_DEG
 };
 volatile Motor_FaultCode_t fault_code = FAULT_NONE;
 volatile float target_position_deg = 0.0f;
@@ -286,7 +292,11 @@ static void Encoder_Update(void)
     if (delta > 2000 || delta < -2000) {
         delta = 0;
     }
-    
+
+#if ENCODER_PHASE_INVERTED
+    delta = -delta;
+#endif
+
     encoder.count_prev = current_count;
     encoder.absolute_counts += delta;
     
@@ -969,6 +979,10 @@ void Motor_Init(void)
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
     __HAL_TIM_MOE_ENABLE(&htim1);
     HAL_TIM_Base_Start_IT(&htim6);
+
+    /* Startup safety latch: hold E-Stop until user explicitly clears it */
+    FAULT_SET(FAULT_STARTUP_ESTOP);
+    printf("[SAFETY] *** STARTUP E-STOP ACTIVE — Send CMD:CLEAR to release ***\r\n");
 }
 
 void Motor_MoveToPosition(float target_degrees)
@@ -1232,10 +1246,11 @@ void Motor_ProcessPacket(char action, char safety, char status)
             printf("[SAFETY] E-Stop LATCHED via Joystick\r\n");
         } else if (!hw.in_estop && hw.raw_prox_bit) {
             // Only clear if physical hardware is also safe
+            startup_estop_pending = false;
             emergency_stop = false;
             FAULT_CLR(FAULT_ESTOP_PHYSICAL | FAULT_PROX_LOST |
                       FAULT_ESTOP_JOYSTICK | FAULT_ESTOP_DASHBOARD |
-                      FAULT_ESTOP_MODBUS);
+                      FAULT_ESTOP_MODBUS | FAULT_STARTUP_ESTOP);
             Motor_SendAudioCommand('C');
             printf("[SAFETY] E-Stop CLEARED via Joystick\r\n");
         }
@@ -1720,7 +1735,7 @@ void Motor_ControlLoop(void)
     bool stall_condition = false;
 
     // 1. Stall Detection
-    if (fabsf(current_applied_pwm) >= STALL_PWM_THRESHOLD && fabsf(encoder.filtered_rpm) < STALL_VELOCITY_THRESHOLD) {
+    if (fabsf(current_applied_pwm) >= safety_config.stall_pwm_pct && fabsf(encoder.filtered_rpm) < safety_config.stall_vel_rpm) {
         if (current_mode == MOTOR_MODE_POSITION || current_mode == MOTOR_MODE_GHOST) {
             /* Compare against the SHAPED (commanded) setpoint, not the final
              * target (bug 0-I). The ZVD shaper delays the command by up to 2N
@@ -1732,7 +1747,7 @@ void Motor_ControlLoop(void)
              * shaper_last_output == trajectory.current_setpoint_pos, which is also
              * correct (and stricter than using target_pos). */
             float pos_error = fabsf(shaper_last_output - encoder.current_position_deg);
-            if (pos_error > STALL_SETTLING_ERROR_DEG) stall_condition = true;
+            if (pos_error > safety_config.stall_error_deg) stall_condition = true;
         } else if (current_mode == MOTOR_MODE_SPEED) {
             stall_condition = true;
         }
@@ -1835,7 +1850,7 @@ void Motor_ControlLoop(void)
     // Stall Timer
     if (stall_condition) {
         if (stall_timer == 0) stall_timer = HAL_GetTick();
-        else if (HAL_GetTick() - stall_timer >= STALL_TIME_MS) {
+        else if (HAL_GetTick() - stall_timer >= safety_config.stall_time_ms) {
             if (safety_config.stall_prevent) {
                 FAULT_SET(FAULT_MOTOR_STALLED);
                 emergency_stop = true;
@@ -1855,7 +1870,8 @@ void Motor_ControlLoop(void)
     }
 
     // 4. Over-Rotation Protection (Virtual Wall Notification)
-    if (fabsf(encoder.current_position_deg) > SOFT_LIMIT_DEG) {
+    if (safety_config.over_rotation_check &&
+        fabsf(encoder.current_position_deg) > safety_config.soft_limit_deg) {
         if (!(fault_code & FAULT_OVER_ROTATION)) {
             FAULT_SET(FAULT_OVER_ROTATION);
             clog_events |= CLOG_SOFT_LIMIT;
@@ -1872,13 +1888,15 @@ void Motor_ControlLoop(void)
     if (!safety_config.encoder_check) FAULT_CLR(FAULT_ENCODER_ERROR);
     if (!safety_config.stall_prevent) FAULT_CLR(FAULT_MOTOR_STALLED);
     if (!safety_config.joystick_check) FAULT_CLR(FAULT_JOYSTICK_LOST);
+    if (!safety_config.over_rotation_check) FAULT_CLR(FAULT_OVER_ROTATION);
 
     /* If e-stop was raised solely by an automatic safety fault that the user
      * has now disabled, and no other fault (automatic or manual) remains,
      * auto-release the e-stop so the motor can run again. Manual e-stop
      * sources (physical button, dashboard, joystick button, Modbus) stay
-     * latched until explicitly cleared. */
-    if (emergency_stop && fault_code == FAULT_NONE && !hw.in_estop) {
+     * latched until explicitly cleared.
+     * startup_estop_pending blocks this until user sends CMD:CLEAR. */
+    if (emergency_stop && fault_code == FAULT_NONE && !hw.in_estop && !startup_estop_pending) {
         emergency_stop = false;
     }
 
@@ -2032,21 +2050,21 @@ void Motor_ControlLoop(void)
         static float delta_pos_rev = 0.0f;
         uint32_t elapsed = HAL_GetTick() - open_loop_test_tick;
 
-        if (elapsed < 500) {
+        if (elapsed < 300) {
             /* Phase 0: Forward Drive (15% PWM) */
             if (elapsed < 20) diag_start_pos = encoder.current_position_deg;
             PWM_Apply(15.0f);
         }
-        else if (elapsed < 1000) {
+        else if (elapsed < 450) {
             /* Phase 1: Brake & Record Forward Delta */
             PWM_Apply(0.0f);
             delta_pos_fwd = encoder.current_position_deg - diag_start_pos;
         }
-        else if (elapsed < 1500) {
+        else if (elapsed < 750) {
             /* Phase 2: Reverse Drive (-15% PWM) */
             PWM_Apply(-15.0f);
         }
-        else if (elapsed < 2000) {
+        else if (elapsed < 900) {
             /* Phase 3: Brake & Record Reverse Delta */
             PWM_Apply(0.0f);
             delta_pos_rev = encoder.current_position_deg - (diag_start_pos + delta_pos_fwd);
@@ -2102,10 +2120,12 @@ void Motor_ControlLoop(void)
     /* --- Velocity Loop --- */
     if (current_mode == MOTOR_MODE_SPEED) {
         // VIRTUAL HARD STOPS: Prevent further motion in the direction of the limit
-        if (encoder.current_position_deg >= SOFT_LIMIT_DEG && trajectory.target_vel > 0.0f) {
-            trajectory.target_vel = 0.0f;
-        } else if (encoder.current_position_deg <= -SOFT_LIMIT_DEG && trajectory.target_vel < 0.0f) {
-            trajectory.target_vel = 0.0f;
+        if (safety_config.over_rotation_check) {
+            if (encoder.current_position_deg >= safety_config.soft_limit_deg && trajectory.target_vel > 0.0f) {
+                trajectory.target_vel = 0.0f;
+            } else if (encoder.current_position_deg <= -safety_config.soft_limit_deg && trajectory.target_vel < 0.0f) {
+                trajectory.target_vel = 0.0f;
+            }
         }
 
         /* Trajectory FF (cascade-control diagram).
@@ -2128,15 +2148,17 @@ void Motor_ControlLoop(void)
     /* --- Position Loop --- */
     else if (current_mode == MOTOR_MODE_POSITION || current_mode == MOTOR_MODE_GHOST || current_mode == MOTOR_MODE_HOMING) {
         // VIRTUAL HARD STOPS: Clamp target position
-        if (trajectory.target_pos > SOFT_LIMIT_DEG) {
-            trajectory.target_pos = SOFT_LIMIT_DEG;
-            static uint32_t last_warn_up = 0;
-            if (HAL_GetTick() - last_warn_up > 1000) { Motor_SendAudioCommand('W'); last_warn_up = HAL_GetTick(); }
-        }
-        if (trajectory.target_pos < -SOFT_LIMIT_DEG) {
-            trajectory.target_pos = -SOFT_LIMIT_DEG;
-            static uint32_t last_warn_dn = 0;
-            if (HAL_GetTick() - last_warn_dn > 1000) { Motor_SendAudioCommand('W'); last_warn_dn = HAL_GetTick(); }
+        if (safety_config.over_rotation_check) {
+            if (trajectory.target_pos > safety_config.soft_limit_deg) {
+                trajectory.target_pos = safety_config.soft_limit_deg;
+                static uint32_t last_warn_up = 0;
+                if (HAL_GetTick() - last_warn_up > 1000) { Motor_SendAudioCommand('W'); last_warn_up = HAL_GetTick(); }
+            }
+            if (trajectory.target_pos < -safety_config.soft_limit_deg) {
+                trajectory.target_pos = -safety_config.soft_limit_deg;
+                static uint32_t last_warn_dn = 0;
+                if (HAL_GetTick() - last_warn_dn > 1000) { Motor_SendAudioCommand('W'); last_warn_dn = HAL_GetTick(); }
+            }
         }
         /* Bypass the S-curve planner during wiggle search — the sine wave
          * is already smooth, and the profiler constantly resetting its

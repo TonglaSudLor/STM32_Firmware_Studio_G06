@@ -20,6 +20,7 @@ class TelemetryChart {
         this.tuningMode = false;
         this.tuningRuns = [];        // [{times[], vals[], vsets[], target, settleTime, overshoot}]
         this.currentRun = null;
+        this.pinnedRuns = { A: null, B: null };  // Phase D — persistent A/B overlay traces
 
         window.addEventListener('resize', () => this.resize());
         this.resize();
@@ -280,6 +281,24 @@ class TelemetryChart {
                 ctx.setLineDash([]);
             }
         });
+
+        // Pinned A/B comparison overlays (Phase D). Drawn solid + bright so the
+        // before (A, amber) and after (B, green) responses sit on top of ghosts.
+        if (!scrolling) {
+            const pinColors = { A: '#ffb000', B: '#39ff14' };
+            ['A', 'B'].forEach(slot => {
+                const run = this.pinnedRuns[slot];
+                if (!run || !run.times || run.times.length < 2) return;
+                this._drawTuningLine(run.times, run.vals, maxT, pinColors[slot], false, 2,
+                    width, height, range, minV, maxV, minT);
+                // small slot label near the trace start
+                const sx = ((run.times[0] - minT) / span) * width;
+                const sy = height - ((Math.min(Math.max(this._xform(run.vals[0]), minV), maxV) - minV) / range) * height;
+                ctx.fillStyle = pinColors[slot];
+                ctx.font = 'bold 11px monospace';
+                ctx.fillText(slot, sx + 2, Math.max(11, sy - 3));
+            });
+        }
 
         // Current run (bright)
         if (this.currentRun) {
