@@ -417,11 +417,16 @@ function processPacket(packet) {
 }
 
 async function sendCommand(cmd) {
-    if (!state.connected || !port) return;
+    if (!state.connected || !port || port.writable.locked) return;
     const writer = port.writable.getWriter();
-    writer.write(new TextEncoder().encode(`$${cmd}*`));
-    writer.releaseLock();
-    log("Sent: $" + cmd + "*");
+    try {
+        await writer.write(new TextEncoder().encode(`$${cmd}*`));
+        log("Sent: $" + cmd + "*");
+    } catch (e) {
+        log("Send error: " + e);
+    } finally {
+        writer.releaseLock();
+    }
 }
 
 // --- UI ---

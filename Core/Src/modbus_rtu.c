@@ -102,12 +102,46 @@ static void Modbus_WriteSingleRegister(Modbus_Handle_t* hmodbus)
         Modbus_ErrorReply(hmodbus, MODBUS_STATUS_ILLEGAL_DATA_ADDRESS);
         return;
     }
-    
+
     hmodbus->registers[address].U8[1] = hmodbus->rx_frame[3];
     hmodbus->registers[address].U8[0] = hmodbus->rx_frame[4];
-    
+
     memcpy(hmodbus->tx_frame, hmodbus->rx_frame, 5);
-    hmodbus->tx_count = 5; 
+    hmodbus->tx_count = 5;
+}
+
+/**
+ * @brief Function 0x10: Write Multiple Registers
+ * Many PLCs/HMIs use FC16 for all writes even for a single register.
+ * Response: echo slave_addr, FC, start_addr_hi, start_addr_lo, count_hi, count_lo.
+ */
+static void Modbus_WriteMultipleRegisters(Modbus_Handle_t* hmodbus)
+{
+    uint16_t address  = ((hmodbus->rx_frame[1] << 8) | hmodbus->rx_frame[2]);
+    uint16_t count    = ((hmodbus->rx_frame[3] << 8) | hmodbus->rx_frame[4]);
+    /* rx_frame[5] = byte count, rx_frame[6..] = data */
+    if (count < 1 || count > 0x7B)
+    {
+        Modbus_ErrorReply(hmodbus, MODBUS_STATUS_ILLEGAL_DATA_VALUE);
+        return;
+    }
+    if (address + count > hmodbus->register_count)
+    {
+        Modbus_ErrorReply(hmodbus, MODBUS_STATUS_ILLEGAL_DATA_ADDRESS);
+        return;
+    }
+    for (uint16_t i = 0; i < count; i++)
+    {
+        hmodbus->registers[address + i].U8[1] = hmodbus->rx_frame[6 + i * 2];
+        hmodbus->registers[address + i].U8[0] = hmodbus->rx_frame[7 + i * 2];
+    }
+    /* Response: FC, addr_hi, addr_lo, count_hi, count_lo */
+    hmodbus->tx_frame[0] = 0x10;
+    hmodbus->tx_frame[1] = hmodbus->rx_frame[1];
+    hmodbus->tx_frame[2] = hmodbus->rx_frame[2];
+    hmodbus->tx_frame[3] = hmodbus->rx_frame[3];
+    hmodbus->tx_frame[4] = hmodbus->rx_frame[4];
+    hmodbus->tx_count = 5;
 }
 
 /**
@@ -145,13 +179,16 @@ static void Modbus_ReadHoldingRegisters(Modbus_Handle_t* hmodbus)
  */
 static void Modbus_Dispatch(Modbus_Handle_t* hmodbus)
 {
-    switch (hmodbus->rx_frame[0]) 
+    switch (hmodbus->rx_frame[0])
     {
     case MODBUS_FUNC_WRITE_SINGLE_REG:
         Modbus_WriteSingleRegister(hmodbus);
         break;
     case MODBUS_FUNC_READ_HOLDING_REG:
         Modbus_ReadHoldingRegisters(hmodbus);
+        break;
+    case 0x10:   /* Write Multiple Registers — common on PLCs even for single-reg writes */
+        Modbus_WriteMultipleRegisters(hmodbus);
         break;
     default:
         Modbus_ErrorReply(hmodbus, MODBUS_STATUS_ILLEGAL_FUNCTION);
@@ -199,17 +236,19 @@ void Modbus_Process(Modbus_Handle_t* hmodbus)
         break;
         
     case MODBUS_STATE_PROCESSING:
-        if (hmodbus->uart.rx_tail >= 4)
+    {
+        uint16_t rx_len = hmodbus->uart.rx_tail;
+        if (rx_len >= 4)
         {
             Modbus_Register_t crc;
-            crc.U16 = CRC16(hmodbus->uart.rx_buffer, hmodbus->uart.rx_tail - 2);
+            crc.U16 = CRC16(hmodbus->uart.rx_buffer, rx_len - 2);
             
-            if (crc.U8[0] == hmodbus->uart.rx_buffer[hmodbus->uart.rx_tail - 2] &&
-                crc.U8[1] == hmodbus->uart.rx_buffer[hmodbus->uart.rx_tail - 1])
+            if (crc.U8[0] == hmodbus->uart.rx_buffer[rx_len - 2] &&
+                crc.U8[1] == hmodbus->uart.rx_buffer[rx_len - 1])
             {
                 if (hmodbus->uart.rx_buffer[0] == hmodbus->slave_address)
                 {
-                    memcpy(hmodbus->rx_frame, &hmodbus->uart.rx_buffer[1], hmodbus->uart.rx_tail - 3);
+                    memcpy(hmodbus->rx_frame, &hmodbus->uart.rx_buffer[1], rx_len - 3);
                     Modbus_Dispatch(hmodbus);
                     hmodbus->state = MODBUS_STATE_EMISSION;
                     Modbus_Emit(hmodbus);
@@ -230,6 +269,7 @@ void Modbus_Process(Modbus_Handle_t* hmodbus)
         }
         hmodbus->uart.rx_tail = 0;
         break;
+    }
         
     case MODBUS_STATE_EMISSION:
         if (hmodbus->huart->gState == HAL_UART_STATE_READY)

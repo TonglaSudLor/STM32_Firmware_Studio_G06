@@ -258,18 +258,35 @@ int main(void)
   MX_ADC1_Init();
   MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
-	/* Force LPUART1 to JOYSTICK/Dashboard mode (115200 8N1) on boot regardless
-	 * of slide-switch position. Slide switch will only toggle on EDGE changes. */
+	/* Read the slide switch at boot so the system starts in the correct mode
+	 * without requiring a toggle-cycle. Selected_Mode_Pin is PULLUP active-low:
+	 * GPIO_PIN_RESET = switch in BASE position (sw_boot=1). */
 	{
 		extern volatile Control_SystemMode_t control_system_mode;
-		control_system_mode = CONTROL_MODE_JOYSTICK;
-	}
+		uint8_t sw_boot = (HAL_GPIO_ReadPin(Selected_Mode_GPIO_Port, Selected_Mode_Pin)
+		                   == GPIO_PIN_RESET) ? 1u : 0u;
+		control_system_mode = sw_boot ? CONTROL_MODE_BASE_SYSTEM : CONTROL_MODE_JOYSTICK;
 	/* ModbusBridge_Init MUST run before LPUART1_SetMode arms the RX interrupt.
 	 * Any byte arriving on LPUART1 goes straight to ModbusBridge_RxCallback(),
 	 * which dereferences hmodbus.htim. If that pointer is still NULL the MCU
 	 * faults immediately. */
-	ModbusBridge_Init();
-	LPUART1_SetMode(false);
+		ModbusBridge_Init();
+		LPUART1_SetMode(sw_boot ? true : false);
+
+		/* Give the base system time to send its first Modbus probe and get a
+		 * response before Motor_Init() occupies the CPU for another ~50 ms.
+		 * Without this, the base system's cold-start scan arrives during the
+		 * MX peripheral init window when LPUART1 RX is not yet armed, gets
+		 * no reply, and declares "abnormal heartbeat" — requiring a manual
+		 * STM32 reset to re-sync.  300 ms is enough for any base system to
+		 * finish booting and fire its first poll. */
+		if (sw_boot) {
+			uint32_t poll_end = HAL_GetTick() + 300;
+			while (HAL_GetTick() < poll_end) {
+				ModbusBridge_Process();
+			}
+		}
+	}
 
 	Motor_Init();
 	HW_Init();
@@ -292,7 +309,10 @@ int main(void)
 	/* --- Skip startup menu, use current position as home --- */
 	{
 		extern volatile bool emergency_stop;
+		extern volatile bool startup_estop_pending;
 		emergency_stop = false;
+		startup_estop_pending = false;
+		FAULT_CLR(FAULT_STARTUP_ESTOP);
 		printf("\r\n>>> System Ready (skipped startup menu) <<<\r\n");
 	}
 
@@ -373,7 +393,7 @@ int main(void)
 					sw_candidate    = sw_raw;
 				} else if (sw_raw == sw_candidate) {
 					if (sw_count < 5) sw_count++;           /* 5 × 10 ms = 50 ms */
-					if (sw_count == 5 && sw_raw != sw_stable_state && !emergency_stop) {
+					if (sw_count == 5 && sw_raw != sw_stable_state) {
 						sw_stable_state = sw_raw;
 						bool sw_wants_base = (sw_raw == 1);
 						bool is_base = (control_system_mode == CONTROL_MODE_BASE_SYSTEM);
@@ -1108,8 +1128,16 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 		HAL_UART_Receive_IT(&huart3, (uint8_t*) &rx_byte, 1);
 	} else if (huart->Instance == LPUART1) {
 		ModbusBridge_RxCallback(modbus_rx_byte);
-		Telemetry_ProcessByte(modbus_rx_byte);
-		HAL_UART_Receive_IT(&hlpuart1, (uint8_t*) &modbus_rx_byte, 1);
+		/* In BASE_SYSTEM mode the wire carries Modbus RTU binary frames.
+		 * Feeding binary bytes into the telemetry text parser would call
+		 * Motor_RefreshWatchdog() on garbage data and could misfire commands. */
+		if (control_system_mode != CONTROL_MODE_BASE_SYSTEM) {
+			Telemetry_ProcessByte(modbus_rx_byte);
+		}
+		/* HAL_UART_Receive_IT can return HAL_BUSY if the interrupt is still
+		 * being processed or a byte arrives exactly during this call.
+		 * Loop until it returns HAL_OK to ensure the receiver is re-armed. */
+		while (HAL_UART_Receive_IT(&hlpuart1, (uint8_t*) &modbus_rx_byte, 1) == HAL_BUSY);
 	}
 }
 
@@ -1140,7 +1168,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
 		__HAL_UART_CLEAR_FEFLAG(huart);
 		__HAL_UART_CLEAR_NEFLAG(huart);
 		__HAL_UART_CLEAR_PEFLAG(huart);
-		HAL_UART_Receive_IT(huart, (uint8_t*) &modbus_rx_byte, 1);
+		while (HAL_UART_Receive_IT(huart, (uint8_t*) &modbus_rx_byte, 1) == HAL_BUSY);
 	}
 }
 /* USER CODE END 4 */

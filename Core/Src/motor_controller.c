@@ -1125,6 +1125,9 @@ void Motor_SetConnectionStatus(bool connected)
 
 void Motor_SendDataToMatlab(void)
 {
+    /* In BASE_SYSTEM mode LPUART1 carries Modbus RTU binary — never send text. */
+    if (control_system_mode == CONTROL_MODE_BASE_SYSTEM) return;
+
     float ghost_pos = (current_mode == MOTOR_MODE_GHOST) ? buffered_target_pos : trajectory.target_pos;
 
     if (ghost_move_active) {
@@ -1755,7 +1758,14 @@ void Motor_ControlLoop(void)
             float pos_error = fabsf(shaper_last_output - encoder.current_position_deg);
             if (pos_error > safety_config.stall_error_deg) stall_condition = true;
         } else if (current_mode == MOTOR_MODE_SPEED) {
-            stall_condition = true;
+            /* Only flag stall when a meaningful velocity is commanded but not
+             * achieved. Suppresses false trips during fine-jog button release
+             * (target_vel → 0 before mode flips to STOPPED) and during the
+             * brief motor startup transient where speed PID hasn't yet wound
+             * up enough to move the shaft past static friction. */
+            if (fabsf(trajectory.target_vel) > safety_config.stall_vel_rpm) {
+                stall_condition = true;
+            }
         }
     }
 
@@ -1789,10 +1799,23 @@ void Motor_ControlLoop(void)
      * creep speeds are 1–10 RPM, and breakaway static friction can make
      * count_delta cross zero while PWM is held high — none of that is a
      * wiring fault. */
+    /* When ENCODER_PHASE_INVERTED=1 the firmware negates count_delta in
+     * Encoder_Update, so positive PWM → negative count_delta is CORRECT.
+     * Flip the expected sign relationship when the inversion is active so
+     * the check only fires on an actual double-inversion (real wiring fault),
+     * not on the intended software correction.  Without this, every sustained
+     * forward or backward move triggers FAULT_ENCODER_ERROR after ~800 ms. */
+#if ENCODER_PHASE_INVERTED
+    bool instant_inverted = pwm_dir_settled &&
+                            (current_mode != MOTOR_MODE_HOMING) && (
+        (pwm_sign_now ==  1 && count_delta >  10) ||
+        (pwm_sign_now == -1 && count_delta < -10));
+#else
     bool instant_inverted = pwm_dir_settled &&
                             (current_mode != MOTOR_MODE_HOMING) && (
         (pwm_sign_now ==  1 && count_delta < -10) ||
         (pwm_sign_now == -1 && count_delta >  10));
+#endif
 
     static uint8_t inversion_streak = 0;
     if (instant_inverted) {
@@ -2317,6 +2340,8 @@ void Motor_DrainControlLog(void)
     __set_PRIMASK(pm);
 
     if (ev == 0) return;
+    /* Suppress all prints in BASE_SYSTEM mode — LPUART1 carries Modbus RTU binary. */
+    if (control_system_mode == CONTROL_MODE_BASE_SYSTEM) return;
 
     if (ev & CLOG_ESTOP_PHYS_REHOME)  printf("[SAFETY] Physical E-Stop cleared. Auto-homing DISABLED. Holding current position.\r\n");
     if (ev & CLOG_ESTOP_CLEARED_HOLD) printf("[SAFETY] E-Stop Cleared. Holding at current position (%.2f).\r\n", hold);

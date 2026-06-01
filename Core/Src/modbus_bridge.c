@@ -319,6 +319,16 @@ static void ModbusBridge_HandleCommands(void)
 
 void ModbusBridge_Init(void)
 {
+    /* CubeMX generates TIM16 with Period=49 (5 ms at 10 kHz timer clock).
+     * Modbus RTU spec for baud > 19200: T3.5 = 1.75 ms (fixed).
+     * At 230400 baud the true T3.5 is only 166 µs; the 5 ms window is so long
+     * that adjacent frames from the base system (separated by the standard
+     * 166 µs inter-frame gap) get merged into one corrupt frame → CRC fail
+     * → no response → "abnormal heartbeat".  2 ms is safely above the 1.75 ms
+     * spec minimum while being short enough to distinguish consecutive frames. */
+    htim16.Init.Period = 19;    /* 10 kHz clock → (19+1) ticks = 2 ms */
+    HAL_TIM_Base_Init(&htim16);
+
     memset(register_frame, 0, sizeof(register_frame));
     
     // 0x00: Device ID / Heartbeat ("YA")

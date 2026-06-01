@@ -1,8 +1,10 @@
 ../Core/Src/modbus_bridge.c:60:13:motor_at_target	16	static
 ../Core/Src/modbus_bridge.c:92:13:PnP_StateMachine	16	static
-../Core/Src/modbus_bridge.c:179:13:ModbusBridge_HandleCommands	24	static
-../Core/Src/modbus_bridge.c:286:6:ModbusBridge_Init	8	static
-../Core/Src/modbus_bridge.c:303:6:ModbusBridge_Process	8	static
-../Core/Src/modbus_bridge.c:315:6:ModbusBridge_UpdateRegisters	16	static
-../Core/Src/modbus_bridge.c:363:6:ModbusBridge_RxCallback	16	static
-../Core/Src/modbus_bridge.c:380:6:ModbusBridge_TimerCallback	8	static
+../Core/Src/modbus_bridge.c:179:13:ModbusBridge_HandleCommands	48	static,ignoring_inline_asm
+../Core/Src/modbus_bridge.c:320:6:ModbusBridge_Init	8	static
+../Core/Src/modbus_bridge.c:347:6:ModbusBridge_Process	8	static
+../Core/Src/modbus_bridge.c:359:6:ModbusBridge_UpdateRegisters	16	static
+../Core/Src/modbus_bridge.c:407:6:ModbusBridge_RxCallback	16	static
+../Core/Src/modbus_bridge.c:424:6:ModbusBridge_TimerCallback	8	static
+../Core/Src/modbus_bridge.c:430:6:ModbusBridge_IsBaseAlive	4	static
+../Core/Src/modbus_bridge.c:435:5:ModbusBridge_GetPnPState	4	static
