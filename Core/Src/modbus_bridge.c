@@ -69,8 +69,46 @@ extern TIM_HandleTypeDef htim16;
 extern TIM_HandleTypeDef htim3;
 
 /* --- Modbus Configuration --- */
-#define MODBUS_SLAVE_ID     21
+#define MODBUS_SLAVE_ID     21       /* ตรงกับ Base System config */
 #define MODBUS_REG_COUNT    128
+
+/*
+ * REGISTER MAP  (FC03=Read, FC06=Write, slave ID=21, 19200 8E1)
+ * ─────────────────────────────────────────────────────────────
+ * WRITE (Base System → Robot):
+ *   0x00  RW  Heartbeat       Robot init: 22881 (YA). Base replies: 18537 (HI). Timeout 3s.
+ *   0x01  W   Command bits    bit0=Home  bit1=Jog  bit2=Auto  bit3=SetHome  bit4=Test
+ *   0x02  W   Manual gripper  0=Up  1=Down  2=Open  4=Close  (edge-triggered)
+ *   0x03  W   Gripper seq     1=Pick  2=Place  (auto-clears after use)
+ *   0x04  W   Config bits     bit0=grip_enable (used when P&P starts)
+ *   0x05  W   Jog step        int16, degrees — ⚠ sign INVERTED vs firmware convention
+ *   0x12  W   PnP pair[0] pick  int16 × 10, deg — ⚠ sign INVERTED
+ *   0x13  W   PnP pair[0] place int16 × 10, deg — ⚠ sign INVERTED
+ *   ...        (pairs 1-4 follow at 0x14/0x15 … 0x1A/0x1B)
+ *   0x22  W   P&P trigger     Write pair count (1–5) to start. Auto-clears.
+ *   0x24  W   Point-to-point  int16, deg — ⚠ sign INVERTED vs firmware convention
+ *   0x25  W   Safety          bit0=E-Stop ON  bit1=E-Stop OFF
+ *
+ * READ (Robot → Base System):
+ *   0x26  R   Reed sensors    bit0=reed_up  bit1=reed_down  bit2=reed_close  bit3=reed_open
+ *   0x27  R   Task state      bit0=Homing  bit1=GoPick  bit2=GoPlace  bit3=GoPoint
+ *   0x28  R   Position        int16, deg × 10 — ⚠ sign INVERTED vs firmware
+ *   0x29  R   Speed           int16, RPM × 10 — ⚠ sign INVERTED vs firmware
+ *   0x30  R   Acceleration    int16, RPM/s × 10 — ⚠ sign INVERTED vs firmware
+ *   0x31  R   E-Stop state    0=running  1=stopped
+ *
+ * SIGN CONVENTION NOTE:
+ *   Base System and firmware use opposite rotation directions.
+ *   Every position/speed/accel register is sign-inverted on both read and write.
+ *   Do not remove these inversions without coordinating with Base System team.
+ *
+ * DIAGNOSTICS (not in register map, visible in STM32 Live Expressions):
+ *   modbus_crc_errors    — frames dropped: bad CRC (field noise indicator)
+ *   modbus_frame_errors  — frames dropped: too short
+ *   modbus_rx_overruns   — RX buffer overflows
+ *   modbus_uart_errors   — UART hardware error callbacks
+ * ─────────────────────────────────────────────────────────────
+ */
 
 /* --- Global Modbus Handle --- */
 static Modbus_Handle_t hmodbus;
@@ -402,6 +440,12 @@ void ModbusBridge_UpdateRegisters(void)
 
     /* 0x31: Emergency / Safety state (bit 0) */
     register_frame[0x31].U16 = emergency_stop ? 1 : 0;
+}
+
+void ModbusBridge_UartErrorRecovery(void)
+{
+    if (!modbus_initialized) return;
+    Modbus_UartErrorRecovery(&hmodbus);
 }
 
 void ModbusBridge_RxCallback(uint8_t data)

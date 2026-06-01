@@ -68,9 +68,15 @@ main.c (USER CODE blocks)
 
 `Motor_ControlLoop()` is called from the 1 kHz TIM6 ISR with a `/10` divider.
 
-Flow: encoder read → S-curve trajectory step → **outer position PID** → **inner speed PID** → PWM + feedforward → safety checks.
+Flow: encoder read → **ZVD input shaper** (filters position setpoint) → S-curve trajectory step → **outer position PID** → **inner speed PID** → PWM + velocity/acceleration/disturbance feedforward → safety checks.
 
 All tunable parameters live in `params.h` as `#define` constants; runtime-mutable copies live in the `Motor_TuningParams_t tuning` struct (`motor_controller.h`).
+
+**ZVD Input Shaper:** 3-impulse Zero-Vibration-Derivative shaper on the position setpoint. Enabled via `tuning.shaper_enable`; coefficients derived from `tuning.shaper_omega_n` (rad/s) and `tuning.shaper_zeta`. Ring buffer size = 100 ticks (1 s max delay). Defaults in `params.h` under `DEFAULT_SHAPER_*`.
+
+**Offset Homing:** `tuning.home_offset_deg` shifts position-0 relative to the proximity sensor centre. Survives re-homing via `original_home_offset_deg`. Settable at runtime with `$SET:HOME_OFFSET=<deg>*`.
+
+**Disturbance Feedforward:** `DEFAULT_K_TFF` scales the Kalman τ_L (load-torque) estimate into a direct PWM pre-compensation term. Tune 0 → 1; large values may cause oscillation.
 
 ### HW I/O (`hw_io.c`)
 
@@ -123,6 +129,9 @@ Key parser mapping (telemetry key → `state.*`):
 | Task | Files to edit |
 |------|--------------|
 | Change PID defaults / motion limits / safety thresholds | `Core/Inc/params.h` |
+| Tune ZVD input shaper (ωn, ζ) or enable/disable it | `Core/Inc/params.h` (`DEFAULT_SHAPER_*`) + `tuning.shaper_*` at runtime |
+| Change homing sensor offset | `Core/Inc/params.h` (`DEFAULT_HOME_OFFSET`) or `$SET:HOME_OFFSET=<deg>*` at runtime |
+| Tune disturbance feedforward | `Core/Inc/params.h` (`DEFAULT_K_TFF`) |
 | Add/change a GPIO pin | `.ioc` (CubeMX GUI) → regenerate → never touch `main.h` directly |
 | Add a new HAL peripheral | `.ioc` → add to `functionlistsort` → regenerate |
 | Change telemetry packet fields | `Core/Src/telemetry_hub.c` + `dashboard/app.js` (processPacket switch) |

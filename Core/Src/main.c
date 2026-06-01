@@ -1168,7 +1168,13 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
 		__HAL_UART_CLEAR_FEFLAG(huart);
 		__HAL_UART_CLEAR_NEFLAG(huart);
 		__HAL_UART_CLEAR_PEFLAG(huart);
-		while (HAL_UART_Receive_IT(huart, (uint8_t*) &modbus_rx_byte, 1) == HAL_BUSY);
+		if (control_system_mode == CONTROL_MODE_BASE_SYSTEM) {
+			/* Modbus mode: reset protocol state machine + re-arm RX */
+			ModbusBridge_UartErrorRecovery();
+		} else {
+			/* Dashboard mode: re-arm with retry (handles HAL_BUSY) */
+			while (HAL_UART_Receive_IT(huart, (uint8_t*) &modbus_rx_byte, 1) == HAL_BUSY);
+		}
 	}
 }
 /* USER CODE END 4 */

@@ -7,8 +7,15 @@
  */
 
 #include "modbus_rtu.h"
+#include "modbus_frame.h"
 
 extern uint8_t modbus_rx_byte;
+
+/* --- Diagnostic counters (visible in Live Expressions + telemetry) --- */
+volatile uint32_t modbus_crc_errors   = 0;  /* frames dropped: bad CRC       */
+volatile uint32_t modbus_frame_errors = 0;  /* frames dropped: too short      */
+volatile uint32_t modbus_rx_overruns  = 0;  /* RX buffer overflow events      */
+volatile uint32_t modbus_uart_errors  = 0;  /* HAL UART error callback fires  */
 
 /**
  * @brief Calculate Modbus CRC16
@@ -70,6 +77,18 @@ static uint16_t CRC16(unsigned char *puchMsg, unsigned short usDataLen)
         uchCRCHi = auchCRCLo[uIndex];
     }
     return (uchCRCHi << 8 | uchCRCLo);
+}
+
+void Modbus_UartErrorRecovery(Modbus_Handle_t* hmodbus)
+{
+    modbus_uart_errors++;
+    /* Reset state machine so we don't get stuck in RECEPTION/EMISSION */
+    hmodbus->state        = MODBUS_STATE_IDLE;
+    hmodbus->uart.rx_tail = 0;
+    hmodbus->uart.tx_tail = 0;
+    /* Re-arm RX interrupt — this is the fix for silent field hangs */
+    HAL_UART_AbortReceive(hmodbus->huart);
+    HAL_UART_Receive_IT(hmodbus->huart, &modbus_rx_byte, 1);
 }
 
 void Modbus_Init(Modbus_Handle_t* hmodbus, Modbus_Register_t* reg_start)
@@ -237,37 +256,41 @@ void Modbus_Process(Modbus_Handle_t* hmodbus)
         
     case MODBUS_STATE_PROCESSING:
     {
-        uint16_t rx_len = hmodbus->uart.rx_tail;
-        if (rx_len >= 4)
+        if (hmodbus->uart.rx_tail < 4)
         {
-            Modbus_Register_t crc;
-            crc.U16 = CRC16(hmodbus->uart.rx_buffer, rx_len - 2);
-            
-            if (crc.U8[0] == hmodbus->uart.rx_buffer[rx_len - 2] &&
-                crc.U8[1] == hmodbus->uart.rx_buffer[rx_len - 1])
-            {
-                if (hmodbus->uart.rx_buffer[0] == hmodbus->slave_address)
-                {
-                    memcpy(hmodbus->rx_frame, &hmodbus->uart.rx_buffer[1], rx_len - 3);
-                    Modbus_Dispatch(hmodbus);
-                    hmodbus->state = MODBUS_STATE_EMISSION;
-                    Modbus_Emit(hmodbus);
-                }
-                else
-                {
-                    hmodbus->state = MODBUS_STATE_IDLE;
-                }
-            }
-            else
-            {
-                hmodbus->state = MODBUS_STATE_IDLE;
-            }
-        }
-        else
-        {
+            modbus_frame_errors++;
+            hmodbus->uart.rx_tail = 0;
             hmodbus->state = MODBUS_STATE_IDLE;
+            break;
         }
+
+        /* Delegate all frame parsing + response building to modbus_frame */
+        Modbus_Frame_Ctx_t fctx = {
+            .slave_address  = hmodbus->slave_address,
+            .registers      = hmodbus->registers,
+            .register_count = hmodbus->register_count,
+        };
+        uint16_t tx_len = 0;
+        bool respond = Modbus_BuildResponse(&fctx,
+                                            hmodbus->uart.rx_buffer,
+                                            hmodbus->uart.rx_tail,
+                                            hmodbus->uart.tx_buffer,
+                                            &tx_len);
         hmodbus->uart.rx_tail = 0;
+
+        if (!respond)
+        {
+            /* Bad CRC or wrong slave address — count and stay silent */
+            modbus_crc_errors++;
+            hmodbus->state = MODBUS_STATE_IDLE;
+            break;
+        }
+
+        hmodbus->uart.tx_tail = tx_len;
+        hmodbus->state = MODBUS_STATE_EMISSION;
+        HAL_UART_Transmit_IT(hmodbus->huart,
+                             hmodbus->uart.tx_buffer,
+                             hmodbus->uart.tx_tail);
         break;
     }
         

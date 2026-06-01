@@ -51,4 +51,10 @@ bool ModbusBridge_IsBaseAlive(void);
  */
 int ModbusBridge_GetPnPState(void);
 
+/**
+ * @brief Call from HAL_UART_ErrorCallback when LPUART1 is in Modbus mode.
+ *        Resets the protocol state machine and re-arms RX — fixes field hangs.
+ */
+void ModbusBridge_UartErrorRecovery(void);
+
 #endif /* MODBUS_BRIDGE_H */
