@@ -34,7 +34,13 @@ typedef struct {
     /* --- Inputs (auto-updated every 100Hz, read-only) --- */
     volatile uint8_t in_estop;        /* PA5  E-Stop button via Opto CH1  (1=pressed) */
     volatile uint8_t in_proximity;    /* PB9  Proximity sensor via Opto CH2 (1=detected) */
-    volatile uint8_t in_select_mode;  /* PA6  Mode switch via Opto CH3    (1=Joystick, 0=Base) */
+    volatile uint8_t  in_select_mode;      /* PA6  Mode switch debounced output (edge-triggered toggle) */
+    volatile uint8_t  in_select_raw;       /* PA6  Raw GPIO read each tick — use to verify pin is toggling */
+    volatile uint8_t  select_debounce_cnt; /* Debounce accumulator — counts up to threshold then resets */
+    volatile uint8_t  select_debounce_peak; /* Peak value seen — stays until next toggle; >0 means switch was detected */
+    volatile uint32_t mode_toggle_fired;   /* Increments each time Mode_Toggle_Impl() actually runs */
+    volatile uint32_t dbg_loop_top;        /* Increments at the very top of the main while(1) loop */
+    volatile uint32_t dbg_loop_premode;    /* Increments right before the mode-toggle check in main loop */
     volatile uint8_t in_reset_btn;    /* PA7  Reset button via Opto CH4   (1=pressed) */
     volatile uint8_t raw_prox_bit;    /* PA6  Raw bit state (0 or 1) for debugging */
     volatile uint8_t sanity_check;   /* Should be 0xAA (170) if code is updated */

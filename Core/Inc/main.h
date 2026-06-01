@@ -55,7 +55,7 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-
+void USART3_QueueTx(const uint8_t *data, uint16_t len);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/

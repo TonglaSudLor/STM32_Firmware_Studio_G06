@@ -2,9 +2,12 @@
 #include "motor_controller.h"
 #include "hw_io.h"
 #include "kalman.h"
+#include "modbus_bridge.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+
+extern Auto_Config_t auto_config;
 
 extern volatile float current_pwm;
 
@@ -66,10 +69,12 @@ void Telemetry_Update(void) {
     float acc_set = trajectory.current_setpoint_accel;
 
     int len = snprintf(tx_buffer, TX_BUFFER_SIZE,
-        "$POS:%.2f,VEL:%.2f,ACC:%.2f,TAR:%.2f,VSET:%.2f,ASET:%.2f,PWM:%.1f,MODE:%d,SYSM:%d,JOGM:%d,JOY:%d,ESTOP:%d,FAULT:%d,PROX:%d,GHOST:%d,GUP:%d,GDN:%d,CURR:%.2f*",
+        "$POS:%.2f,VEL:%.2f,ACC:%.2f,TAR:%.2f,VSET:%.2f,ASET:%.2f,PWM:%.1f,MODE:%d,SYSM:%d,JOGM:%d,JOY:%d,ESTOP:%d,FAULT:%d,PROX:%d,GHOST:%d,GUP:%d,GDN:%d,CURR:%.2f,RSUP:%d,RSDN:%d,RSCL:%d,RSOP:%d,BSALV:%d,PNPS:%d,PUNK:%d*",
         pos, vel, acc, target, vel_set, acc_set, current_pwm, (int)current_mode, (int)control_system_mode, (int)jog_mode, (int)is_joystick_connected,
         (int)emergency_stop, (int)fault_code, (int)hw.raw_prox_bit, (int)current_mode == MOTOR_MODE_GHOST,
-        (int)hw.out_gripper_up, (int)hw.out_gripper_down, hw.current_amps);
+        (int)hw.out_gripper_up, (int)hw.out_gripper_down, hw.current_amps,
+        (int)hw.in_reed_up, (int)hw.in_reed_down, (int)hw.in_reed_close, (int)hw.in_reed_open,
+        (int)ModbusBridge_IsBaseAlive(), ModbusBridge_GetPnPState(), (int)position_unknown);
 
     if (len > 0) {
         HAL_UART_Transmit(t_huart, (uint8_t*)tx_buffer, len, 100);
@@ -103,7 +108,7 @@ void Telemetry_Update(void) {
         len = snprintf(tx_buffer, TX_BUFFER_SIZE,
             "$SKP:%.3f,SKI:%.3f,SKD:%.3f,KVFF:%.3f,KAFF:%.3f,KTFF:%.3f,PKP:%.3f,PKI:%.3f,PKD:%.3f,"
             "VMAX:%.2f,AMAX:%.2f,JMAX:%.1f,STEPC:%.1f,STEPF:%.1f,JOGF:%.1f,HOMES:%.1f,MINP:%.1f,PLOOP:%d,"
-            "SHPEN:%d,SHPWN:%.3f,SHPZT:%.4f,HOFS:%.2f*",
+            "SHPEN:%d,SHPWN:%.3f,SHPZT:%.4f,SHPN:%lu,GRIPS:%d,GRIPD:%u,HOFS:%.2f*",
             tuning.speed_Kp, tuning.speed_Ki, tuning.speed_Kd,
             tuning.K_vff, tuning.K_aff, tuning.K_tff,
             tuning.pos_Kp, tuning.pos_Ki, tuning.pos_Kd,
@@ -114,6 +119,9 @@ void Telemetry_Update(void) {
             tuning.shaper_enable ? 1 : 0,
             tuning.shaper_omega_n,
             tuning.shaper_zeta,
+            (unsigned long)Motor_GetShaperDelay(),
+            auto_config.use_sensors ? 1 : 0,
+            auto_config.delay_ms,
             tuning.home_offset_deg);
             
         if (len > 0) {
@@ -149,6 +157,9 @@ void Telemetry_ProcessByte(uint8_t byte) {
 
 static void Telemetry_ParseCommand(char *cmd_str) {
     has_received_command = true;
+    
+    /* Refresh joystick watchdog so dashboard activity counts as a valid control link */
+    Motor_RefreshWatchdog();
     
     // Expected format: TYPE:PAYLOAD
     char *colon = strchr(cmd_str, ':');
@@ -256,7 +267,40 @@ static void Telemetry_HandleSet(char *payload) {
             else if (strcmp(key, "SAFE_ENCODER") == 0) safety_config.encoder_check       = (val > 0.5f);
             else if (strcmp(key, "SAFE_OVERROT") == 0) safety_config.over_rotation_check = (val > 0.5f);
             else if (strcmp(key, "SAFE_JOY")     == 0) safety_config.joystick_check      = (val > 0.5f);
-            else if (strcmp(key, "SYS_MODE")     == 0) control_system_mode = (val > 0.5f) ? CONTROL_MODE_JOYSTICK : CONTROL_MODE_BASE_SYSTEM;
+            else if (strcmp(key, "SAFE_ESTOP")   == 0) safety_config.physical_estop_check= (val > 0.5f);
+            /* Runtime-tunable safety thresholds (dashboard Safety Config). */
+            else if (strcmp(key, "MAX_ROT")      == 0) safety_config.soft_limit_deg  = val;
+            else if (strcmp(key, "STALL_PWM")    == 0) safety_config.stall_pwm_pct    = val;
+            else if (strcmp(key, "STALL_VEL")    == 0) safety_config.stall_vel_rpm    = val;
+            else if (strcmp(key, "STALL_TIME")   == 0) safety_config.stall_time_ms    = (uint32_t)val;
+            else if (strcmp(key, "STALL_ERR")    == 0) safety_config.stall_error_deg  = val;
+            else if (strcmp(key, "SYS_MODE")     == 0) {
+                if (val > 1.5f) {
+                    current_mode = MOTOR_MODE_AUTO;
+                    auto_config.current_index = 0;
+                } else {
+                    control_system_mode = (val > 0.5f) ? CONTROL_MODE_JOYSTICK : CONTROL_MODE_BASE_SYSTEM;
+                    if (current_mode == MOTOR_MODE_AUTO) current_mode = MOTOR_MODE_STOPPED;
+                }
+            }
+            else if (strcmp(key, "WP_CLR")       == 0) {
+                auto_config.target_count = 0;
+                auto_config.current_index = 0;
+            }
+            else if (strcmp(key, "WP_ADD")       == 0) {
+                if (auto_config.target_count < 10) {
+                    auto_config.positions[auto_config.target_count] = val;
+                    auto_config.actions[auto_config.target_count] = AUTO_ACTION_NONE;
+                    auto_config.target_count++;
+                }
+            }
+            else if (strcmp(key, "WP_ACT")       == 0) {
+                if (auto_config.target_count > 0) {
+                    auto_config.actions[auto_config.target_count - 1] = (Auto_Action_t)((int)val);
+                }
+            }
+            else if (strcmp(key, "WP_SENS")      == 0) auto_config.use_sensors = (val > 0.5f);
+            else if (strcmp(key, "WP_DLY")       == 0) auto_config.delay_ms = (uint16_t)val;
             else if (strcmp(key, "JOG_MODE")     == 0) jog_mode = (val > 0.5f) ? JOG_FINE : JOG_COARSE;
             else if (strcmp(key, "SHPEN")        == 0) tuning.shaper_enable  = (val > 0.5f);
             else if (strcmp(key, "SHPWN")        == 0) { tuning.shaper_omega_n = val; Motor_ShaperRecompute(); }
@@ -274,9 +318,14 @@ static void Telemetry_HandleSet(char *payload) {
 
 static void Telemetry_HandleCmd(char *payload) {
     if (strcmp(payload, "ESTOP=1") == 0 || strcmp(payload, "ESTOP") == 0) {
+        if (!emergency_stop) {
+            printf("[SAFETY] E-Stop LATCHED via Dashboard Command\r\n");
+        }
         emergency_stop = true;
-        fault_code |= FAULT_ESTOP_DASHBOARD;
+        FAULT_SET(FAULT_ESTOP_DASHBOARD);
     } else if (strcmp(payload, "CLEAR") == 0) {
+        startup_estop_pending = false;
+        FAULT_CLR(FAULT_STARTUP_ESTOP);
         fault_code = FAULT_NONE;
         emergency_stop = false;
     } else if (strcmp(payload, "HOME") == 0) {
@@ -296,6 +345,8 @@ static void Telemetry_HandleCmd(char *payload) {
         hw.out_gripper_down = 0;
     } else if (strcmp(payload, "TOGGLE_MODE") == 0) {
         Mode_Toggle();
+    } else if (strcmp(payload, "DIAG") == 0 || strcmp(payload, "Z") == 0) {
+        Motor_ProcessCommand('Z');
     } else if (strcmp(payload, "SET_HOME") == 0) {
         /* Instantly declare current position as home (position 0).
          * Same effect as a single A-button click on the joystick.

@@ -252,7 +252,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
   /** Initializes the peripherals clocks
   */
     PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_LPUART1;
-    PeriphClkInit.Lpuart1ClockSelection = RCC_LPUART1CLKSOURCE_HSI;
+    PeriphClkInit.Lpuart1ClockSelection = RCC_LPUART1CLKSOURCE_PCLK1;
     if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
     {
       Error_Handler();
@@ -407,6 +407,20 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* htim_base)
 
     /* USER CODE END TIM6_MspInit 1 */
   }
+  else if(htim_base->Instance==TIM7)
+  {
+    /* USER CODE BEGIN TIM7_MspInit 0 */
+
+    /* USER CODE END TIM7_MspInit 0 */
+    /* Peripheral clock enable */
+    __HAL_RCC_TIM7_CLK_ENABLE();
+    /* TIM7 interrupt Init */
+    HAL_NVIC_SetPriority(TIM7_DAC_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(TIM7_DAC_IRQn);
+    /* USER CODE BEGIN TIM7_MspInit 1 */
+
+    /* USER CODE END TIM7_MspInit 1 */
+  }
   else if(htim_base->Instance==TIM16)
   {
     /* USER CODE BEGIN TIM16_MspInit 0 */
@@ -529,6 +543,20 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* htim_base)
     /* USER CODE BEGIN TIM6_MspDeInit 1 */
 
     /* USER CODE END TIM6_MspDeInit 1 */
+  }
+  else if(htim_base->Instance==TIM7)
+  {
+    /* USER CODE BEGIN TIM7_MspDeInit 0 */
+
+    /* USER CODE END TIM7_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_TIM7_CLK_DISABLE();
+
+    /* TIM7 interrupt DeInit */
+    HAL_NVIC_DisableIRQ(TIM7_DAC_IRQn);
+    /* USER CODE BEGIN TIM7_MspDeInit 1 */
+
+    /* USER CODE END TIM7_MspDeInit 1 */
   }
   else if(htim_base->Instance==TIM16)
   {

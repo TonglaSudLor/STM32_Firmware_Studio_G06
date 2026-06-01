@@ -89,19 +89,33 @@ typedef struct {
     Modbus_Uart_t uart;
 } Modbus_Handle_t;
 
+/* --- Diagnostic counters (read from Live Expressions or telemetry) --- */
+extern volatile uint32_t modbus_crc_errors;    /* bad CRC frames dropped      */
+extern volatile uint32_t modbus_frame_errors;  /* frames too short to parse   */
+extern volatile uint32_t modbus_rx_overruns;   /* RX buffer overflow events   */
+extern volatile uint32_t modbus_uart_errors;   /* HAL UART error callbacks    */
+
 /* --- Public API --- */
 
 /**
  * @brief Initialize Modbus handle
- * @param hmodbus Pointer to handle
+ * @param hmodbus   Pointer to handle
  * @param reg_start Pointer to register map start
  */
 void Modbus_Init(Modbus_Handle_t* hmodbus, Modbus_Register_t* reg_start);
 
 /**
- * @brief Main protocol processing worker
+ * @brief Main protocol processing worker — call from main loop
  * @param hmodbus Pointer to handle
  */
 void Modbus_Process(Modbus_Handle_t* hmodbus);
+
+/**
+ * @brief Call from HAL_UART_ErrorCallback when hmodbus->huart matches.
+ *        Re-arms RX interrupt so the stack recovers from framing/noise errors
+ *        instead of hanging silently (root cause of field disconnects).
+ * @param hmodbus Pointer to handle
+ */
+void Modbus_UartErrorRecovery(Modbus_Handle_t* hmodbus);
 
 #endif /* MODBUS_RTU_H */

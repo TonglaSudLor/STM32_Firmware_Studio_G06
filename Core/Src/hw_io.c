@@ -102,14 +102,15 @@ void HW_RefreshIO(void)
          * tight wait_for_reed() poll — so estop_debounce accumulates at
          * roughly 150 Hz, not 100 Hz.  Actual window = threshold / 150 s.
          *
-         * During homing the creep phase (HOMING_CREEP_RPM = 1 RPM) commands
-         * near-maximum PWM to overcome static friction, generating the worst
-         * possible EMI on PA5 for the longest time.  Use a 1 s window (150
-         * samples at ~150 Hz) so the startup transient can drain before
-         * accumulating enough counts.  Normal running stays at 300 ms. */
-        uint8_t threshold = (motor_active_ticks > 0)
-                          ? (current_mode == MOTOR_MODE_HOMING ? 150 : 30)
-                          : 8;
+         * During homing or diagnostic tests, high PWM commands generate 
+         * significant EMI on PA5. Use a 1.5 s window (225 samples at ~150 Hz) 
+         * so the startup transients are ignored. Normal running stays at 500 ms. */
+        /* Use a 1.0 s window (150 samples at ~150 Hz) for normal running,
+         * and 2.0 s (300 samples) for high-EMI modes like Homing.
+         * This prevents false FAULT_ESTOP_PHYSICAL triggers from motor noise. */
+        uint16_t threshold = (motor_active_ticks > 0)
+                           ? ((current_mode == MOTOR_MODE_HOMING || current_mode == MOTOR_MODE_TEST) ? 300 : 150)
+                           : 8;
 
         if (estop_raw) {
             if (estop_debounce < threshold) estop_debounce++;
@@ -120,30 +121,67 @@ void HW_RefreshIO(void)
     }
     hw.in_proximity   = (HAL_GPIO_ReadPin(Proximity_Sensor_GPIO_Port, Proximity_Sensor_Pin) == GPIO_PIN_RESET) ? 1 : 0;
     hw.raw_prox_bit   = (HAL_GPIO_ReadPin(Proximity_Sensor_GPIO_Port, Proximity_Sensor_Pin) == GPIO_PIN_RESET) ? 1 : 0;
-    hw.in_select_mode = (HAL_GPIO_ReadPin(Selected_Mode_GPIO_Port, Selected_Mode_Pin) == GPIO_PIN_RESET) ? 1 : 0;
 
-    /* --- Slide switch edge detect → toggle system mode --- */
+    /* --- Slide switch debouncing (integrator) → toggle system mode ---
+     * The slide switch on PA6 is susceptible to motor-current EMI.
+     * Require a consistent state for 20 samples (~200ms) before toggling. */
     {
-        static int8_t prev_select = -1;  /* -1 = uninitialized */
-        if (prev_select < 0) {
-            prev_select = (int8_t)hw.in_select_mode;  /* sync on first read; no toggle */
-        } else if ((int8_t)hw.in_select_mode != prev_select) {
-            prev_select = (int8_t)hw.in_select_mode;
-            printf("[SLIDE SW] edge detected, toggling mode\r\n");
-            Mode_Toggle();
+        static uint8_t  select_debounce = 0;
+        static int8_t   debounced_state = -1; /* -1 = uninitialized */
+        static uint16_t toggle_cooldown = 0;  /* ticks remaining before another toggle is allowed */
+        uint8_t raw_select = (HAL_GPIO_ReadPin(Selected_Mode_GPIO_Port, Selected_Mode_Pin) == GPIO_PIN_RESET) ? 1 : 0;
+        hw.in_select_raw = raw_select;
+
+        if (toggle_cooldown > 0) toggle_cooldown--;
+
+        if (debounced_state < 0) {
+            debounced_state = (int8_t)raw_select;
+        } else if (raw_select != (uint8_t)debounced_state) {
+            select_debounce++;
+            hw.select_debounce_cnt = select_debounce;
+            if (select_debounce > hw.select_debounce_peak)
+                hw.select_debounce_peak = select_debounce;
+            if (select_debounce >= 5) {
+                debounced_state = (int8_t)raw_select;
+                select_debounce = 0;
+                hw.select_debounce_cnt = 0;
+                /* Mode change is handled level-triggered in the main loop
+                 * by comparing hw.in_select_mode to control_system_mode.
+                 * No Mode_Toggle() call needed here. */
+            }
+        } else {
+            select_debounce = 0;
+            hw.select_debounce_cnt = 0;
         }
+        hw.in_select_mode = (uint8_t)debounced_state;
     }
-    /* Debounce reset button: require 5 consecutive active reads (~100ms at 50Hz poll).
-     * Prevents contact bounce from causing rapid relay oscillation. */
+    /* Debounce reset button with adaptive threshold — same EMI that trips the
+     * E-stop (PA5) also couples onto PA7 (Reset) through the board's ground
+     * plane during relay switching. A fixed 5-tick threshold (50 ms) is short
+     * enough that relay-arc transients satisfy it, auto-clearing the E-stop
+     * without the user touching anything.
+     *
+     * Adaptive thresholds (same motor_active_ticks guard used by E-stop):
+     *   Motor relay recently ON : 50 ticks (~500 ms) — long enough to outlast
+     *                             relay-arc + PWM-switching noise bursts.
+     *   Motor relay idle        :  8 ticks (~80 ms)  — snappy for real presses.
+     * A real button press easily sustains LOW for 500 ms; EMI bursts do not. */
     {
-        static uint8_t reset_debounce = 0;
+        static uint8_t  reset_debounce      = 0;
+        static uint16_t reset_motor_ticks   = 0;   /* mirrors E-stop's motor_active_ticks */
+        if (hw.out_relay_motor) {
+            reset_motor_ticks = 100;   /* hold strict mode 1 s past relay open */
+        } else if (reset_motor_ticks > 0) {
+            reset_motor_ticks--;
+        }
         uint8_t reset_raw = (HAL_GPIO_ReadPin(Reset_Btn_GPIO_Port, Reset_Btn_Pin) == GPIO_PIN_RESET) ? 1 : 0;
+        uint8_t reset_threshold = (reset_motor_ticks > 0) ? 50u : 8u;
         if (reset_raw) {
-            if (reset_debounce < 5) reset_debounce++;
+            if (reset_debounce < reset_threshold) reset_debounce++;
         } else {
             reset_debounce = 0;
         }
-        hw.in_reset_btn = (reset_debounce >= 5) ? 1 : 0;
+        hw.in_reset_btn = (reset_debounce >= reset_threshold) ? 1 : 0;
     }
 
     /* --- Read Reed Switch inputs (gripper position feedback) --- */
@@ -163,15 +201,30 @@ void HW_RefreshIO(void)
     hw.current_amps    = CurrentSensor_Sample();
     hw.current_adc_raw = CurrentSensor_GetRaw();
 
-    /* Overcurrent trip: cut motor power immediately */
-    if (!hw.override_enabled &&
-        (hw.current_amps > OVERCURRENT_LIMIT_AMPS || hw.current_amps < -OVERCURRENT_LIMIT_AMPS))
+    /* Overcurrent trip with time debounce (bug 0-E): a single filtered sample
+     * over the limit must NOT latch the e-stop. Inrush, direction-reversal and
+     * gripper-relay transients legitimately spike past the limit for a few ms.
+     * Require the current to stay over the limit continuously for
+     * OVERCURRENT_TIME_MS before cutting motor power. */
     {
-        emergency_stop = true;
-        hw.out_relay_motor  = 0;
-        hw.out_relay_status = 1;
-        printf("[FAULT] Overcurrent: %.1f A (limit %.1f A)\r\n",
-               hw.current_amps, (float)OVERCURRENT_LIMIT_AMPS);
+        static uint32_t overcurrent_start_tick = 0;
+        bool over = (hw.current_amps > OVERCURRENT_LIMIT_AMPS ||
+                     hw.current_amps < -OVERCURRENT_LIMIT_AMPS);
+        if (!hw.override_enabled && over) {
+            if (overcurrent_start_tick == 0) overcurrent_start_tick = HAL_GetTick();
+            if ((HAL_GetTick() - overcurrent_start_tick) >= OVERCURRENT_TIME_MS) {
+                FAULT_SET(FAULT_OVERCURRENT);
+                emergency_stop = true;
+                hw.out_relay_motor  = 0;
+                hw.out_relay_status = 1;
+                printf("[FAULT] Overcurrent: %.1f A (limit %.1f A, >%lu ms)\r\n",
+                       hw.current_amps, (float)OVERCURRENT_LIMIT_AMPS,
+                       (unsigned long)OVERCURRENT_TIME_MS);
+            }
+        } else {
+            overcurrent_start_tick = 0;   /* dropped below limit (or override) — reset */
+            if (!emergency_stop) FAULT_CLR(FAULT_OVERCURRENT);
+        }
     }
 
     /* --- Read motor direction pin state for monitoring --- */
@@ -182,7 +235,7 @@ void HW_RefreshIO(void)
         if (hw.in_estop) {
             /* Emergency Pressed: Safe the system immediately */
             emergency_stop = true;
-            fault_code |= FAULT_ESTOP_PHYSICAL;
+            FAULT_SET(FAULT_ESTOP_PHYSICAL);
             /* Motor relay is about to open, encoder loses power → position
              * cannot be trusted after recovery. Force a re-home.
              *
@@ -197,11 +250,15 @@ void HW_RefreshIO(void)
                 position_unknown = true;
             }
         } else if (hw.in_reset_btn) {
-            /* Reset Pressed AND Emergency is Released: Enter Ready state */
+            /* Reset Pressed AND Emergency is Released: Enter Ready state.
+             * Also clear the startup latch so the board does not require a
+             * DIAG run after every power cycle when the hardware is known good. */
+            extern volatile bool startup_estop_pending;
+            startup_estop_pending = false;
             emergency_stop = false;
-            fault_code &= ~(FAULT_ESTOP_PHYSICAL | FAULT_PROX_LOST |
-                            FAULT_ESTOP_JOYSTICK | FAULT_ESTOP_DASHBOARD |
-                            FAULT_ESTOP_MODBUS);
+            FAULT_CLR(FAULT_ESTOP_PHYSICAL | FAULT_PROX_LOST |
+                      FAULT_ESTOP_JOYSTICK | FAULT_ESTOP_DASHBOARD |
+                      FAULT_ESTOP_MODBUS   | FAULT_STARTUP_ESTOP);
         }
 
         /* Update Outputs based on emergency_stop state */
@@ -216,11 +273,16 @@ void HW_RefreshIO(void)
         /* In override mode, still update emergency_stop flag but don't force outputs */
         if (hw.in_estop) {
             emergency_stop = true;
-            fault_code |= FAULT_ESTOP_PHYSICAL;
+            FAULT_SET(FAULT_ESTOP_PHYSICAL);
             if (current_mode != MOTOR_MODE_HOMING) {
                 position_unknown = true;
             }
-        } else if (hw.in_reset_btn) emergency_stop = false;
+        } else if (hw.in_reset_btn) {
+            extern volatile bool startup_estop_pending;
+            startup_estop_pending = false;
+            FAULT_CLR(FAULT_STARTUP_ESTOP);
+            emergency_stop = false;
+        }
     }
 
     /* --- Update Mode lamp if not overridden --- */
@@ -243,7 +305,7 @@ void HW_EStop_Trigger(void)
     hw.out_relay_motor  = 0; /* Must be 0 (OFF) for safe state! */
     if (!emergency_stop) {
         emergency_stop = true;
-        fault_code |= FAULT_ESTOP_PHYSICAL;
+        FAULT_SET(FAULT_ESTOP_PHYSICAL);
         position_unknown = true;
         Motor_SendAudioCommand('E');
     }

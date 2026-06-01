@@ -7,33 +7,40 @@
 #define PARAMS_H
 
 /* ============================================================================
+ * HARDWARE WIRING CORRECTIONS
+ * ============================================================================ */
+/* Set to 1 if the encoder counts opposite to the PWM drive direction.
+ * Negates the count delta in software — no rewiring needed. */
+#define ENCODER_PHASE_INVERTED  1
+
+/* ============================================================================
  * PID GAINS (Tuning)
  * ============================================================================ */
 
-/* Speed Loop (Inner) */
-#define DEFAULT_SPEED_KP    1.0f
-#define DEFAULT_SPEED_KI    2.0f
+/* Speed Loop (Inner) — conservative demo values; tune up live via dashboard */
+#define DEFAULT_SPEED_KP    1.58f
+#define DEFAULT_SPEED_KI    0.5f
 #define DEFAULT_SPEED_KD    0.0f
 /* Trajectory feedforward (matches cascade-control block diagram).
  *   Kvff units: V / (rad/s)   — compensates back-EMF + viscous damping
  *   Kaff units: V / (rad/s^2) — compensates inertia
  * Firmware converts trajectory RPM/(RPM/s) into rad/s/(rad/s^2) and Volts into PWM%.
  */
-#define DEFAULT_K_VFF       0.0f
-#define DEFAULT_K_AFF       0.0f
+#define DEFAULT_K_VFF       3.03f   /* restored — feedforward must overcome back-EMF+friction */
+#define DEFAULT_K_AFF       0.1f
 #define DEFAULT_K_TFF       0.0f  /* disturbance (load-torque) feedforward gain — tune 0→1 */
 
 /* Position Loop (Outer) */
-#define DEFAULT_POS_KP      0.4f
-#define DEFAULT_POS_KI      0.05f
-#define DEFAULT_POS_KD      0.1f
+#define DEFAULT_POS_KP      3.0f
+#define DEFAULT_POS_KI      0.02f
+#define DEFAULT_POS_KD      0.05f
 
 /* ============================================================================
  * MOTION & JOG SPEEDS
  * ============================================================================ */
 
 #define JOG_SPEED_FINE      10.0f   /**< Increased for better feedback */
-#define MOVE_SPEED_COARSE   69.74f  /**< 7.304 rad/s converted to RPM (v_max for S-curve) */
+#define MOVE_SPEED_COARSE   69.74f   /**< Half of original 69.74 RPM — safe demo speed */
 #define MOVE_SPEED_RETURN_HOME 30.0f /**< Custom speed for returning to home/origin */
 
 #define STEP_SIZE_COARSE    10.0f
@@ -50,7 +57,7 @@
 #define POS_INTEGRAL_MAX    200.0f
 
 #define DEFAULT_MIN_PWM     0.0f    /**< Increased to overcome static friction */
-#define DEFAULT_MAX_ACCEL   262.5f   /**< 27.49 rad/s^2 converted to RPM/s   (a_max for S-curve) */
+#define DEFAULT_MAX_ACCEL   100.0f   /**< Reduced from 262.5 — gentler ramp for demo */
 #define DEFAULT_MAX_JERK    5252.0f  /**< 550 rad/s^3 converted to RPM/s² (j_max for S-curve, T_j ≈ 50ms) */
 
 /* ============================================================================
@@ -63,6 +70,10 @@
 #define STALL_SETTLING_ERROR_DEG 15.0f   /**< Don't trigger stall if error < 15 deg
                                               * (covers normal PID overshoot/undershoot;
                                               *  genuine stall under load has error >> 15°) */
+
+/* --- Joystick link supervision (bugs 0-A/0-D) --- */
+#define JOYSTICK_TIMEOUT_MS        5000  /**< Raised to 5 s: ESP32 only sends on button-press, not continuously */
+#define JOYSTICK_DISCONNECT_STREAK 30    /**< Raised from 15 — BT button events cause transient non-C packets */
 
 #define ENCODER_FAULT_PWM_THRESHOLD 50.0f   /**< PWM threshold for hardware check */
 #define ENCODER_INVERSION_RPM_LIMIT 5.0f    /**< RPM threshold for inversion check */
@@ -98,6 +109,7 @@
  * CURRENT SENSING — WCS1800 on PA0 (via 1kΩ/1.8kΩ voltage divider to 3.3V ADC)
  * ============================================================================ */
 #define OVERCURRENT_LIMIT_AMPS   15.0f  /**< Trip threshold — tune to motor nameplate rating */
+#define OVERCURRENT_TIME_MS      50     /**< Current must stay over limit this long to latch e-stop (bug 0-E) */
 
 /* ============================================================================
  * ZVD INPUT SHAPER

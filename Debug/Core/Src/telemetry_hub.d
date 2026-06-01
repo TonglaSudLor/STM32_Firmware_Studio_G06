@@ -33,7 +33,8 @@ Core/Src/telemetry_hub.o: ../Core/Src/telemetry_hub.c \
  ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_tim_ex.h \
  ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_uart.h \
  ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_uart_ex.h \
- ../Core/Inc/motor_controller.h ../Core/Inc/hw_io.h ../Core/Inc/kalman.h
+ ../Core/Inc/motor_controller.h ../Core/Inc/hw_io.h ../Core/Inc/kalman.h \
+ ../Core/Inc/modbus_bridge.h
 ../Core/Inc/telemetry_hub.h:
 ../Core/Inc/main.h:
 ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal.h:
@@ -72,3 +73,4 @@ Core/Src/telemetry_hub.o: ../Core/Src/telemetry_hub.c \
 ../Core/Inc/motor_controller.h:
 ../Core/Inc/hw_io.h:
 ../Core/Inc/kalman.h:
+../Core/Inc/modbus_bridge.h:

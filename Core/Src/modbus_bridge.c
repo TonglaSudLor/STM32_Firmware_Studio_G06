@@ -69,8 +69,46 @@ extern TIM_HandleTypeDef htim16;
 extern TIM_HandleTypeDef htim3;
 
 /* --- Modbus Configuration --- */
-#define MODBUS_SLAVE_ID     21
+#define MODBUS_SLAVE_ID     21       /* ตรงกับ Base System config */
 #define MODBUS_REG_COUNT    128
+
+/*
+ * REGISTER MAP  (FC03=Read, FC06=Write, slave ID=21, 19200 8E1)
+ * ─────────────────────────────────────────────────────────────
+ * WRITE (Base System → Robot):
+ *   0x00  RW  Heartbeat       Robot init: 22881 (YA). Base replies: 18537 (HI). Timeout 3s.
+ *   0x01  W   Command bits    bit0=Home  bit1=Jog  bit2=Auto  bit3=SetHome  bit4=Test
+ *   0x02  W   Manual gripper  0=Up  1=Down  2=Open  4=Close  (edge-triggered)
+ *   0x03  W   Gripper seq     1=Pick  2=Place  (auto-clears after use)
+ *   0x04  W   Config bits     bit0=grip_enable (used when P&P starts)
+ *   0x05  W   Jog step        int16, degrees — ⚠ sign INVERTED vs firmware convention
+ *   0x12  W   PnP pair[0] pick  int16 × 10, deg — ⚠ sign INVERTED
+ *   0x13  W   PnP pair[0] place int16 × 10, deg — ⚠ sign INVERTED
+ *   ...        (pairs 1-4 follow at 0x14/0x15 … 0x1A/0x1B)
+ *   0x22  W   P&P trigger     Write pair count (1–5) to start. Auto-clears.
+ *   0x24  W   Point-to-point  int16, deg — ⚠ sign INVERTED vs firmware convention
+ *   0x25  W   Safety          bit0=E-Stop ON  bit1=E-Stop OFF
+ *
+ * READ (Robot → Base System):
+ *   0x26  R   Reed sensors    bit0=reed_up  bit1=reed_down  bit2=reed_close  bit3=reed_open
+ *   0x27  R   Task state      bit0=Homing  bit1=GoPick  bit2=GoPlace  bit3=GoPoint
+ *   0x28  R   Position        int16, deg × 10 — ⚠ sign INVERTED vs firmware
+ *   0x29  R   Speed           int16, RPM × 10 — ⚠ sign INVERTED vs firmware
+ *   0x30  R   Acceleration    int16, RPM/s × 10 — ⚠ sign INVERTED vs firmware
+ *   0x31  R   E-Stop state    0=running  1=stopped
+ *
+ * SIGN CONVENTION NOTE:
+ *   Base System and firmware use opposite rotation directions.
+ *   Every position/speed/accel register is sign-inverted on both read and write.
+ *   Do not remove these inversions without coordinating with Base System team.
+ *
+ * DIAGNOSTICS (not in register map, visible in STM32 Live Expressions):
+ *   modbus_crc_errors    — frames dropped: bad CRC (field noise indicator)
+ *   modbus_frame_errors  — frames dropped: too short
+ *   modbus_rx_overruns   — RX buffer overflows
+ *   modbus_uart_errors   — UART hardware error callbacks
+ * ─────────────────────────────────────────────────────────────
+ */
 
 /* --- Global Modbus Handle --- */
 static Modbus_Handle_t hmodbus;
@@ -180,6 +218,15 @@ static void ModbusBridge_HandleCommands(void)
 {
     if (!modbus_initialized) return;
 
+    /* Only execute motor-movement commands when the Base System owns the arm.
+     * In JOYSTICK mode LPUART1 is in dashboard mode (115200 8N1) so no valid
+     * Modbus frames arrive — but stale register bits (e.g. bit 0 "Home" written
+     * during a brief mode-switch) would still fire Motor_MoveToPosition(0)
+     * every main-loop iteration until cleared, causing an unexpected snap-to-0
+     * while the user controls the arm from the dashboard. */
+    extern volatile Control_SystemMode_t control_system_mode;
+    const bool base_active = (control_system_mode == CONTROL_MODE_BASE_SYSTEM);
+
     /* 0x00: Heartbeat — Base System writes HI (18537) back when alive */
     if (register_frame[0x00].U16 == HB_HI) {
         last_hb_ack_tick = HAL_GetTick();
@@ -191,20 +238,30 @@ static void ModbusBridge_HandleCommands(void)
         base_system_alive = false;
     }
 
+    /* All motor-movement and gripper commands below only execute in BASE_SYSTEM
+     * mode. In JOYSTICK mode the bits are cleared silently so stale register
+     * state cannot interfere with dashboard or joystick control. */
+
     // 0x01: Operating Mode Bits
     if (register_frame[0x01].U16 & 0x01) { // Home (Move to 0)
-        Motor_MoveToPosition(0.0f);
+        if (base_active) Motor_MoveToPosition(0.0f);
         register_frame[0x01].U16 &= ~0x01;
     }
-    
+
     /* 0x01 bit 1 = Manual/Jog mode (per spec - just acknowledge, no action) */
     if (register_frame[0x01].U16 & 0x02) {
         register_frame[0x01].U16 &= ~0x02;
     }
 
+    /* 0x01 bit 5 = Fine Home (Sensor-based search) */
+    if (register_frame[0x01].U16 & 0x20) {
+        if (base_active) trigger_homing_sequence = true;
+        register_frame[0x01].U16 &= ~0x20;
+    }
+
     /* 0x02: Manual Gripper — react to value changes (per spec). Up=0, Down=1, Open=2, Close=4.
      * Edge-triggered so we don't spam printf every cycle. */
-    {
+    if (base_active) {
         static uint16_t last_grip_v = 0xFFFF; /* impossible value at boot */
         uint16_t v = register_frame[0x02].U16;
         if (v != last_grip_v) {
@@ -222,7 +279,7 @@ static void ModbusBridge_HandleCommands(void)
 
     /* P&P trigger: per spec, Base System writes slots first, then writes 0x22 (pair count).
      * Detect non-zero 0x22 while P&P is idle and start the sequence. */
-    if (pnp_state == PNP_IDLE && register_frame[0x22].U16 > 0) {
+    if (base_active && pnp_state == PNP_IDLE && register_frame[0x22].U16 > 0) {
         uint16_t pairs = register_frame[0x22].U16;
         if (pairs > 5) pairs = 5;
         pnp_total_pairs  = pairs;
@@ -235,45 +292,60 @@ static void ModbusBridge_HandleCommands(void)
         register_frame[0x22].U16 = 0; /* consume trigger so it doesn't re-fire */
     }
     if (register_frame[0x01].U16 & 0x08) { // Set Home (Reset Encoder)
-        __HAL_TIM_SET_COUNTER(&htim3, 0);
-        encoder.absolute_counts = 0;
-        encoder.current_position_deg = 0.0f;
-        trajectory.target_pos = 0.0f;
-        trajectory.current_setpoint_pos = 0.0f;
+        if (base_active) {
+            __HAL_TIM_SET_COUNTER(&htim3, 0);
+            encoder.absolute_counts = 0;
+            encoder.current_position_deg = 0.0f;
+            trajectory.target_pos = 0.0f;
+            trajectory.current_setpoint_pos = 0.0f;
+        }
         register_frame[0x01].U16 &= ~0x08;
     }
     if (register_frame[0x01].U16 & 0x10) { // Test mode
-        current_mode = MOTOR_MODE_TEST;
+        if (base_active) current_mode = MOTOR_MODE_TEST;
         register_frame[0x01].U16 &= ~0x10;
     }
 
     // 0x03: Gripper Sequence
     if (register_frame[0x03].U16 != 0) {
-        uint16_t val = register_frame[0x03].U16;
-        if (val == 1) Gripper_Sequence_Pick();
-        else if (val == 2) Gripper_Sequence_Place();
+        if (base_active) {
+            uint16_t val = register_frame[0x03].U16;
+            if (val == 1) Gripper_Sequence_Pick();
+            else if (val == 2) Gripper_Sequence_Place();
+        }
         register_frame[0x03].U16 = 0;
     }
 
     /* 0x05: Jog step (Base System: +=CCW, -=CW → invert to match firmware convention) */
     if (register_frame[0x05].U16 != 0) {
-        float step = -(float)((int16_t)register_frame[0x05].U16);
-        Motor_MoveToPosition(encoder.current_position_deg + step);
+        if (base_active) {
+            float step = -(float)((int16_t)register_frame[0x05].U16);
+            Motor_MoveToPosition(encoder.current_position_deg + step);
+        }
         register_frame[0x05].U16 = 0;
     }
 
     /* 0x24: Point-to-Point Target (sign inverted to match firmware direction) */
     if (register_frame[0x24].U16 != 0) {
-        Motor_MoveToPosition(-(float)((int16_t)register_frame[0x24].U16));
+        if (base_active) Motor_MoveToPosition(-(float)((int16_t)register_frame[0x24].U16));
         register_frame[0x24].U16 = 0;
     }
 
     // 0x25: Safety / Soft Stop
     if (register_frame[0x25].U16 & 0x01) {
+        if (!emergency_stop) {
+            printf("[SAFETY] E-Stop LATCHED via Modbus (0x25)\r\n");
+        }
         emergency_stop = true;
-        fault_code |= FAULT_ESTOP_MODBUS;
+        FAULT_SET(FAULT_ESTOP_MODBUS);   /* guarded RMW (bug 1-B) */
         register_frame[0x25].U16 &= ~0x01;
     } else if (register_frame[0x25].U16 & 0x02) {
+        /* Full release: clear all latched fault sources including startup latch
+         * so the PLC can release the system without requiring a DIAG run. */
+        extern volatile bool startup_estop_pending;
+        FAULT_CLR(FAULT_ESTOP_PHYSICAL | FAULT_ESTOP_MODBUS | FAULT_ESTOP_DASHBOARD |
+                  FAULT_ESTOP_JOYSTICK | FAULT_STARTUP_ESTOP | FAULT_JOYSTICK_LOST);
+        startup_estop_pending = false;
         emergency_stop = false;
         register_frame[0x25].U16 &= ~0x02;
     }
@@ -285,6 +357,16 @@ static void ModbusBridge_HandleCommands(void)
 
 void ModbusBridge_Init(void)
 {
+    /* CubeMX generates TIM16 with Period=49 (5 ms at 10 kHz timer clock).
+     * Modbus RTU spec for baud > 19200: T3.5 = 1.75 ms (fixed).
+     * At 230400 baud the true T3.5 is only 166 µs; the 5 ms window is so long
+     * that adjacent frames from the base system (separated by the standard
+     * 166 µs inter-frame gap) get merged into one corrupt frame → CRC fail
+     * → no response → "abnormal heartbeat".  2 ms is safely above the 1.75 ms
+     * spec minimum while being short enough to distinguish consecutive frames. */
+    htim16.Init.Period = 19;    /* 10 kHz clock → (19+1) ticks = 2 ms */
+    HAL_TIM_Base_Init(&htim16);
+
     memset(register_frame, 0, sizeof(register_frame));
     
     // 0x00: Device ID / Heartbeat ("YA")
@@ -360,6 +442,12 @@ void ModbusBridge_UpdateRegisters(void)
     register_frame[0x31].U16 = emergency_stop ? 1 : 0;
 }
 
+void ModbusBridge_UartErrorRecovery(void)
+{
+    if (!modbus_initialized) return;
+    Modbus_UartErrorRecovery(&hmodbus);
+}
+
 void ModbusBridge_RxCallback(uint8_t data)
 {
     // Log for debugging
@@ -381,4 +469,14 @@ void ModbusBridge_TimerCallback(void)
 {
     hmodbus.flag_t35_timeout = 1;
     HAL_TIM_Base_Stop_IT(hmodbus.htim);
+}
+
+bool ModbusBridge_IsBaseAlive(void)
+{
+    return base_system_alive;
+}
+
+int ModbusBridge_GetPnPState(void)
+{
+    return (int)pnp_state;
 }

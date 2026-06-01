@@ -10,8 +10,10 @@
 #include "hw_io.h"
 #include "params.h"
 #include "kalman.h"
+#include "telemetry_hub.h"
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 /* ============================================================================
  * Private System Variables
@@ -21,16 +23,30 @@ extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim6;
 extern TIM_HandleTypeDef htim1;
 extern UART_HandleTypeDef huart3;
+extern UART_HandleTypeDef hlpuart1;
 
 volatile Motor_ControlMode_t current_mode = MOTOR_MODE_STOPPED;
-volatile Control_SystemMode_t control_system_mode = CONTROL_MODE_BASE_SYSTEM;
+volatile Control_SystemMode_t control_system_mode = CONTROL_MODE_JOYSTICK;
 volatile Motor_JogMode_t jog_mode = JOG_COARSE;
 volatile Motor_AutotuneTrigger_t autotune_trigger = ATUNE_IDLE;
 volatile Motor_AutotuneStatus_t autotune_status = STATUS_IDLE;
 volatile int tuning_progress = 0;
 volatile Motor_TuningParams_t tuning;
-volatile bool is_joystick_connected = false;
+Auto_Config_t auto_config = {
+    .use_sensors = true,
+    .target_count = 0,
+    .current_index = 0,
+    .delay_ms = 2000
+};
+
+/* Link state: assume connected until proven otherwise (watchdog only arms 
+ * after first joystick packet seen). */
+volatile bool is_joystick_connected = true;
+static bool usart3_joystick_seen = false;
+
 volatile bool emergency_stop = true;
+volatile bool startup_estop_pending = true;
+static SafetyConfig_t diag_saved_safety;   /* saved before DIAG, restored after */  /**< Cleared only when self-test passes */
 /* Set to true when the physical (hardware) E-Stop fires — the motor relay
  * opens, which cuts power to the encoder too, so the TIM3 quadrature count
  * cannot be trusted across the outage. On recovery, the firmware ignores the
@@ -52,7 +68,13 @@ volatile SafetyConfig_t safety_config = {
     .stall_prevent = true,
     .encoder_check = true,
     .over_rotation_check = true,
-    .joystick_check = true
+    .joystick_check = true,
+    .physical_estop_check = true,
+    .soft_limit_deg  = SOFT_LIMIT_DEG,
+    .stall_pwm_pct   = STALL_PWM_THRESHOLD,
+    .stall_vel_rpm   = STALL_VELOCITY_THRESHOLD,
+    .stall_time_ms   = STALL_TIME_MS,
+    .stall_error_deg = STALL_SETTLING_ERROR_DEG
 };
 volatile Motor_FaultCode_t fault_code = FAULT_NONE;
 volatile float target_position_deg = 0.0f;
@@ -62,6 +84,38 @@ volatile bool ghost_move_active = false;
 volatile uint32_t ghost_settle_start_tick = 0;
 volatile float original_home_offset_deg = 0.0f;
 volatile bool trigger_homing_sequence = false;
+/* Deferred gripper sequence request (bug 1-F): the joystick command arrives in
+ * the USART3 RX ISR; the blocking Pick/Place sequence must NOT run there (it
+ * busy-waits on reed switches for up to ~12 s, freezing the control loop). The
+ * ISR only sets this flag; the main loop runs the sequence at thread level.
+ * 0=none, 1=pick, 2=place. */
+volatile uint8_t gripper_seq_request = 0;
+
+/* Deferred control-loop logging (bug 1-G). printf blocks for milliseconds and
+ * must not run inside the 100 Hz TIM6 ISR. The ISR sets an event bit (and
+ * latches any value the message needs); the main loop calls
+ * Motor_DrainControlLog() to emit the strings at thread level. Only the TIM6
+ * ISR sets bits (single producer → plain |= is safe); the main loop snapshots
+ * and clears under a PRIMASK guard so a concurrent ISR set is never lost. */
+#define CLOG_ESTOP_PHYS_REHOME   0x0001u
+#define CLOG_ESTOP_CLEARED_HOLD  0x0002u
+#define CLOG_RELAY_SETTLED       0x0004u
+#define CLOG_TEST_START          0x0008u
+#define CLOG_TEST_FINISH         0x0010u
+#define CLOG_HOME_TEMP_SET       0x0020u
+#define CLOG_HOME_MOVE_TEMP      0x0040u
+#define CLOG_HOME_MOVE_ORIG      0x0080u
+#define CLOG_ENCODER_INVERTED    0x0100u
+#define CLOG_ENCODER_NOSIGNAL    0x0200u
+#define CLOG_MOTOR_STALLED       0x0400u
+#define CLOG_SOFT_LIMIT          0x0800u
+
+static volatile uint32_t clog_events         = 0;
+static volatile float    clog_hold_pos       = 0.0f;  /* CLOG_ESTOP_CLEARED_HOLD */
+static volatile float    clog_temp_home_orig = 0.0f;  /* CLOG_HOME_TEMP_SET */
+static volatile float    clog_move_orig_pos  = 0.0f;  /* CLOG_HOME_MOVE_ORIG */
+static volatile float    clog_move_speed     = 0.0f;  /* CLOG_HOME_MOVE_* RPM */
+
 Ghost_Buffer_t ghost_buffer[GHOST_BUFFER_MAX];
 volatile uint32_t ghost_buffer_idx = 0;
 volatile bool ghost_dump_requested = false;
@@ -78,6 +132,7 @@ static float last_rpm_for_accel = 0.0f;
 static uint32_t a_press_tick = 0;    
 static uint32_t stall_timer = 0;
 static uint32_t encoder_fault_timer = 0;
+static uint32_t over_rot_esc_tick = 0;  /* over-rotation escalation timer */
 static uint32_t homing_settle_tick    = 0;    /* relay-settle delay start tick */
 static bool     homing_settle_pending = false; /* waiting to arm re-home after E-stop clear */
 static uint32_t joystick_watchdog_timer = 0;
@@ -113,7 +168,8 @@ Trajectory_State_t trajectory;
  * Private Function Prototypes
  * ============================================================================ */
 static float PID_Compute(PID_Controller_t *pid, float setpoint, float feedback);
-static void PWM_Apply(float duty_cycle);
+static float PWM_Apply(float duty_cycle);
+static float Motor_DriveWithAntiWindup(float pid_out, float ff);
 static void Encoder_Update(void);
 static void Trajectory_Generator_Update(void);
 void Motor_SendAudioCommand(char sound_code);
@@ -160,28 +216,72 @@ static float PID_Compute(PID_Controller_t *pid, float setpoint, float feedback)
 }
 
 /**
- * @brief Apply PWM duty cycle to motor
+ * @brief Apply PWM duty cycle to motor.
+ * @return The final signed duty (%) actually applied to TIM1 AFTER min_pwm
+ *         friction offset and hardware saturation. This is the true actuator
+ *         output; callers route it back to the Kalman observer (current_pwm)
+ *         and to anti-windup so the controller and observer never desync from
+ *         the physical PWM. (Fix 2-E)
  */
-static void PWM_Apply(float duty_cycle)
+static float PWM_Apply(float duty_cycle)
 {
     float min_p = tuning.min_pwm;
-    
-    if (fabsf(duty_cycle) < 0.1f) { 
-        duty_cycle = 0.0f; 
+
+    if (fabsf(duty_cycle) < 0.1f) {
+        duty_cycle = 0.0f;
     } else {
         if (duty_cycle > 0) duty_cycle += min_p;
         else duty_cycle -= min_p;
     }
-    
+
     if (duty_cycle > pid_speed.output_max) duty_cycle = pid_speed.output_max;
     else if (duty_cycle < pid_speed.output_min) duty_cycle = pid_speed.output_min;
 
-    bool forward = (duty_cycle >= 0); 
+    bool forward = (duty_cycle >= 0);
     uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim1);
     uint32_t pwm_value = (uint32_t)((arr * fabsf(duty_cycle)) / 100.0f);
-    
+
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_value);
     HAL_GPIO_WritePin(Motor_Direction_GPIO_Port, Motor_Direction_Pin, forward ? GPIO_PIN_RESET : GPIO_PIN_SET);
+
+    /* Publish the true applied voltage-equivalent to the Kalman observer.
+     * Every drive path that goes through PWM_Apply now keeps the observer's
+     * input u in sync with the physical PWM, including saturated commands. */
+    current_pwm = duty_cycle;
+    return duty_cycle;
+}
+
+/**
+ * @brief Drive the inner speed loop with feedforward and back-calculation
+ *        anti-windup. (Fixes 2-A)
+ *
+ * The speed PID clamps only its OWN output, so it is blind to the extra
+ * headroom consumed by the feedforward term: pid_out may be in-range while
+ * (pid_out + ff) saturates the actuator. Left uncorrected, the integrator
+ * winds up against a limit it cannot observe.
+ *
+ * Here we form the linear command u_cmd = pid_out + ff, compute the value the
+ * actuator can actually realise within its LINEAR limits (output_min/max, i.e.
+ * excluding the min_pwm friction offset, which is a feedforward not a windup
+ * source), and bleed the integrator by the un-realisable excess scaled by
+ * 1/Ki — the standard tracking back-calculation law. Returns the true applied
+ * PWM from PWM_Apply (which also clamps + adds friction offset).
+ */
+static float Motor_DriveWithAntiWindup(float pid_out, float ff)
+{
+    float u_cmd = pid_out + ff;
+
+    float u_sat = u_cmd;
+    if (u_sat > pid_speed.output_max)      u_sat = pid_speed.output_max;
+    else if (u_sat < pid_speed.output_min) u_sat = pid_speed.output_min;
+
+    if (pid_speed.Ki > 0.0f) {
+        pid_speed.integral -= (u_cmd - u_sat) / pid_speed.Ki;
+        if (pid_speed.integral > pid_speed.integral_max)        pid_speed.integral = pid_speed.integral_max;
+        else if (pid_speed.integral < -pid_speed.integral_max)  pid_speed.integral = -pid_speed.integral_max;
+    }
+
+    return PWM_Apply(u_cmd);
 }
 
 /**
@@ -201,10 +301,11 @@ static void Encoder_Update(void)
     if (delta > 2000 || delta < -2000) {
         delta = 0;
     }
-    
-    // Invert encoder direction to match motor phase
+
+#if ENCODER_PHASE_INVERTED
     delta = -delta;
-    
+#endif
+
     encoder.count_prev = current_count;
     encoder.absolute_counts += delta;
     
@@ -267,9 +368,12 @@ static SCurvePlan_t s_plan = {0};
 #define SHAPER_BUF_SIZE  100   /* 100 ticks @ 100 Hz = 1 s max total delay */
 
 static float    shaper_buf[SHAPER_BUF_SIZE];
+static float    shaper_buf_v[SHAPER_BUF_SIZE];  /* velocity FF, same delay line (Fix 2-B) */
+static float    shaper_buf_a[SHAPER_BUF_SIZE];  /* accel FF,    same delay line (Fix 2-B) */
 static uint32_t shaper_buf_idx = 0;
 static float    shaper_A1 = 1.0f, shaper_A2 = 0.0f, shaper_A3 = 0.0f;
 static uint32_t shaper_N  = 0;
+static float    shaper_last_output = 0.0f;   /* last shaped setpoint, for stall check (bug 0-I) */
 
 static void ZVD_UpdateCoefficients(void)
 {
@@ -297,12 +401,21 @@ static void ZVD_UpdateCoefficients(void)
 
 static void ZVD_FlushBuffer(float val)
 {
-    for (int i = 0; i < SHAPER_BUF_SIZE; i++) shaper_buf[i] = val;
+    for (int i = 0; i < SHAPER_BUF_SIZE; i++) {
+        shaper_buf[i]   = val;
+        shaper_buf_v[i] = 0.0f;   /* velocity/accel delay lines start at rest */
+        shaper_buf_a[i] = 0.0f;
+    }
 }
 
 void Motor_ShaperRecompute(void)
 {
     ZVD_UpdateCoefficients();
+}
+
+uint32_t Motor_GetShaperDelay(void)
+{
+    return shaper_N;
 }
 
 /* Conversion helpers — firmware is in RPM/RPM/s/RPM/s², planner is in
@@ -545,10 +658,11 @@ static HomingState_t h_state = H_IDLE;
 static float h_edge_a = 0, h_edge_b = 0, h_edge_a_verify = 0, h_edge_b_verify = 0;
 static float h_verify_reverse_start = 0;     /**< encoder pos at the moment we reverse, used as travel reference */
 static float h_verify_a_start = 0;           /**< encoder pos when the edge-A verify phase begins */
-static float h_wiggle_amp = 20.0f;
-static float h_start_pos = 0;
-static int h_direction = 1;
-static bool h_verify_overshot = false;
+static float    h_wiggle_amp      = 20.0f;
+static float    h_start_pos       = 0;
+static int      h_direction       = 1;
+static bool     h_verify_overshot = false;
+static uint32_t h_wiggle_start_ms = 0u;  /**< tick when H_WIGGLE_SEARCH began; reset in H_INIT */
 
 /**
  * @brief Standalone Homing Sequence Function
@@ -558,6 +672,9 @@ bool Motor_RunHomingSequence(void)
 {
     // If emergency stop is active, reset homing
     if (emergency_stop) {
+        if (h_state != H_IDLE) {
+            printf("[HOMING] ABORTED: Emergency Stop is active.\r\n");
+        }
         h_state = H_IDLE;
         return true;
     }
@@ -573,9 +690,11 @@ bool Motor_RunHomingSequence(void)
             return false;
 
         case H_INIT:
-            h_start_pos = encoder.current_position_deg;
-            h_wiggle_amp = 20.0f;
-            h_direction = 1;
+            h_start_pos       = encoder.current_position_deg;
+            h_wiggle_amp      = 20.0f;
+            h_direction       = 1;
+            h_wiggle_start_ms = 0u;   /* always reset so stale ticks from a prior
+                                       * interrupted run cannot poison t_s */
             current_mode = MOTOR_MODE_HOMING;
             // Set slow motion profile for homing
             Motor_SetMotionProfile(HOMING_SEARCH_RPM, 50.0f, 0.1f);
@@ -584,45 +703,102 @@ bool Motor_RunHomingSequence(void)
             return false;
 
         case H_WIGGLE_SEARCH:
-            // Set smooth PID target
-            trajectory.target_pos = h_start_pos + (float)h_direction * h_wiggle_amp;
+        {
+            if (h_wiggle_start_ms == 0u) h_wiggle_start_ms = HAL_GetTick();
 
-            // Check sensor (PB9) - 0 means detected
-            if (!hw.raw_prox_bit) { 
-                h_state = H_FIND_EDGE_A;
-                printf("[HOMING] Target Found! Locating Edge A...\r\n");
+            /* Time in SECONDS. HAL_GetTick() returns milliseconds — dividing
+             * by 1000 is mandatory. Passing raw ms into sinf() multiplies the
+             * effective frequency by 1000, collapsing the 0.2 Hz sweep into a
+             * 200 Hz vibration the motor cannot follow. */
+            float t_s = (float)(HAL_GetTick() - h_wiggle_start_ms) * 0.001f;
+
+            /* Amplitude grows continuously at a fixed rate instead of jumping
+             * by 20 deg on each reversal. The old approach created a step
+             * of 2*old_amp+20 deg at every flip (60 deg, 100 deg, 140 deg …),
+             * growing progressively more violent with each cycle. */
+            const float HOMING_AMP_RATE = 8.0f;          /* deg/s → 180 deg in ~22.5 s */
+            h_wiggle_amp = HOMING_AMP_RATE * t_s;
+            if (h_wiggle_amp < 1.0f) h_wiggle_amp = 1.0f;  /* non-trivial plan at t=0 */
+
+            if (h_wiggle_amp >= HOMING_MAX_WIGGLE) {
+                h_wiggle_start_ms = 0u;
+                h_wiggle_amp      = 20.0f;
+                h_state = H_ERROR;
+                printf("[HOMING] ERROR: Target not found within limits.\r\n");
+                Motor_SendAudioCommand('E');
                 return false;
             }
 
-            // If we reached the wiggle target without finding anything, flip and expand
-            float error = trajectory.target_pos - encoder.current_position_deg;
-            if (fabsf(error) < 1.0f) {
-                h_direction *= -1;
-                h_wiggle_amp += 20.0f;
-                if (h_wiggle_amp > HOMING_MAX_WIGGLE) {
-                    h_state = H_ERROR;
-                    printf("[HOMING] ERROR: Target not found within limits.\r\n");
-                    Motor_SendAudioCommand('E');
-                }
+            /* Sine wave setpoint — f = 0.2 Hz (5 s / full sweep).
+             * Each 10 ms tick the target advances by at most A·ω·dt ≈ 0.6 deg,
+             * which the S-curve tracks without any step discontinuity in
+             * velocity or acceleration. The velocity limiter (HOMING_SEARCH_RPM)
+             * caps the motor naturally when amplitude is large. */
+            const float SWEEP_OMEGA = 2.0f * 3.14159265f * 0.2f;  /* 1.2566 rad/s */
+            float sine_pos = h_start_pos + h_wiggle_amp * sinf(SWEEP_OMEGA * t_s);
+
+            /* Hard-clip to machine envelope */
+            if (sine_pos >  SOFT_LIMIT_DEG) sine_pos =  SOFT_LIMIT_DEG;
+            if (sine_pos < -SOFT_LIMIT_DEG) sine_pos = -SOFT_LIMIT_DEG;
+
+            /* BYPASS S-Curve: Inject directly into PID reference. The sine
+             * wave is already mathematically smooth; the S-curve generator 
+             * constantly resetting its internal state every tick was 
+             * causing violent jerking. */
+            trajectory.target_pos           = sine_pos;
+            trajectory.current_setpoint_pos = sine_pos;
+
+            /* Capture instantaneous velocity FF and direction of travel.
+             * A(t)*sin(wt) derivative is A'(t)sin(wt) + A(t)w*cos(wt).
+             * A'(t) = HOMING_AMP_RATE = 8.0. */
+            float sine_vel_dps = HOMING_AMP_RATE * sinf(SWEEP_OMEGA * t_s) 
+                               + h_wiggle_amp * SWEEP_OMEGA * cosf(SWEEP_OMEGA * t_s);
+            
+            trajectory.current_setpoint_vel   = sine_vel_dps * DPS_TO_RPM;
+            trajectory.current_setpoint_accel = 0.0f;
+            
+            /* Sensor active-low: raw_prox_bit == 0 means object detected */
+            if (!hw.raw_prox_bit) {
+                /* CAPTURE ACTUAL PHYSICAL DIRECTION to prevent phase-lag reversal.
+                 * Because of PID tracking delay, the mathematical derivative can be 
+                 * opposite to the physical motor direction at the trigger point. */
+                h_direction = (encoder.filtered_rpm >= 0.0f) ? 1 : -1;
+
+                h_wiggle_start_ms = 0u;
+                h_wiggle_amp      = 20.0f;
+                
+                /* WIPE PID MEMORY & SHAPER to prevent 100% PWM windup explosion.
+                 * Bypassing the S-curve during Wiggle built up tracking error;
+                 * we must clear it before enabling the profiler for the creep. */
+                pid_position.integral = 0.0f;
+                pid_position.error_prev = encoder.current_position_deg;
+                pid_speed.integral = 0.0f;
+                pid_speed.error_prev = encoder.filtered_rpm;
+                trajectory.current_setpoint_pos = encoder.current_position_deg;
+                trajectory.current_setpoint_vel = 0.0f;
+                trajectory.current_setpoint_accel = 0.0f;
+                ZVD_FlushBuffer(encoder.current_position_deg);
+
+                /* Setup smooth creep trajectory ONCE */
+                Motor_SetMotionProfile(HOMING_CREEP_RPM, 20.0f, 0.1f);
+                trajectory.target_pos = encoder.current_position_deg + ((float)h_direction * 360.0f);
+                
+                h_state = H_FIND_EDGE_A;
+                printf("[HOMING] Target Found! Locating Edge A...\r\n");
             }
             return false;
+        }
 
         case H_FIND_EDGE_A:
-            // Creep slowly (3 RPM) until sensor triggers
-            Motor_SetMotionProfile(HOMING_CREEP_RPM, 20.0f, 0.1f);
-            trajectory.target_pos += (float)h_direction * 0.5f; // Constant slow move
-
-            if (!hw.raw_prox_bit) {
-                h_edge_a = encoder.current_position_deg;
-                h_state = H_FIND_EDGE_B;
-                printf("[HOMING] Edge A: %.2f. Finding Edge B...\r\n", h_edge_a);
-            }
+            /* Since Wiggle stopped the moment it detected the sensor, we are ALREADY
+             * on Edge A. Record it immediately and proceed to find where it releases (Edge B). */
+            h_edge_a = encoder.current_position_deg;
+            h_state = H_FIND_EDGE_B;
+            printf("[HOMING] Edge A: %.2f. Finding Edge B...\r\n", h_edge_a);
             return false;
 
         case H_FIND_EDGE_B:
-            // Continue moving until sensor releases
-            trajectory.target_pos += (float)h_direction * 0.5f;
-
+            /* Target is set far away. Wait for sensor RELEASE to find the other edge. */
             if (hw.raw_prox_bit) {
                 h_edge_b = encoder.current_position_deg;
                 h_verify_overshot = false;
@@ -632,22 +808,19 @@ bool Motor_RunHomingSequence(void)
             return false;
 
         case H_VERIFY_EDGE_B:
-            /* Step 1: overshoot a small amount past edge B in the original
-             * direction so we're cleanly outside the sensor's detection zone.
-             * Step 2: reverse and creep back. The sensor should trigger again
-             * at the same physical edge but from the other side; averaging
-             * the two readings cancels the hysteresis offset.
-             * Safety: if the reverse creep travels too far without seeing
-             * the sensor (sensor too narrow, mechanical slip, etc.), abort
-             * the verify and fall back to the original edge_b reading rather
-             * than spin a full revolution looking for it. */
             if (!h_verify_overshot) {
-                trajectory.target_pos += (float)h_direction * 0.5f;
+                /* Continue moving in original direction for overshoot. 
+                 * Target is already far away in this direction. */
                 float traveled = (encoder.current_position_deg - h_edge_b) * (float)h_direction;
                 if (traveled >= HOMING_VERIFY_OVERSHOOT_DEG) {
                     h_verify_overshot = true;
                     h_direction = -h_direction;   /* reverse */
                     h_verify_reverse_start = encoder.current_position_deg;
+                    
+                    /* Sync S-Curve start to current position to prevent jerking */
+                    trajectory.current_setpoint_pos = encoder.current_position_deg;
+                    trajectory.target_pos = encoder.current_position_deg + ((float)h_direction * 360.0f);
+                    
                     printf("[HOMING] Overshot %.2f deg, reversing to verify Edge B\r\n",
                            HOMING_VERIFY_OVERSHOOT_DEG);
                 }
@@ -655,23 +828,19 @@ bool Motor_RunHomingSequence(void)
             }
 
             /* Reversed creep — watch for the sensor to trigger again */
-            trajectory.target_pos += (float)h_direction * 0.5f;
             if (!hw.raw_prox_bit) {
                 h_edge_b_verify = encoder.current_position_deg;
                 printf("[HOMING] Edge B (verify): %.2f.  Avg: %.2f\r\n",
                        h_edge_b_verify, 0.5f * (h_edge_b + h_edge_b_verify));
                 h_edge_b = 0.5f * (h_edge_b + h_edge_b_verify);
                 /* We're now inside the sensor zone heading back toward edge A.
-                 * Continue and watch for the sensor to RELEASE — that's edge A
-                 * from the opposite side, which lets us average out its
-                 * hysteresis the same way we just did for edge B. */
+                 * Continue and watch for the sensor to RELEASE. */
                 h_verify_a_start = encoder.current_position_deg;
                 h_state = H_VERIFY_EDGE_A;
                 return false;
             }
 
-            /* Safety net: never let verify travel more than the cap. If we
-             * exhaust it, skip the verify and use the original edges. */
+            /* Safety net: never let verify travel more than the cap. */
             float back_traveled = (h_verify_reverse_start - encoder.current_position_deg)
                                   * (float)(-h_direction);
             if (back_traveled >= HOMING_VERIFY_MAX_TRAVEL_DEG) {
@@ -682,10 +851,7 @@ bool Motor_RunHomingSequence(void)
             return false;
 
         case H_VERIFY_EDGE_A:
-            /* Same reversed direction as during H_VERIFY_EDGE_B. We're inside
-             * the sensor zone. Keep going; the sensor will release as we exit
-             * across edge A from the opposite side. */
-            trajectory.target_pos += (float)h_direction * 0.5f;
+            /* Same reversed direction. Target is already set far away. */
             if (hw.raw_prox_bit) {
                 h_edge_a_verify = encoder.current_position_deg;
                 printf("[HOMING] Edge A (verify): %.2f.  Avg: %.2f\r\n",
@@ -827,11 +993,16 @@ void Motor_Init(void)
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
     __HAL_TIM_MOE_ENABLE(&htim1);
     HAL_TIM_Base_Start_IT(&htim6);
+
+    /* Power-on safety latch: motor is blocked until self-test passes */
+    FAULT_SET(FAULT_STARTUP_ESTOP);
+    printf("[SAFETY] *** STARTUP E-STOP — Run Self-Test (DIAG) to release ***\r\n");
 }
 
 void Motor_MoveToPosition(float target_degrees)
 {
     if (emergency_stop) return;
+    if (position_unknown) return;  /* encoder zeroed before moving is mandatory */
     trajectory.target_pos = target_degrees;
     current_mode = MOTOR_MODE_POSITION;
     motion_config.max_velocity    = tuning.move_speed_coarse;
@@ -881,14 +1052,17 @@ void Motor_SetHomeHere(void)
     pid_position.error_prev = 0.0f;
     pid_position.d_filt   = 0.0f;
 
+    position_unknown = false;   /* encoder is now valid — dashboard PUNK→0 satisfies home gate */
     printf("[HOME] Home set here (was %.2f deg). Original home now at %.2f deg.\r\n",
            -original_home_offset_deg, original_home_offset_deg);
 }
 
 void Motor_SendAudioCommand(char sound_code)
 {
+    /* Enqueue for the main-loop TX drain — never block here. This is called
+     * from the 100 Hz control ISR and the USART3 RX ISR (bug 0-C). */
     uint8_t pkt[2] = {'@', (uint8_t)sound_code};
-    HAL_UART_Transmit(&huart3, pkt, 2, 10);
+    USART3_QueueTx(pkt, 2);
 }
 
 void Motor_SetVoltageLimit(float max_voltage, float supply_voltage)
@@ -912,20 +1086,17 @@ void Motor_SetMotionProfile(float max_rpm, float max_accel, float smoothing)
 void Motor_SetJogVelocity(float rpm)
 {
     if (emergency_stop) return;
+    if (position_unknown) return;  /* encoder zeroed before jogging is mandatory */
     trajectory.target_vel = rpm;
     current_mode = MOTOR_MODE_SPEED;
 }
 
 void Motor_UpdateSelectionButton(bool pressed)
 {
-    if (pressed) {
-        if (!y_button_active) {
-            y_button_hold_tick = HAL_GetTick();
-            y_button_active = true;
-        }
-    } else {
-        y_button_active = false;
-    }
+    /* Slide switch logic: every state change (EDGE) from the switch 
+     * triggers a system mode toggle between JOYSTICK and BASE_SYSTEM. 
+     * Handled with debouncing in hw_io.c. */
+    (void)pressed;
 }
 
 void Motor_UpdateModeButton(bool pressed)
@@ -948,7 +1119,13 @@ void Motor_UpdateControlModeButton(bool pressed)
             b_button_active = true;
         }
     } else {
-        b_button_active = false;
+        if (b_button_active) {
+            uint32_t duration = HAL_GetTick() - b_button_hold_tick;
+            if (duration >= 1000) {
+                Mode_Toggle();
+            }
+            b_button_active = false;
+        }
     }
 }
 
@@ -959,6 +1136,9 @@ void Motor_SetConnectionStatus(bool connected)
 
 void Motor_SendDataToMatlab(void)
 {
+    /* In BASE_SYSTEM mode LPUART1 carries Modbus RTU binary — never send text. */
+    if (control_system_mode == CONTROL_MODE_BASE_SYSTEM) return;
+
     float ghost_pos = (current_mode == MOTOR_MODE_GHOST) ? buffered_target_pos : trajectory.target_pos;
 
     if (ghost_move_active) {
@@ -1027,38 +1207,53 @@ void Motor_StartAutotuneSpeed(void)
 
 static bool last_joystick_status = false;
 static char last_safety_char = 'O';
+/* Gamepad-disconnect debounce counter. Module scope (was a Motor_ProcessPacket
+ * local static) so Motor_RefreshWatchdog can clear it on re-arm — otherwise a
+ * streak that built up while joystick_check was disabled (e.g. during DIAG)
+ * instantly re-fires FAULT_JOYSTICK_LOST the moment the check is restored. */
+static uint8_t disconnect_streak = 0;
 
 void Motor_ProcessPacket(char action, char safety, char status)
 {
     bool current_status = (status == 'C');
 
-    // 1. Connection Event Notification
-    if (current_status && !last_joystick_status) {
-        printf("\r\n[SYSTEM] >>> JOYSTICK CONNECTED <<<\r\n");
-    } 
-    else if (!current_status && last_joystick_status) {
-        printf("\r\n[SYSTEM] !!! JOYSTICK DISCONNECTED !!!\r\n");
-    }
-    last_joystick_status = current_status;
+    /* Any validated packet (printable 3 bytes) means the ESP32 link itself is
+     * alive — refresh the silence watchdog unconditionally. Motor_ControlLoop
+     * uses this timestamp to detect a *silent* link (cable pulled / ESP32 hung). */
+    joystick_watchdog_timer = HAL_GetTick();
+    usart3_joystick_seen = true;
 
-    // 2. Connection Status Logic
-    if (!current_status) {
-        is_joystick_connected = false;
-        /* Only raise the fault + latch e-stop if the Joystick safety check is
-         * enabled. When the user has unchecked "Joystick Check" in the
-         * dashboard Faults modal, a dropped joystick link must NOT halt the
-         * motor — useful for bench testing without the joystick connected. */
-        if (safety_config.joystick_check) {
-            fault_code |= FAULT_JOYSTICK_LOST;
-            emergency_stop = true;
-        } else {
-            fault_code &= ~FAULT_JOYSTICK_LOST;
+    /* Debounce the gamepad-side connection flag the ESP32 reports in the status
+     * byte (bug 0-A). A single non-'C' — a noise byte, a dropped-byte frame
+     * shift, or a momentary BT hiccup — must NOT latch the e-stop. Require
+     * JOYSTICK_DISCONNECT_STREAK consecutive non-'C' packets before declaring
+     * the gamepad lost. The JOYSTICK_TIMEOUT_MS silence watchdog in the control
+     * loop handles a hard/dead link (bug 0-D). */
+    if (current_status) {
+        disconnect_streak = 0;
+        if (!last_joystick_status) {
         }
-        return;
-    } else {
+        last_joystick_status  = true;
         is_joystick_connected = true;
-        joystick_watchdog_timer = HAL_GetTick();
-        fault_code &= ~FAULT_JOYSTICK_LOST;
+        FAULT_CLR(FAULT_JOYSTICK_LOST);
+    } else {
+        if (disconnect_streak < 255) disconnect_streak++;
+        if (disconnect_streak >= JOYSTICK_DISCONNECT_STREAK) {
+            if (last_joystick_status) {
+                printf("\r\n[SYSTEM] !!! JOYSTICK DISCONNECTED !!!\r\n");
+            }
+            last_joystick_status  = false;
+            is_joystick_connected = false;
+            if (safety_config.joystick_check) {
+                FAULT_SET(FAULT_JOYSTICK_LOST);
+                emergency_stop = true;
+            } else {
+                FAULT_CLR(FAULT_JOYSTICK_LOST);
+            }
+        }
+        /* Below the streak threshold: ignore this packet's status and keep
+         * running. Fall through so the safety-button and action fields are
+         * still processed — a single transient must not freeze control input. */
     }
 
     // 3. Safety / Emergency Button Toggle Logic (Rising Edge)
@@ -1066,15 +1261,16 @@ void Motor_ProcessPacket(char action, char safety, char status)
         // Toggle Emergency Stop
         if (!emergency_stop) {
             emergency_stop = true;
-            fault_code |= FAULT_ESTOP_JOYSTICK;
+            FAULT_SET(FAULT_ESTOP_JOYSTICK);
             Motor_SendAudioCommand('E');
             printf("[SAFETY] E-Stop LATCHED via Joystick\r\n");
         } else if (!hw.in_estop && hw.raw_prox_bit) {
             // Only clear if physical hardware is also safe
+            startup_estop_pending = false;
             emergency_stop = false;
-            fault_code &= ~(FAULT_ESTOP_PHYSICAL | FAULT_PROX_LOST |
-                            FAULT_ESTOP_JOYSTICK | FAULT_ESTOP_DASHBOARD |
-                            FAULT_ESTOP_MODBUS);
+            FAULT_CLR(FAULT_ESTOP_PHYSICAL | FAULT_PROX_LOST |
+                      FAULT_ESTOP_JOYSTICK | FAULT_ESTOP_DASHBOARD |
+                      FAULT_ESTOP_MODBUS | FAULT_STARTUP_ESTOP);
             Motor_SendAudioCommand('C');
             printf("[SAFETY] E-Stop CLEARED via Joystick\r\n");
         }
@@ -1085,23 +1281,70 @@ void Motor_ProcessPacket(char action, char safety, char status)
     Motor_ProcessCommand(action);
 }
 
+void Motor_RefreshWatchdog(void)
+{
+    is_joystick_connected = true;
+    joystick_watchdog_timer = HAL_GetTick();
+    FAULT_CLR(FAULT_JOYSTICK_LOST);
+}
+
+/* Clear the gamepad-disconnect debounce. Call this when re-arming the joystick
+ * safety check after it was disabled (e.g. at the end of DIAG): a streak that
+ * accumulated while the check was off must not instantly re-trip the e-stop on
+ * the first packet once the check is live. A genuine loss has to build a fresh
+ * JOYSTICK_DISCONNECT_STREAK afterwards. Kept separate from
+ * Motor_RefreshWatchdog because that runs on every joystick command packet —
+ * resetting the streak there would defeat the debounce entirely. */
+void Motor_ResetJoystickDebounce(void)
+{
+    disconnect_streak     = 0;
+    last_joystick_status  = true;
+    is_joystick_connected = true;
+}
+
 void Motor_ProcessCommand(char cmd)
 {
     // RESET WATCHDOG: Receiving any character indicates the joystick is alive
-    is_joystick_connected = true;
-    joystick_watchdog_timer = HAL_GetTick();
-    fault_code &= ~FAULT_JOYSTICK_LOST;
+    Motor_RefreshWatchdog();
 
     // PRIORITY 1: Manual Emergency Stop Command
     if (cmd == 'P' || cmd == 'X') {
+        if (!emergency_stop) {
+            printf("[SAFETY] Manual E-Stop triggered via Joystick (cmd=%c)\r\n", cmd);
+        }
         emergency_stop = true;
-        fault_code |= FAULT_ESTOP_JOYSTICK;
+        FAULT_SET(FAULT_ESTOP_JOYSTICK);
         Motor_SendAudioCommand('E');
         trajectory.current_setpoint_vel = 0.0f;
         trajectory.current_setpoint_pos = encoder.current_position_deg;
         trajectory.target_pos = encoder.current_position_deg;
         pid_speed.integral = 0.0f; 
         pid_position.integral = 0.0f;
+        return;
+    }
+
+    // Hardware Diagnostic Command
+    if (cmd == 'Z') {
+        if (current_mode != MOTOR_MODE_TEST) {
+            /* AUTO-CLEAR E-STOP: We need the motor relay to close to run 
+             * the open-loop test. */
+            emergency_stop = false;
+            fault_code = FAULT_NONE;
+
+            /* DISABLE SAFETY CHECKS: Save current user config first so we
+             * can restore it exactly after the test (not hardcode true). */
+            diag_saved_safety = safety_config;
+            safety_config.stall_prevent = false;
+            safety_config.encoder_check = false;
+            safety_config.joystick_check = false;
+            
+            current_mode = MOTOR_MODE_TEST;
+            open_loop_test_tick = HAL_GetTick();
+            printf("[DIAG] Starting Hardware Diagnostic Sequence...\r\n");
+            // Wipe PID memory for safety
+            pid_speed.integral = 0.0f;
+            pid_position.integral = 0.0f;
+        }
         return;
     }
 
@@ -1201,8 +1444,10 @@ void Motor_ProcessCommand(char cmd)
             Gripper_Toggle(); 
         }
         break;
-    case 'S': Gripper_Sequence_Pick(); break;
-    case 'G': Gripper_Sequence_Place(); break;
+    /* Defer the blocking sequences to the main loop (bug 1-F) — this runs in
+     * the USART3 RX ISR and must never busy-wait on reed switches here. */
+    case 'S': gripper_seq_request = 1; break;
+    case 'G': gripper_seq_request = 2; break;
     case 'L': 
         if (current_mode == MOTOR_MODE_GHOST) {
             buffered_target_pos -= resolution_step;
@@ -1296,14 +1541,20 @@ void Motor_ControlLoop(void)
          * encoder signal-loss timer to start (high PWM, zero RPM for one tick)
          * and can fire FAULT_ENCODER_ERROR even though the encoder is fine. */
         pid_speed.integral    = 0.0f;
-        pid_speed.error_prev  = 0.0f;
+        pid_speed.error_prev  = encoder.filtered_rpm;
         pid_speed.d_filt      = 0.0f;
         pid_position.integral = 0.0f;
-        pid_position.error_prev = 0.0f;
+        pid_position.error_prev = encoder.current_position_deg;
         pid_position.d_filt   = 0.0f;
         trajectory.current_setpoint_vel   = 0.0f;
         trajectory.current_setpoint_accel = 0.0f;
-        fault_code &= ~FAULT_ENCODER_ERROR;  /* clear stale encoder fault from E-Stop relay bounce */
+        FAULT_CLR(FAULT_ENCODER_ERROR);  /* clear stale encoder fault from E-Stop relay bounce */
+
+        /* Reset Kalman Filter to clear residual load torque (tau_L) windup */
+        if (Kalman_GetEnabled()) {
+            float current_rad = encoder.current_position_deg * 0.0174532925f;
+            Kalman_Reset(current_rad);
+        }
 
         if (position_unknown) {
             /* Recovery from a physical (hardware) E-stop: motor relay was
@@ -1327,8 +1578,8 @@ void Motor_ControlLoop(void)
             trajectory.current_setpoint_pos  = encoder.current_position_deg;
             Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
             homing_settle_tick    = HAL_GetTick();
-            homing_settle_pending = true;
-            printf("[SAFETY] Physical E-Stop cleared — re-homing in 500 ms (relay settle).\r\n");
+            homing_settle_pending = false;
+            clog_events |= CLOG_ESTOP_PHYS_REHOME;
         } else {
             /* Soft E-stop (or boot): motor relay just closed this tick and the
              * user only asked to clear the latch — they did not request motion.
@@ -1339,7 +1590,7 @@ void Motor_ControlLoop(void)
             current_mode = MOTOR_MODE_STOPPED;
             trajectory.target_pos             = encoder.current_position_deg;
             trajectory.current_setpoint_pos   = encoder.current_position_deg;
-            printf("[SAFETY] E-Stop Cleared. Holding at current position (%.2f).\r\n", encoder.current_position_deg);
+            clog_hold_pos = encoder.current_position_deg; clog_events |= CLOG_ESTOP_CLEARED_HOLD;
         }
         /* Flush ZVD buffer so stale pre-E-Stop setpoints cannot leak into
          * the shaper output on the first tick after resume. */
@@ -1359,7 +1610,7 @@ void Motor_ControlLoop(void)
             if (current_mode == MOTOR_MODE_STOPPED) {  /* still in settle-hold state */
                 trigger_homing_sequence = true;
                 current_mode = MOTOR_MODE_POSITION;    /* RunHomingSequence() switches to HOMING */
-                printf("[SAFETY] Relay settled — starting re-home.\r\n");
+                clog_events |= CLOG_RELAY_SETTLED;
             }
         }
     }
@@ -1367,7 +1618,7 @@ void Motor_ControlLoop(void)
     // M-button long press (3s) -> Test Mode
     if (m_button_active && current_mode != MOTOR_MODE_TEST && !emergency_stop) {
         if (HAL_GetTick() - m_button_hold_tick >= 3000) {
-            printf("START\r\n");
+            clog_events |= CLOG_TEST_START;
             open_loop_test_tick = HAL_GetTick();
             current_mode = MOTOR_MODE_TEST;
             m_button_active = false;
@@ -1443,32 +1694,52 @@ void Motor_ControlLoop(void)
             pid_position.error_prev = 0.0f;
             pid_position.d_filt = 0.0f;
             
-            printf("[HOME] Temporary Home Set. Original Home is now at %.2f deg.\r\n", original_home_offset_deg);
+            clog_temp_home_orig = original_home_offset_deg; clog_events |= CLOG_HOME_TEMP_SET;
         } else if (a_button_click_count == 2) {
             // DOUBLE CLICK: Go to Temporary Home
             Motor_SendAudioCommand('2');
             trajectory.target_pos = 0.0f;
             current_mode = MOTOR_MODE_POSITION;
             Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
-            printf("[HOME] Moving to Temporary Home (0.0) at %.1f RPM\r\n", tuning.move_speed_return_home);
+            clog_move_speed = tuning.move_speed_return_home; clog_events |= CLOG_HOME_MOVE_TEMP;
         } else if (a_button_click_count >= 3) {
             // TRIPLE CLICK: Go to Original Home
             Motor_SendAudioCommand('3');
             trajectory.target_pos = original_home_offset_deg;
             current_mode = MOTOR_MODE_POSITION;
             Motor_SetMotionProfile(tuning.move_speed_return_home, tuning.max_accel, 0.1f);
-            printf("[HOME] Moving to Original Home (%.2f) at %.1f RPM\r\n", original_home_offset_deg, tuning.move_speed_return_home);
+            clog_move_orig_pos = original_home_offset_deg; clog_move_speed = tuning.move_speed_return_home; clog_events |= CLOG_HOME_MOVE_ORIG;
         }
         
         a_button_click_count = 0;
         a_button_evaluating = false;
     }
 
+    /* Link silence watchdog (bug 0-D): declare the joystick link dead if no
+     * validated packet has arrived for JOYSTICK_TIMEOUT_MS, regardless of what
+     * the ESP32 status byte said. This is the authoritative detector for a
+     * physically dead/unplugged link. Only armed in JOYSTICK control mode so it
+     * does not trigger spuriously in BASE_SYSTEM (Modbus) mode. 
+     * 
+     * NEW: 
+     * 1. Only arm if we have seen at least one packet from USART3 (physical joystick).
+     * 2. If we have received a dashboard command, assume the dashboard is 
+     *    the control source and disable the silence watchdog to allow low-frequency
+     *    manual commands without heartbeats. */
+    if (control_system_mode == CONTROL_MODE_JOYSTICK && usart3_joystick_seen && 
+        !Telemetry_HasReceivedCommand() &&
+        (HAL_GetTick() - joystick_watchdog_timer) > JOYSTICK_TIMEOUT_MS) {
+        is_joystick_connected = false;
+    }
+
     // Joystick fault from ESP32 disconnect signal only (no timer).
     // Honour the "Joystick Check" safety toggle: when disabled, neither raise
     // the fault bit nor force STOPPED mode — the motor keeps running.
     if (!is_joystick_connected && safety_config.joystick_check) {
-        fault_code |= FAULT_JOYSTICK_LOST;
+        if (!(fault_code & FAULT_JOYSTICK_LOST)) {
+            printf("[SAFETY] Joystick Link LOST (Watchdog Timeout)\r\n");
+        }
+        FAULT_SET(FAULT_JOYSTICK_LOST);
         /* Do NOT interrupt the homing state machine — it drives MOTOR_MODE_HOMING
          * intentionally and must complete to set encoder zero.  Any other active
          * mode (POSITION, SPEED, JOG …) is stopped as before. */
@@ -1477,19 +1748,35 @@ void Motor_ControlLoop(void)
             PWM_Apply(0.0f);
         }
     } else {
-        fault_code &= ~FAULT_JOYSTICK_LOST;
+        FAULT_CLR(FAULT_JOYSTICK_LOST);
     }
 
     /* --- Safety Monitoring --- */
     bool stall_condition = false;
 
     // 1. Stall Detection
-    if (fabsf(current_applied_pwm) >= STALL_PWM_THRESHOLD && fabsf(encoder.filtered_rpm) < STALL_VELOCITY_THRESHOLD) {
+    if (fabsf(current_applied_pwm) >= safety_config.stall_pwm_pct && fabsf(encoder.filtered_rpm) < safety_config.stall_vel_rpm) {
         if (current_mode == MOTOR_MODE_POSITION || current_mode == MOTOR_MODE_GHOST) {
-            float pos_error = fabsf(trajectory.target_pos - encoder.current_position_deg);
-            if (pos_error > STALL_SETTLING_ERROR_DEG) stall_condition = true;
+            /* Compare against the SHAPED (commanded) setpoint, not the final
+             * target (bug 0-I). The ZVD shaper delays the command by up to 2N
+             * ticks (~0.5 s at default wn); measuring error against the un-shaped
+             * final target causes the 2 s stall window to elapse while the shaper
+             * is still ramping up the command → spurious FAULT_MOTOR_STALLED.
+             * shaper_last_output holds the shaped setpoint from the previous tick
+             * (10 ms stale — negligible). When the shaper is disabled,
+             * shaper_last_output == trajectory.current_setpoint_pos, which is also
+             * correct (and stricter than using target_pos). */
+            float pos_error = fabsf(shaper_last_output - encoder.current_position_deg);
+            if (pos_error > safety_config.stall_error_deg) stall_condition = true;
         } else if (current_mode == MOTOR_MODE_SPEED) {
-            stall_condition = true;
+            /* Only flag stall when a meaningful velocity is commanded but not
+             * achieved. Suppresses false trips during fine-jog button release
+             * (target_vel → 0 before mode flips to STOPPED) and during the
+             * brief motor startup transient where speed PID hasn't yet wound
+             * up enough to move the shaft past static friction. */
+            if (fabsf(trajectory.target_vel) > safety_config.stall_vel_rpm) {
+                stall_condition = true;
+            }
         }
     }
 
@@ -1523,10 +1810,23 @@ void Motor_ControlLoop(void)
      * creep speeds are 1–10 RPM, and breakaway static friction can make
      * count_delta cross zero while PWM is held high — none of that is a
      * wiring fault. */
+    /* When ENCODER_PHASE_INVERTED=1 the firmware negates count_delta in
+     * Encoder_Update, so positive PWM → negative count_delta is CORRECT.
+     * Flip the expected sign relationship when the inversion is active so
+     * the check only fires on an actual double-inversion (real wiring fault),
+     * not on the intended software correction.  Without this, every sustained
+     * forward or backward move triggers FAULT_ENCODER_ERROR after ~800 ms. */
+#if ENCODER_PHASE_INVERTED
+    bool instant_inverted = pwm_dir_settled &&
+                            (current_mode != MOTOR_MODE_HOMING) && (
+        (pwm_sign_now ==  1 && count_delta >  10) ||
+        (pwm_sign_now == -1 && count_delta < -10));
+#else
     bool instant_inverted = pwm_dir_settled &&
                             (current_mode != MOTOR_MODE_HOMING) && (
         (pwm_sign_now ==  1 && count_delta < -10) ||
         (pwm_sign_now == -1 && count_delta >  10));
+#endif
 
     static uint8_t inversion_streak = 0;
     if (instant_inverted) {
@@ -1537,9 +1837,9 @@ void Motor_ControlLoop(void)
     bool encoder_inverted = (inversion_streak >= 30);   /* 300 ms continuous */
 
     if (safety_config.encoder_check && encoder_inverted) {
-        fault_code |= FAULT_ENCODER_ERROR;
+        FAULT_SET(FAULT_ENCODER_ERROR);
         emergency_stop = true;
-        printf("CRITICAL: ENCODER INVERTED / PHASE ERROR\r\n");
+        clog_events |= CLOG_ENCODER_INVERTED;
         PWM_Apply(0.0f);
     }
 
@@ -1571,9 +1871,9 @@ void Motor_ControlLoop(void)
     }
 
     if (safety_config.encoder_check && encoder_signal_lost) {
-        fault_code |= FAULT_ENCODER_ERROR;
+        FAULT_SET(FAULT_ENCODER_ERROR);
         emergency_stop = true;
-        printf("CRITICAL: ENCODER DISCONNECTED / NO SIGNAL\r\n");
+        clog_events |= CLOG_ENCODER_NOSIGNAL;
         PWM_Apply(0.0f);
     }
 
@@ -1582,19 +1882,19 @@ void Motor_ControlLoop(void)
     //  - neither inversion nor signal-loss conditions are currently active
     //    and the e-stop has been cleared (so a recovered link drops the fault).
     if (!safety_config.encoder_check) {
-        fault_code &= ~FAULT_ENCODER_ERROR;
+        FAULT_CLR(FAULT_ENCODER_ERROR);
     } else if (!encoder_inverted && !encoder_signal_lost && !emergency_stop) {
-        fault_code &= ~FAULT_ENCODER_ERROR;
+        FAULT_CLR(FAULT_ENCODER_ERROR);
     }
 
     // Stall Timer
     if (stall_condition) {
         if (stall_timer == 0) stall_timer = HAL_GetTick();
-        else if (HAL_GetTick() - stall_timer >= STALL_TIME_MS) {
+        else if (HAL_GetTick() - stall_timer >= safety_config.stall_time_ms) {
             if (safety_config.stall_prevent) {
-                fault_code |= FAULT_MOTOR_STALLED;
+                FAULT_SET(FAULT_MOTOR_STALLED);
                 emergency_stop = true;
-                printf("CRITICAL: MOTOR STALLED\r\n");
+                clog_events |= CLOG_MOTOR_STALLED;
                 PWM_Apply(0.0f);
             }
         }
@@ -1604,19 +1904,29 @@ void Motor_ControlLoop(void)
 
     // Clear stale stall fault when the check is disabled or condition has cleared and e-stop is released
     if (!safety_config.stall_prevent) {
-        fault_code &= ~FAULT_MOTOR_STALLED;
+        FAULT_CLR(FAULT_MOTOR_STALLED);
     } else if (!stall_condition && !emergency_stop) {
-        fault_code &= ~FAULT_MOTOR_STALLED;
+        FAULT_CLR(FAULT_MOTOR_STALLED);
     }
 
-    // 4. Over-Rotation Protection (Virtual Wall Notification)
-    if (fabsf(encoder.current_position_deg) > SOFT_LIMIT_DEG) {
+    // 4. Over-Rotation Protection (Virtual Wall Notification + Escalation)
+    if (safety_config.over_rotation_check &&
+        fabsf(encoder.current_position_deg) > safety_config.soft_limit_deg) {
         if (!(fault_code & FAULT_OVER_ROTATION)) {
-            fault_code |= FAULT_OVER_ROTATION;
-            printf("WARNING: SOFT LIMIT REACHED (HARD STOP ACTIVE)\r\n");
+            FAULT_SET(FAULT_OVER_ROTATION);
+            clog_events |= CLOG_SOFT_LIMIT;
+        }
+        /* Escalate to E-Stop after 1 s sustained breach. Normal PID overshoot
+         * clears within one tick; 1 s means the arm is pressing a hard end-stop. */
+        if (over_rot_esc_tick == 0) over_rot_esc_tick = HAL_GetTick();
+        else if (HAL_GetTick() - over_rot_esc_tick >= 1000) {
+            emergency_stop = true;
+            over_rot_esc_tick = 0;
+            printf("[SAFETY] Over-rotation sustained >1s — E-Stop\r\n");
         }
     } else {
-        fault_code &= ~FAULT_OVER_ROTATION;
+        FAULT_CLR(FAULT_OVER_ROTATION);
+        over_rot_esc_tick = 0;
     }
 
     /* Fault-bit hygiene: clear stale automatic-safety fault bits when the
@@ -1624,16 +1934,17 @@ void Motor_ControlLoop(void)
      * dashboard keeps showing "Encoder Error" after the user unchecks
      * Encoder Check because the clear-path that lives later in this function
      * is unreachable while e-stop is active. */
-    if (!safety_config.encoder_check) fault_code &= ~FAULT_ENCODER_ERROR;
-    if (!safety_config.stall_prevent) fault_code &= ~FAULT_MOTOR_STALLED;
-    if (!safety_config.joystick_check) fault_code &= ~FAULT_JOYSTICK_LOST;
+    if (!safety_config.encoder_check) FAULT_CLR(FAULT_ENCODER_ERROR);
+    if (!safety_config.stall_prevent) FAULT_CLR(FAULT_MOTOR_STALLED);
+    if (!safety_config.joystick_check) FAULT_CLR(FAULT_JOYSTICK_LOST);
+    if (!safety_config.over_rotation_check) FAULT_CLR(FAULT_OVER_ROTATION);
 
     /* If e-stop was raised solely by an automatic safety fault that the user
      * has now disabled, and no other fault (automatic or manual) remains,
      * auto-release the e-stop so the motor can run again. Manual e-stop
      * sources (physical button, dashboard, joystick button, Modbus) stay
      * latched until explicitly cleared. */
-    if (emergency_stop && fault_code == FAULT_NONE && !hw.in_estop) {
+    if (emergency_stop && fault_code == FAULT_NONE && !hw.in_estop && !startup_estop_pending) {
         emergency_stop = false;
     }
 
@@ -1644,6 +1955,13 @@ void Motor_ControlLoop(void)
             ghost_dump_requested = true;
         }
         PWM_Apply(0.0f);
+        /* On E-Stop: release gripper relays to safe rest state.
+         * Spring returns gripper DOWN (out_gripper_up=0) and claw OPEN (out_gripper_down=0).
+         * Once E-Stop is cleared the user must explicitly re-command the gripper. */
+        if (emergency_stop) {
+            hw.out_gripper_up   = 0;
+            hw.out_gripper_down = 0;
+        }
         /* CRITICAL: also reset the module-level PWM monitor variable. Without
          * this, current_applied_pwm holds the last large value commanded just
          * before the fault (e.g. -80% from the corrective brake), the early-
@@ -1780,16 +2098,79 @@ void Motor_ControlLoop(void)
     pid_position.Ki = tuning.pos_Ki; 
     pid_position.Kd = tuning.pos_Kd;
 
-    /* --- Open Loop Test Mode --- */
+    /* --- Open Loop Hardware Diagnostic Mode --- */
     if (current_mode == MOTOR_MODE_TEST) {
-        if (HAL_GetTick() - open_loop_test_tick < 1000) {
-            PWM_Apply(25.0f);
-        } else {
+        static float diag_start_pos = 0.0f;
+        static float delta_pos_fwd = 0.0f;
+        static float delta_pos_rev = 0.0f;
+        uint32_t elapsed = HAL_GetTick() - open_loop_test_tick;
+
+        if (elapsed < 300) {
+            /* Phase 0: Forward Drive (15% PWM) */
+            if (elapsed < 20) diag_start_pos = encoder.current_position_deg;
+            PWM_Apply(15.0f);
+        }
+        else if (elapsed < 450) {
+            /* Phase 1: Brake & Record Forward Delta */
             PWM_Apply(0.0f);
-            printf("FINISH\r\n");
-            tuning.move_speed_coarse = 5.0f;
-            trajectory.target_pos = 0.0f;
-            current_mode = MOTOR_MODE_POSITION;
+            delta_pos_fwd = encoder.current_position_deg - diag_start_pos;
+        }
+        else if (elapsed < 750) {
+            /* Phase 2: Reverse Drive (-15% PWM) */
+            PWM_Apply(-15.0f);
+        }
+        else if (elapsed < 900) {
+            /* Phase 3: Brake & Record Reverse Delta */
+            PWM_Apply(0.0f);
+            delta_pos_rev = encoder.current_position_deg - (diag_start_pos + delta_pos_fwd);
+        }
+        else {
+            /* Phase 4: Analysis & Reporting */
+            PWM_Apply(0.0f);
+            
+            char report[256];
+            int len = snprintf(report, sizeof(report),
+                "\r\n[DIAG] --- Hardware Diagnostic Report ---\r\n"
+                "[DIAG] Fwd Delta: %.2f deg, Rev Delta: %.2f deg\r\n",
+                delta_pos_fwd, delta_pos_rev);
+            HAL_UART_Transmit(&hlpuart1, (uint8_t*)report, len, 100);
+
+            const char* res;
+            if (fabsf(delta_pos_fwd) < 0.5f && fabsf(delta_pos_rev) < 0.5f) {
+                res = "[DIAG] RESULT: ENCODER DEAD (No movement detected)\r\n";
+            }
+            else if ((delta_pos_fwd > 0.5f && delta_pos_rev > 0.5f) || 
+                     (delta_pos_fwd < -0.5f && delta_pos_rev < -0.5f)) {
+                res = "[DIAG] RESULT: DIRECTION PIN STUCK (Motor moved same direction twice)\r\n";
+            }
+            else if (delta_pos_fwd < -0.5f && delta_pos_rev > 0.5f) {
+                res = "[DIAG] RESULT: PHASE INVERTED (Encoder moved opposite to PWM)\r\n";
+            }
+            else {
+                res = "[DIAG] RESULT: HARDWARE OK (Motion matches commands)\r\n";
+                /* Self-test passed — release startup latch */
+                startup_estop_pending = false;
+                FAULT_CLR(FAULT_STARTUP_ESTOP);
+            }
+            HAL_UART_Transmit(&hlpuart1, (uint8_t*)res, strlen(res), 100);
+            HAL_UART_Transmit(&hlpuart1, (uint8_t*)"[DIAG] ----------------------------------\r\n\r\n", 44, 100);
+
+            current_mode = MOTOR_MODE_STOPPED;
+            trajectory.target_pos = encoder.current_position_deg;
+            trajectory.current_setpoint_pos = encoder.current_position_deg;
+
+            /* RESTORE SAFETY CHECKS to whatever the user had before the test */
+            safety_config.stall_prevent  = diag_saved_safety.stall_prevent;
+            safety_config.encoder_check  = diag_saved_safety.encoder_check;
+            safety_config.joystick_check = diag_saved_safety.joystick_check;
+
+            /* Refresh watchdog so it doesn't trip immediately upon restoration.
+             * Also clear the gamepad-disconnect debounce: a non-'C' streak that
+             * built up while joystick_check was off during the test would
+             * otherwise re-fire FAULT_JOYSTICK_LOST on the first packet now that
+             * the check is live again. */
+            Motor_RefreshWatchdog();
+            Motor_ResetJoystickDebounce();
         }
         return;
     }
@@ -1797,10 +2178,12 @@ void Motor_ControlLoop(void)
     /* --- Velocity Loop --- */
     if (current_mode == MOTOR_MODE_SPEED) {
         // VIRTUAL HARD STOPS: Prevent further motion in the direction of the limit
-        if (encoder.current_position_deg >= SOFT_LIMIT_DEG && trajectory.target_vel > 0.0f) {
-            trajectory.target_vel = 0.0f;
-        } else if (encoder.current_position_deg <= -SOFT_LIMIT_DEG && trajectory.target_vel < 0.0f) {
-            trajectory.target_vel = 0.0f;
+        if (safety_config.over_rotation_check) {
+            if (encoder.current_position_deg >= safety_config.soft_limit_deg && trajectory.target_vel > 0.0f) {
+                trajectory.target_vel = 0.0f;
+            } else if (encoder.current_position_deg <= -safety_config.soft_limit_deg && trajectory.target_vel < 0.0f) {
+                trajectory.target_vel = 0.0f;
+            }
         }
 
         /* Trajectory FF (cascade-control diagram).
@@ -1815,33 +2198,44 @@ void Motor_ControlLoop(void)
         float ff_dist_s  = tuning.K_tff * (tau_L_s * MOT_R_ARM / (MOT_N_GEAR * MOT_ETA_GB * MOT_K_T)) * V_TO_PWM;
         float ff_volts   = tuning.K_vff * v_ref_rads;
         float ff = ff_volts * V_TO_PWM + ff_dist_s;
-        current_applied_pwm = PID_Compute(&pid_speed, trajectory.target_vel, encoder.filtered_rpm) + ff;
-        PWM_Apply(current_applied_pwm);
+        float pid_out = PID_Compute(&pid_speed, trajectory.target_vel, encoder.filtered_rpm);
+        current_applied_pwm = Motor_DriveWithAntiWindup(pid_out, ff);
         trajectory.target_pos = encoder.current_position_deg;
         trajectory.current_setpoint_pos = encoder.current_position_deg;
     }
     /* --- Position Loop --- */
     else if (current_mode == MOTOR_MODE_POSITION || current_mode == MOTOR_MODE_GHOST || current_mode == MOTOR_MODE_HOMING) {
         // VIRTUAL HARD STOPS: Clamp target position
-        if (trajectory.target_pos > SOFT_LIMIT_DEG) {
-            trajectory.target_pos = SOFT_LIMIT_DEG;
-            static uint32_t last_warn_up = 0;
-            if (HAL_GetTick() - last_warn_up > 1000) { Motor_SendAudioCommand('W'); last_warn_up = HAL_GetTick(); }
+        if (safety_config.over_rotation_check) {
+            if (trajectory.target_pos > safety_config.soft_limit_deg) {
+                trajectory.target_pos = safety_config.soft_limit_deg;
+                static uint32_t last_warn_up = 0;
+                if (HAL_GetTick() - last_warn_up > 1000) { Motor_SendAudioCommand('W'); last_warn_up = HAL_GetTick(); }
+            }
+            if (trajectory.target_pos < -safety_config.soft_limit_deg) {
+                trajectory.target_pos = -safety_config.soft_limit_deg;
+                static uint32_t last_warn_dn = 0;
+                if (HAL_GetTick() - last_warn_dn > 1000) { Motor_SendAudioCommand('W'); last_warn_dn = HAL_GetTick(); }
+            }
         }
-        if (trajectory.target_pos < -SOFT_LIMIT_DEG) {
-            trajectory.target_pos = -SOFT_LIMIT_DEG;
-            static uint32_t last_warn_dn = 0;
-            if (HAL_GetTick() - last_warn_dn > 1000) { Motor_SendAudioCommand('W'); last_warn_dn = HAL_GetTick(); }
+        /* Bypass the S-curve planner during wiggle search — the sine wave
+         * is already smooth, and the profiler constantly resetting its
+         * internal state every tick is what caused the jerking. */
+        if (!(current_mode == MOTOR_MODE_HOMING && h_state == H_WIGGLE_SEARCH)) {
+            Trajectory_Generator_Update();
         }
-        Trajectory_Generator_Update();
 
         /* --- ZVD Input Shaper ---
          * Filters the S-curve position setpoint before the outer PID so that
          * the two-impulse (A2) and four-impulse (A3) delayed copies cancel the
          * first resonant swing. Coefficients are pre-computed in
          * ZVD_UpdateCoefficients() and never involve sqrtf/expf here. */
-        shaper_buf[shaper_buf_idx] = trajectory.current_setpoint_pos;
+        shaper_buf[shaper_buf_idx]   = trajectory.current_setpoint_pos;
+        shaper_buf_v[shaper_buf_idx] = trajectory.current_setpoint_vel;
+        shaper_buf_a[shaper_buf_idx] = trajectory.current_setpoint_accel;
         float shaped_pos;
+        float shaped_vel;
+        float shaped_acc;
         if (tuning.shaper_enable && shaper_N > 0u) {
             uint32_t i_n  = (shaper_buf_idx + (uint32_t)SHAPER_BUF_SIZE - shaper_N)
                             % (uint32_t)SHAPER_BUF_SIZE;
@@ -1850,16 +2244,33 @@ void Motor_ControlLoop(void)
             shaped_pos = shaper_A1 * shaper_buf[shaper_buf_idx]
                        + shaper_A2 * shaper_buf[i_n]
                        + shaper_A3 * shaper_buf[i_2n];
+            /* The ZVD shaper is a linear FIR filter, so the shaped velocity and
+             * acceleration are exactly the same convolution applied to the
+             * trajectory derivatives. Routing these (instead of the raw
+             * trajectory v/a) into the feedforward keeps the FF phase-aligned
+             * with shaped_pos — they share the same group delay. (Fix 2-B) */
+            shaped_vel = shaper_A1 * shaper_buf_v[shaper_buf_idx]
+                       + shaper_A2 * shaper_buf_v[i_n]
+                       + shaper_A3 * shaper_buf_v[i_2n];
+            shaped_acc = shaper_A1 * shaper_buf_a[shaper_buf_idx]
+                       + shaper_A2 * shaper_buf_a[i_n]
+                       + shaper_A3 * shaper_buf_a[i_2n];
         } else {
             shaped_pos = trajectory.current_setpoint_pos;
+            shaped_vel = trajectory.current_setpoint_vel;
+            shaped_acc = trajectory.current_setpoint_accel;
         }
         shaper_buf_idx = (shaper_buf_idx + 1u) % (uint32_t)SHAPER_BUF_SIZE;
+        shaper_last_output = shaped_pos;   /* expose commanded setpoint to the stall check (bug 0-I) */
 
         // (Dynamic speed recovery removed — it was overwriting Live Expressions tuning)
 
         float target_rpm;
-        float v_ref_rpm = trajectory.current_setpoint_vel;
-        float a_ref_rpmps = trajectory.current_setpoint_accel;
+        /* Shaper-delayed trajectory derivatives so the velocity/accel
+         * feedforward stays phase-aligned with shaped_pos. (Fix 2-B)
+         * The sine-test bypass below overrides these with analytic values. */
+        float v_ref_rpm = shaped_vel;
+        float a_ref_rpmps = shaped_acc;
 
         if (position_loop_enabled) {
             target_rpm = PID_Compute(&pid_position,
@@ -1898,9 +2309,8 @@ void Motor_ControlLoop(void)
         float ff_volts   = tuning.K_vff * v_ref_rads + tuning.K_aff * a_ref_rads;
         float ff = ff_volts * V_TO_PWM + ff_dist;
 
-        current_applied_pwm = PID_Compute(&pid_speed, target_rpm, encoder.filtered_rpm) + ff;
-        PWM_Apply(current_applied_pwm);
-        current_pwm = current_applied_pwm;
+        float pid_out = PID_Compute(&pid_speed, target_rpm, encoder.filtered_rpm);
+        current_applied_pwm = Motor_DriveWithAntiWindup(pid_out, ff);
 
         // Ghost Mode settle check: Must be within 0.5 deg AND < 1.0 RPM for 3 seconds
         if (ghost_move_active) {
@@ -1925,6 +2335,39 @@ void Motor_ControlLoop(void)
 float Motor_GetPosition(void) { return encoder.current_position_deg; }
 float Motor_GetSpeed(void) { return encoder.filtered_rpm; }
 
+/* Emit the strings deferred by the 100 Hz control ISR (bug 1-G). Call from the
+ * main loop. Snapshot+clear the event word atomically so a TIM6-ISR set that
+ * lands between the read and the clear is preserved for the next drain. */
+void Motor_DrainControlLog(void)
+{
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
+    uint32_t ev      = clog_events;
+    clog_events      = 0;
+    float hold       = clog_hold_pos;
+    float th_orig    = clog_temp_home_orig;
+    float mo_pos     = clog_move_orig_pos;
+    float spd        = clog_move_speed;
+    __set_PRIMASK(pm);
+
+    if (ev == 0) return;
+    /* Suppress all prints in BASE_SYSTEM mode — LPUART1 carries Modbus RTU binary. */
+    if (control_system_mode == CONTROL_MODE_BASE_SYSTEM) return;
+
+    if (ev & CLOG_ESTOP_PHYS_REHOME)  printf("[SAFETY] Physical E-Stop cleared. Auto-homing DISABLED. Holding current position.\r\n");
+    if (ev & CLOG_ESTOP_CLEARED_HOLD) printf("[SAFETY] E-Stop Cleared. Holding at current position (%.2f).\r\n", hold);
+    if (ev & CLOG_RELAY_SETTLED)      printf("[SAFETY] Relay settled — starting re-home.\r\n");
+    if (ev & CLOG_TEST_START)         printf("START\r\n");
+    if (ev & CLOG_HOME_TEMP_SET)      printf("[HOME] Temporary Home Set. Original Home is now at %.2f deg.\r\n", th_orig);
+    if (ev & CLOG_HOME_MOVE_TEMP)     printf("[HOME] Moving to Temporary Home (0.0) at %.1f RPM\r\n", spd);
+    if (ev & CLOG_HOME_MOVE_ORIG)     printf("[HOME] Moving to Original Home (%.2f) at %.1f RPM\r\n", mo_pos, spd);
+    if (ev & CLOG_ENCODER_INVERTED)   printf("CRITICAL: ENCODER INVERTED / PHASE ERROR\r\n");
+    if (ev & CLOG_ENCODER_NOSIGNAL)   printf("CRITICAL: ENCODER DISCONNECTED / NO SIGNAL\r\n");
+    if (ev & CLOG_MOTOR_STALLED)      printf("CRITICAL: MOTOR STALLED\r\n");
+    if (ev & CLOG_SOFT_LIMIT)         printf("WARNING: SOFT LIMIT REACHED (HARD STOP ACTIVE)\r\n");
+    if (ev & CLOG_TEST_FINISH)        printf("FINISH\r\n");
+}
+
 /* ============================================================================
  * Gripper & Sequence Functions
  * ============================================================================ */
@@ -1942,12 +2385,15 @@ void Gripper_Toggle(void)
     is_open = !is_open;
 }
 
-/* Wait for a reed switch to read 1, or bail out after REED_SW_TIMEOUT_MS. */
+/* Wait for a reed switch to read 1, or bail out after REED_SW_TIMEOUT_MS.
+ * Runs at thread level (main loop) after bug 1-F. Reads the cached *reed value,
+ * which the 100 Hz TIM6 ISR refreshes via HW_RefreshIO — we must NOT call
+ * HW_RefreshIO here (bug 1-A): it is not reentrant and is owned by the ISR. */
 static void wait_for_reed(volatile uint8_t *reed, const char *name)
 {
     uint32_t t0 = HAL_GetTick();
     while (!(*reed)) {
-        HW_RefreshIO();
+        IWDG->KR = 0xAAAAU;  /* keep watchdog alive — gripper wait can take up to REED_SW_TIMEOUT_MS */
         if ((HAL_GetTick() - t0) >= REED_SW_TIMEOUT_MS) {
             printf("Reed SW timeout: %s\r\n", name);
             return;
@@ -1983,6 +2429,34 @@ void Gripper_Sequence_Pick(void)
     wait_for_reed_if_joystick(&hw.in_reed_up, "UP");
     task_pick_active = false;
     printf("Sequence PICK: Done\r\n");
+}
+
+void Gripper_Sequence_Pick_Timed(uint16_t ms)
+{
+    printf("Starting Timed Sequence: PICK (%u ms)\r\n", ms);
+    Gripper_Open();
+    HAL_Delay(ms);
+    Gripper_Down();
+    HAL_Delay(ms);
+    Gripper_Close();
+    HAL_Delay(ms);
+    Gripper_Up();
+    HAL_Delay(ms);
+    printf("Timed Sequence PICK: Done\r\n");
+}
+
+void Gripper_Sequence_Place_Timed(uint16_t ms)
+{
+    printf("Starting Timed Sequence: PLACE (%u ms)\r\n", ms);
+    Gripper_Down();
+    HAL_Delay(ms);
+    Gripper_Open();
+    HAL_Delay(ms);
+    Gripper_Up();
+    HAL_Delay(ms);
+    Gripper_Close();
+    HAL_Delay(ms);
+    printf("Timed Sequence PLACE: Done\r\n");
 }
 
 void Gripper_Sequence_Place(void)

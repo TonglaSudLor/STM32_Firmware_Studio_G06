@@ -1,7 +1,7 @@
-../Core/Src/telemetry_hub.c:35:6:Telemetry_HasReceivedCommand	4	static
-../Core/Src/telemetry_hub.c:39:6:Telemetry_Init	16	static
-../Core/Src/telemetry_hub.c:49:6:Telemetry_Update	384	static
-../Core/Src/telemetry_hub.c:125:6:Telemetry_ProcessByte	16	static
-../Core/Src/telemetry_hub.c:150:13:Telemetry_ParseCommand	32	static
-../Core/Src/telemetry_hub.c:168:13:Telemetry_HandleSet	40	static
-../Core/Src/telemetry_hub.c:275:13:Telemetry_HandleCmd	16	static
+../Core/Src/telemetry_hub.c:38:6:Telemetry_HasReceivedCommand	4	static
+../Core/Src/telemetry_hub.c:42:6:Telemetry_Init	16	static
+../Core/Src/telemetry_hub.c:52:6:Telemetry_Update	408	static
+../Core/Src/telemetry_hub.c:133:6:Telemetry_ProcessByte	16	static
+../Core/Src/telemetry_hub.c:158:13:Telemetry_ParseCommand	32	static
+../Core/Src/telemetry_hub.c:179:13:Telemetry_HandleSet	40	static
+../Core/Src/telemetry_hub.c:319:13:Telemetry_HandleCmd	40	static,ignoring_inline_asm

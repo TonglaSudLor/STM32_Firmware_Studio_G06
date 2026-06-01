@@ -1,3 +1,5 @@
+let _lastGhost = false;
+
 // --- State ---
 const state = {
     connected: false,
@@ -18,10 +20,19 @@ const state = {
     ghost: false,
     prox: false,
     estop: false,
+    positionUnknown: false,
     gripper_ud: 0,
     gripper_co: 0,
     current: 0,
     override: false,
+    // Reed switch inputs (from firmware RSUP/RSDN/RSCL/RSOP)
+    reed_up: -1,    // -1 = no data yet
+    reed_down: -1,
+    reed_close: -1,
+    reed_open: -1,
+    baseAlive: false,
+    pnpState: 0,
+    connectTime: null,
     waypoints: [],
     seqActive: false,
     seqLoop: false,
@@ -45,9 +56,59 @@ const state = {
     kfSanityShow: false,
 };
 
+/* Mission Readiness — enforces Connect → HW Self-Test → Home before motion.
+ * Declared early so telemetry/UI callbacks can touch it safely. */
+const readiness = {
+    diag: 'idle',          // idle | running | pass | fail
+    home: 'no',            // no | homing | done | fail
+    diagText: 'Not run yet.',
+    diagHint: '',
+    homeText: 'Not homed.',
+};
+let _faultLatched = false; // set when a fault/E-Stop invalidates the home
+
+/* Motion controls disabled until the readiness gate passes (or Override is on).
+ * Declared early: updateUI() runs at load and reads this through the gate. */
+const RD_GATED_IDS = [
+    'btn-set-target', 'input-target', 'range-target', 'btn-negate-target',
+    'btn-go-home', 'btn-run-seq', 'btn-sine-toggle',
+];
+
 let tuningSynced = false;
 // Hoisted because renderPosLoopBtn() (called during script eval) references it.
 let tuningMode = false;
+
+/* Shared map of firmware SET-key → input element id. Used by Apply All,
+ * autosave draft, and named profiles so the field list lives in one place. */
+const TUNING_FIELDS = {
+    'SPEED_KP':   'input-speed-kp',
+    'SPEED_KI':   'input-speed-ki',
+    'SPEED_KD':   'input-speed-kd',
+    'K_VFF':      'input-k-vff',
+    'K_AFF':      'input-k-aff',
+    'K_TFF':      'input-k-tff',
+    'V_MAX_RAD':  'input-vmax-rad',
+    'A_MAX_RAD':  'input-amax-rad',
+    'J_MAX_RAD':  'input-jmax-rad',
+    'POS_KP':     'input-pos-kp',
+    'POS_KI':     'input-pos-ki',
+    'POS_KD':     'input-pos-kd',
+    'MIN_PWM':    'input-min-pwm',
+    'HOME_SPEED': 'input-home-speed',
+    'HOME_OFFSET':'input-home-offset',
+    'JOG_FINE':   'input-jog-fine',
+    'STEP_COARSE':'input-step-coarse',
+    'STEP_FINE':  'input-step-fine',
+    'SHPWN':      'input-shaper-wn',
+    'SHPZT':      'input-shaper-zeta',
+    'KF_Q_THETA': 'input-kf-q-theta',
+    'KF_Q_OMEGA': 'input-kf-q-omega',
+    'KF_Q_TAU':   'input-kf-q-tau',
+    'KF_Q_I':     'input-kf-q-i',
+    'KF_R':       'input-kf-r',
+};
+const TUNING_DRAFT_KEY    = 'tuningDraft';
+const TUNING_PROFILES_KEY = 'tuningProfiles';
 
 // --- Charts & Visualizer ---
 const visualizer = new RobotVisualizer('robot-visualizer');
@@ -65,7 +126,6 @@ const statusIndicator = document.getElementById('serial-status');
 const logContent = document.getElementById('log-content');
 const statMode = document.getElementById('stat-mode');
 const statFault = document.getElementById('stat-fault');
-const statJoy = document.getElementById('stat-joy');
 const statModbus = document.getElementById('stat-modbus');
 const statSysmode = document.getElementById('stat-sysmode');
 const statJogmode = document.getElementById('stat-jogmode');
@@ -88,9 +148,14 @@ async function connectSerial(existingPort = null) {
         await port.open({ baudRate: 115200 });
 
         state.connected = true;
+        state.connectTime = Date.now();
+        state.reed_up = -1; state.reed_down = -1;
+        state.reed_close = -1; state.reed_open = -1;
         updateUI();
         log("Connected to serial port.");
         sendCommand("CMD:PING=1");
+        pushSafetyConfig();
+        if (typeof onSerialConnected === 'function') onSerialConnected();
 
         const textDecoder = new TextDecoderStream();
         port.readable.pipeTo(textDecoder.writable);
@@ -110,6 +175,7 @@ async function disconnectSerial() {
     } catch (e) { /* ignore */ }
     state.connected = false;
     inputBuffer = "";
+    if (typeof resetReadiness === 'function') resetReadiness();
     updateUI();
     log("Disconnected.");
 }
@@ -135,6 +201,19 @@ async function readLoop() {
                 s = inputBuffer.indexOf('$');
                 e = inputBuffer.indexOf('*');
             }
+
+            // Display plain-text firmware debug output ([DIAG], [SAFETY], [SYSTEM], etc.)
+            // Only shows lines that start with '[' to ignore high-frequency CSV/numeric data.
+            const dollarPos = inputBuffer.indexOf('$');
+            const plainPart = dollarPos !== -1 ? inputBuffer.substring(0, dollarPos) : inputBuffer;
+            const lastNewline = plainPart.lastIndexOf('\n');
+            if (lastNewline !== -1) {
+                plainPart.substring(0, lastNewline).split('\n').forEach(line => {
+                    const clean = line.replace(/\r/g, '').trim();
+                    if (clean.startsWith('[')) { log('STM: ' + clean, 'info'); handleFirmwareLine(clean); }
+                });
+                inputBuffer = inputBuffer.substring(lastNewline + 1);
+            }
         } catch (err) {
             log("Read error: " + err.message, "error");
             break;
@@ -145,11 +224,21 @@ async function readLoop() {
 }
 
 let _dbgPacketCount = 0;
+let _hbPktCount = 0, _hbPktWindowStart = Date.now();
 
 function processPacket(packet) {
     if (_dbgPacketCount < 5) {
         log("RAW PKT: " + packet);
         _dbgPacketCount++;
+    }
+    _hbPktCount++;
+    const _now = Date.now();
+    if (_now - _hbPktWindowStart >= 1000) {
+        const rate = Math.round(_hbPktCount * 1000 / (_now - _hbPktWindowStart));
+        const rateEl = document.getElementById('hb-rate');
+        if (rateEl) rateEl.textContent = rate + ' Hz';
+        _hbPktCount = 0;
+        _hbPktWindowStart = _now;
     }
     packet.split(',').forEach(pair => {
         const idx = pair.indexOf(':');
@@ -167,17 +256,78 @@ function processPacket(packet) {
             case 'VSET': state.velSetpoint = safeNum; break;
             case 'ASET': state.accSetpoint = safeNum; break;
             case 'PWM': state.pwm = safeNum; break;
-            case 'MODE': state.mode = decodeMode(val); break;
+            case 'MODE':
+                state.mode = decodeMode(val);
+                if (state.mode === 'HOMING' && readiness.home !== 'done') {
+                    readiness.home = 'homing';
+                    readiness.homeText = 'Homing in progress…';
+                }
+                break;
             case 'SYSM': state.sysMode = val === '1' ? 'JOYSTICK' : 'BASE'; break;
             case 'JOGM': state.jogMode = val === '1' ? 'FINE' : 'COARSE'; break;
             case 'JOY': state.joystick = val === '1'; break;
-            case 'ESTOP': state.estop = val === '1'; break;
-            case 'FAULT': state.fault = decodeFault(val); break;
+            case 'ESTOP': {
+                const wasEstop = state.estop;
+                state.estop = val === '1';
+                if (state.estop && !wasEstop) onFaultOrEstop();
+                break;
+            }
+            case 'FAULT': {
+                const prevFault = state.fault;
+                const prevBits  = state.faultRaw ?? 0xFFFF; /* 0xFFFF = unknown at start */
+                state.faultRaw  = parseInt(val);
+                state.fault     = decodeFault(val);
+
+                /* Fault appeared → invalidate home */
+                if (state.fault !== 'NONE' && (prevFault === 'NONE' || prevFault === undefined)) onFaultOrEstop();
+
+                /* STARTUP_ESTOP bit just cleared → firmware confirmed DIAG passed.
+                 * Using the FAULT field is race-free (50 Hz telemetry) unlike the
+                 * HAL_UART_Transmit plain-text path which drops silently when UART
+                 * is busy with a telemetry packet from the main loop. */
+                if ((prevBits & 0x200) && !(state.faultRaw & 0x200) && readiness.diag !== 'pass') {
+                    readiness.diag     = 'pass';
+                    readiness.diagText = '✓ Hardware OK — startup latch released.';
+                    readiness.diagHint = '';
+                    /* If position is already known (PUNK=0, no prior E-stop), grant
+                     * the home step immediately — encoder is valid from boot. */
+                    if (!state.positionUnknown && readiness.home !== 'done') {
+                        readiness.home     = 'done';
+                        readiness.homeText = '✓ Position known.';
+                    }
+                    updateReadinessUI();
+                }
+                break;
+            }
             case 'PROX': state.prox = val !== '1'; break;
             case 'GHOST': state.ghost = val === '1'; break;
             case 'GUP': state.gripper_ud = val === '0'; break;  // GUP=1 → UP relay ON → gripper is UP (ud=false=not-down)
             case 'GDN': state.gripper_co = val === '1'; break;  // GDN=1 → claw CLOSE relay ON → claw is CLOSED
             case 'CURR': state.current = safeNum; break;
+            case 'RSUP': state.reed_up    = parseInt(val); break;
+            case 'RSDN': state.reed_down  = parseInt(val); break;
+            case 'RSCL': state.reed_close = parseInt(val); break;
+            case 'RSOP': state.reed_open  = parseInt(val); break;
+            case 'PUNK': {
+                const wasUnknown = state.positionUnknown;
+                state.positionUnknown = val === '1';
+                if (state.positionUnknown && !wasUnknown && readiness.home === 'done') {
+                    readiness.home = 'fail';
+                    readiness.homeText = 'Position unknown after relay cut — re-home required.';
+                    updateReadinessUI();
+                }
+                /* Position became known (PUNK→0) AND diag passed → accept any home
+                 * method (Fine Home or Set Home) as satisfying the readiness gate. */
+                if (!state.positionUnknown && wasUnknown && readiness.diag === 'pass'
+                        && readiness.home !== 'done') {
+                    readiness.home     = 'done';
+                    readiness.homeText = '✓ Homed.';
+                    updateReadinessUI();
+                }
+                break;
+            }
+            case 'BSALV': state.baseAlive = val === '1'; break;
+            case 'PNPS': state.pnpState = parseInt(val); break;
             case 'KFEN': state.kfEnabled = val === '1'; break;
             case 'KTH': state.kfTheta = safeNum; break;
             case 'KOM': state.kfOmega = safeNum; break;
@@ -246,7 +396,6 @@ function processPacket(packet) {
     lockTuningAfterSync();
     updateUI();
     visualizer.update(state.currentPos, state.firmwareTarget);
-    gripperVisualizer.update(!!state.gripper_ud, !state.gripper_co);
     chartPos.addData(state.currentPos);
     chartPos.addTarget(state.firmwareTarget);
     chartVel.addData(state.vel);
@@ -270,11 +419,16 @@ function processPacket(packet) {
 }
 
 async function sendCommand(cmd) {
-    if (!state.connected || !port) return;
+    if (!state.connected || !port || port.writable.locked) return;
     const writer = port.writable.getWriter();
-    writer.write(new TextEncoder().encode(`$${cmd}*`));
-    writer.releaseLock();
-    log("Sent: $" + cmd + "*");
+    try {
+        await writer.write(new TextEncoder().encode(`$${cmd}*`));
+        log("Sent: $" + cmd + "*");
+    } catch (e) {
+        log("Send error: " + e);
+    } finally {
+        writer.releaseLock();
+    }
 }
 
 // --- UI ---
@@ -284,11 +438,20 @@ function updateUI() {
     connectBtn.innerText = state.connected ? "Disconnect" : "Connect Robot";
 
     statMode.innerText = state.mode;
+    statMode.className = "value " + ({
+        POSITION: 'ok', GHOST: 'ok', VELOCITY: 'ok',
+        HOMING: 'warn', STOPPED: ''
+    }[state.mode] ?? '');
     statFault.innerText = state.fault;
     statFault.className = "value " + (state.fault === 'NONE' ? "ok" : "error");
-    statJoy.innerText = state.joystick ? "CONNECTED" : "OFFLINE";
-    statJoy.className = "value " + (state.joystick ? "ok" : "");
-    statModbus.innerText = state.modbus;
+    const baseText = state.sysMode === 'BASE' ? (state.baseAlive ? 'ALIVE' : 'TIMEOUT') : '--';
+    statModbus.innerText = baseText;
+    statModbus.className = 'value ' + (state.baseAlive ? 'ok' : (state.sysMode === 'BASE' ? 'error' : ''));
+    const statPnp = document.getElementById('stat-pnp');
+    if (statPnp) {
+        statPnp.innerText = decodePnP(state.pnpState);
+        statPnp.className = 'value ' + (state.pnpState > 0 ? 'warn' : '');
+    }
     statSysmode.innerText = state.sysMode;
     statSysmode.className = "value " + (state.sysMode === 'JOYSTICK' ? "ok" : "");
     statJogmode.innerText = state.jogMode;
@@ -300,8 +463,6 @@ function updateUI() {
         bjm.className = 'toggle-btn ' + (state.jogMode === 'FINE' ? 'active' : '');
     }
 
-    document.getElementById('stat-pwm').innerText = (isNaN(state.pwm) ? '0.0' : state.pwm.toFixed(1)) + "%";
-    document.getElementById('stat-current').innerText = state.current.toFixed(2) + ' A';
     ioProx.className = "io-item " + (state.prox ? "active" : "");
     ioEstop.className = "io-item " + (state.estop ? "active" : "");
 
@@ -309,6 +470,7 @@ function updateUI() {
     btnGripperUD.className = "toggle-btn " + (state.gripper_ud ? "active" : "active-green");
     btnGripperCO.innerText = "Claw: " + (state.gripper_co ? "CLOSED" : "OPEN");
     btnGripperCO.className = "toggle-btn " + (state.gripper_co ? "active" : "active-green");
+    gripperVisualizer.update(!!state.gripper_ud, !state.gripper_co);
     btnOverride.innerText = "Override: " + (state.override ? "ON" : "OFF");
     btnOverride.className = "toggle-btn warning " + (state.override ? "active" : "");
     estopBtn.innerText = state.estop ? "CLEAR FAULT / RESUME" : "EMERGENCY STOP";
@@ -318,6 +480,124 @@ function updateUI() {
     btnSysMode.innerText = "Mode: " + state.sysMode;
     btnSysMode.className = "toggle-btn " + (state.sysMode === 'JOYSTICK' ? "active" : "");
 
+    if (typeof updateReadinessUI === 'function') updateReadinessUI();
+    updateHeartbeat();
+    // Keep the fault modal live while it's open
+    if (!document.getElementById('fault-modal')?.classList.contains('hidden')) refreshFaultModal();
+}
+
+function setHbTile(id, status, val) {
+    const tile = document.getElementById(id);
+    if (!tile) return;
+    tile.dataset.status = status;
+    const v = tile.querySelector('.hb-val');
+    if (v) v.textContent = val;
+}
+
+function updateHeartbeat() {
+    if (!state.connected) {
+        document.querySelectorAll('.hb-tile').forEach(t => {
+            t.dataset.status = 'idle';
+            const v = t.querySelector('.hb-val');
+            if (v) v.textContent = '--';
+        });
+        const rateEl = document.getElementById('hb-rate');
+        if (rateEl) rateEl.textContent = '-- Hz';
+        return;
+    }
+
+    const f = state.fault;
+
+    // ENCODER
+    setHbTile('hbt-encoder',
+        f.includes('ENCODER') ? 'fault' : 'ok',
+        state.vel.toFixed(0) + 'RPM'
+    );
+
+    // CURRENT SENSOR (WCS1800 ADC)
+    setHbTile('hbt-current', 'ok', state.current.toFixed(2) + 'A');
+
+    // PROXIMITY SENSOR
+    setHbTile('hbt-prox',
+        f.includes('PROX_LOST') ? 'fault' : 'ok',
+        state.prox ? 'CLR' : 'TRIP'
+    );
+
+    // JOYSTICK (ESP32)
+    setHbTile('hbt-joy',
+        f.includes('JOY_LOST') ? 'fault' : (state.joystick ? 'ok' : 'warn'),
+        state.joystick ? 'ON' : 'OFF'
+    );
+
+    // E-STOP
+    setHbTile('hbt-estop',
+        state.estop ? 'fault' : 'ok',
+        state.estop ? 'ACTV' : 'CLR'
+    );
+
+    // MOTOR / H-BRIDGE
+    const motorFault = f.includes('STALL') || f.includes('OVER_ROT');
+    setHbTile('hbt-motor',
+        motorFault ? 'fault' : 'ok',
+        Math.abs(state.pwm).toFixed(0) + '%'
+    );
+
+    // GRIP (vertical) — reed switches RSUP / RSDN
+    {
+        const up = state.reed_up, dn = state.reed_down;
+        let gs, gv;
+        if (up < 0) { gs = 'idle'; gv = '--'; }           // no data yet
+        else if (up === 1 && dn === 0) { gs = 'ok';   gv = 'UP'; }
+        else if (up === 0 && dn === 1) { gs = 'ok';   gv = 'DOWN'; }
+        else if (up === 0 && dn === 0) { gs = 'warn'; gv = 'TRNST'; }
+        else                            { gs = 'fault'; gv = 'ERR'; }  // both 1 = impossible
+        setHbTile('hbt-grip', gs, gv);
+    }
+
+    // CLAW — reed switches RSCL / RSOP
+    {
+        const cl = state.reed_close, op = state.reed_open;
+        let cs, cv;
+        if (cl < 0) { cs = 'idle'; cv = '--'; }
+        else if (cl === 1 && op === 0) { cs = 'ok';   cv = 'CLSD'; }
+        else if (cl === 0 && op === 1) { cs = 'ok';   cv = 'OPEN'; }
+        else if (cl === 0 && op === 0) { cs = 'warn'; cv = 'TRNST'; }
+        else                            { cs = 'fault'; cv = 'ERR'; }
+        setHbTile('hbt-claw', cs, cv);
+    }
+
+    // ── STM32 HEALTH TILES ──
+
+    // LINK — serial packet rate quality
+    const rateEl = document.getElementById('hb-rate');
+    const rateStr = rateEl ? rateEl.textContent : '-- Hz';
+    const rateNum = parseInt(rateStr);
+    setHbTile('hbt-link',
+        isNaN(rateNum) ? 'idle' : (rateNum >= 40 ? 'ok' : rateNum >= 10 ? 'warn' : 'fault'),
+        rateStr
+    );
+
+    // CTRL — active control loop mode
+    const ctrlModes = { 'STOPPED': 'warn', 'POSITION': 'ok', 'VELOCITY': 'ok', 'GHOST': 'ok', 'HOMING': 'warn' };
+    setHbTile('hbt-ctrl',
+        ctrlModes[state.mode] || 'ok',
+        (state.mode || 'STP').substring(0, 4)
+    );
+
+    // SYS — system mode (BASE / JOYSTICK)
+    setHbTile('hbt-sys', 'ok',
+        state.sysMode === 'BASE' ? 'BASE' : 'JOY'
+    );
+
+    // BASE — Modbus master heartbeat + P&P task
+    {
+        const pnpLabel = decodePnP(state.pnpState).substring(0, 4);
+        const baseStatus = state.baseAlive ? 'ok' : (state.sysMode === 'BASE' ? 'fault' : 'warn');
+        setHbTile('hbt-base',
+            baseStatus,
+            state.pnpState > 0 ? pnpLabel : (state.baseAlive ? 'IDLE' : 'OFF')
+        );
+    }
 }
 
 function log(msg, type = "info") {
@@ -325,7 +605,10 @@ function log(msg, type = "info") {
     const div = document.createElement('div');
     div.innerHTML = `<span style="color:#555">[${time}]</span> ${msg}`;
     if (type === "error") div.style.color = "#ff3131";
-    logContent.prepend(div);
+    logContent.appendChild(div);
+    // Keep at most 200 entries
+    while (logContent.children.length > 200) logContent.removeChild(logContent.firstChild);
+    logContent.scrollTop = logContent.scrollHeight;
 }
 
 let _tuningReceivedFromFirmware = false;
@@ -339,11 +622,19 @@ function syncTuning(id, val) {
 }
 
 function lockTuningAfterSync() {
-    if (_tuningReceivedFromFirmware) tuningSynced = true;
+    if (_tuningReceivedFromFirmware) {
+        tuningSynced = true;
+        // Fields now mirror firmware values, so clear the unsynced indicator.
+        if (typeof markTuningSynced === 'function') markTuningSynced();
+    }
 }
 
 function decodeMode(val) {
     return ['STOPPED', 'SPEED', 'POSITION', 'AUTOTUNE_P', 'AUTOTUNE_S', 'TEST', 'GHOST', 'HOMING'][parseInt(val)] || 'UNKNOWN';
+}
+
+function decodePnP(n) {
+    return ['IDLE','→PICK','WAIT♦','OPEN','↓','CLOSE','↑','→PLACE','WAIT♦','↓','OPEN','↑','CLOSE','NEXT','DONE'][n] || '??';
 }
 
 function decodeFault(val) {
@@ -359,6 +650,8 @@ function decodeFault(val) {
     if (bits & 0x040) f.push('ESTOP_JOY');
     if (bits & 0x080) f.push('ESTOP_DASH');
     if (bits & 0x100) f.push('ESTOP_MBUS');
+    if (bits & 0x200) f.push('STARTUP_ESTOP');
+    if (bits & 0x400) f.push('OVERCURRENT');
     return f.join(' | ');
 }
 
@@ -378,10 +671,8 @@ estopBtn.addEventListener('click', () => {
         state.estop = true;
         state.vel = 0;
         state.acc = 0;
-        chartVel.history = [];
-        chartAcc.history = [];
-        chartVel.draw();
-        chartAcc.draw();
+        chartVel.clearLiveData();
+        chartAcc.clearLiveData();
     }
     updateUI();
 });
@@ -412,13 +703,36 @@ document.getElementById('btn-set-target').addEventListener('click', () => {
     }
 });
 
+document.querySelectorAll('.mo-step-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const step = parseFloat(btn.dataset.step);
+        const cur = parseFloat(inputTarget.value) || 0;
+        const next = Math.round((cur + step) * 10) / 10;
+        inputTarget.value = next;
+        rangeTarget.value = Math.max(-180, Math.min(180, next));
+        state.targetPos = next;
+        sendCommand(`SET:TARGET=${next}`);
+        if (tuningMode) { tuningState = 'IDLE'; tuningArmRun(); setMetricsStatus('ARMED (Move) — Waiting for motor motion...', ''); }
+    });
+});
+
+let _lastGripUDClick = 0;
+let _lastGripCOClick = 0;
+const GRIP_DEBOUNCE_MS = 500;
+
 btnGripperUD.addEventListener('click', () => {
+    const now = Date.now();
+    if (now - _lastGripUDClick < GRIP_DEBOUNCE_MS) return;
+    _lastGripUDClick = now;
     state.gripper_ud = 1 - state.gripper_ud;
     sendCommand(state.gripper_ud ? "CMD:GRIP_DN" : "CMD:GRIP_UP");
     updateUI();
 });
 
 btnGripperCO.addEventListener('click', () => {
+    const now = Date.now();
+    if (now - _lastGripCOClick < GRIP_DEBOUNCE_MS) return;
+    _lastGripCOClick = now;
     state.gripper_co = 1 - state.gripper_co;
     sendCommand(state.gripper_co ? "CMD:CLAW_CLOSE" : "CMD:CLAW_OPEN");
     updateUI();
@@ -467,7 +781,7 @@ function renderPosLoopBtn() {
     btnPosLoop.classList.toggle('danger', !posLoopEnabled);
 
     // Gray out + lock the position-PID inputs when the outer loop is bypassed
-    const section = btnPosLoop.closest('.tuning-section');
+    const section = btnPosLoop.closest('.tl-sec') || btnPosLoop.closest('.tuning-section');
     if (section) section.classList.toggle('disabled', !posLoopEnabled);
     POS_INPUT_IDS.forEach(id => {
         const el = document.getElementById(id);
@@ -662,29 +976,73 @@ btnOverride.addEventListener('click', () => {
 // --- Fault Modal ---
 const FAULT_INFO = {
     /* Automatic faults (gated by safety_config) */
-    'STALL': { name: 'Motor Stalled', desc: 'PWM high but rotor not moving for 2 s. Source: automatic safety monitor. Check obstruction or wiring.' },
-    'ENCODER': { name: 'Encoder Error', desc: 'Encoder signal lost or phase inverted. Source: automatic safety monitor. Check encoder cable.' },
-    'JOY_LOST': { name: 'Joystick Lost', desc: 'ESP32 joystick disconnected. Source: automatic safety monitor (Joystick Check).' },
-    'OVER_ROT': { name: 'Over-Rotation', desc: 'Exceeded ±720° from home. Source: soft-limit watchdog (wire-twist protection).' },
-    /* User / external e-stop sources (informational; not gated by safety_config) */
-    'ESTOP_HW': { name: 'E-Stop: Physical', desc: 'Hardware E-Stop button was pressed (GPIO EXTI). Release the button and press the physical Reset.' },
-    'PROX_LOST': { name: 'Proximity Lost', desc: 'Proximity sensor reported open. Source: physical interlock.' },
-    'ESTOP_JOY': { name: 'E-Stop: Joystick', desc: 'E-Stop triggered by the joystick safety button (P) or command (X). Source: ESP32 joystick.' },
-    'ESTOP_DASH': { name: 'E-Stop: Dashboard', desc: 'EMERGENCY STOP button on the dashboard was clicked. Source: user via dashboard.' },
-    'ESTOP_MBUS': { name: 'E-Stop: Modbus', desc: 'Modbus register 0x25 requested soft stop. Source: Base System / Modbus master.' },
+    'STALL':        { name: 'Motor Stalled',         desc: 'PWM high but rotor not moving for the stall sustain time. Check for obstruction, mechanical jam, or wiring fault.' },
+    'ENCODER':      { name: 'Encoder Error',          desc: 'Encoder signal lost or phase inverted. Check encoder cable and connector.' },
+    'JOY_LOST':     { name: 'Joystick Lost',          desc: 'ESP32 joystick link timed out or reported disconnected. Check joystick power and Bluetooth.' },
+    'OVER_ROT':     { name: 'Over-Rotation',          desc: 'Absolute position exceeded the soft limit. Virtual hard-stop active. Sustained >1 s escalates to E-Stop.' },
+    /* User / external e-stop sources */
+    'ESTOP_HW':     { name: 'E-Stop: Physical Button',desc: 'Hardware E-Stop button held down. Release button, then clear fault.' },
+    'PROX_LOST':    { name: 'Proximity Sensor Lost',  desc: 'Proximity sensor input opened. Check sensor wiring and power.' },
+    'ESTOP_JOY':    { name: 'E-Stop: Joystick',       desc: 'E-Stop triggered by joystick safety button (P/X). Source: ESP32.' },
+    'ESTOP_DASH':   { name: 'E-Stop: Dashboard',      desc: 'EMERGENCY STOP button clicked on the dashboard.' },
+    'ESTOP_MBUS':   { name: 'E-Stop: Modbus',         desc: 'Modbus register 0x25 soft-stop request from Base System.' },
+    'STARTUP_ESTOP':{ name: 'Startup E-Stop Latch',   desc: 'Power-on safety latch. Run Self-Test (DIAG) to release. Prevents motion before hardware is verified.' },
+    'OVERCURRENT':  { name: 'Overcurrent Trip',       desc: 'Motor current exceeded the hardware limit for 50 ms. Motor relay opened. Check for jam, short circuit, or overload. Clear fault once safe.' },
 };
 
 function refreshFaultModal() {
+    // ── Status strip ───────────────────────────────────────────────────────
+    const posEl  = document.getElementById('modal-pos-status');
+    const wdgEl  = document.getElementById('modal-wdg-status');
+    const currEl = document.getElementById('modal-curr-status');
+    if (wdgEl) {
+        wdgEl.textContent = state.connected ? 'IWDG Active (15 s)' : 'IWDG: --';
+        wdgEl.className   = `modal-status-pill ${state.connected ? 'ok' : 'neutral'}`;
+    }
+    if (posEl) {
+        if (!state.connected) {
+            posEl.textContent = 'Position: Disconnected';
+            posEl.className   = 'modal-status-pill neutral';
+        } else if (state.positionUnknown) {
+            posEl.textContent = 'Position UNKNOWN — Re-home required';
+            posEl.className   = 'modal-status-pill warn';
+        } else {
+            posEl.textContent = 'Position KNOWN';
+            posEl.className   = 'modal-status-pill ok';
+        }
+    }
+    if (currEl) {
+        const amps = typeof state.current === 'number' ? state.current : 0;
+        const pct  = Math.min(100, Math.abs(amps) / 15 * 100);
+        const cls  = pct > 80 ? 'warn' : (pct > 50 ? 'caution' : 'ok');
+        currEl.textContent = state.connected ? `Current: ${amps.toFixed(1)} A` : 'Current: --';
+        currEl.className   = `modal-status-pill ${state.connected ? cls : 'neutral'}`;
+    }
+    // Live current in the overcurrent info block
+    const ocCurr = document.getElementById('disp-oc-current');
+    if (ocCurr) ocCurr.textContent = state.connected ? (state.current ?? 0).toFixed(2) : '--';
+
+    // ── Active faults ───────────────────────────────────────────────────────
     const list = document.getElementById('modal-fault-list');
     list.innerHTML = '';
-    if (state.fault === 'NONE') {
+    const visibleFaults = (state.fault && state.fault !== 'NONE') ? state.fault.split(' | ') : [];
+
+    // Treat positionUnknown as a fault-level condition
+    if (state.positionUnknown) visibleFaults.unshift('_PUNK');
+
+    if (visibleFaults.length === 0) {
         list.innerHTML = '<div style="color:var(--accent-green);">No active faults.</div>';
         return;
     }
-    state.fault.split(' | ').forEach(f => {
-        const info = FAULT_INFO[f] || { name: f, desc: 'Unknown fault.' };
+    visibleFaults.forEach(f => {
+        let info;
+        if (f === '_PUNK') {
+            info = { name: 'Position Unknown', desc: 'Physical E-Stop cut power to the encoder. Arm may have moved. Run the homing sequence before commanding motion.' };
+        } else {
+            info = FAULT_INFO[f] || { name: f, desc: 'Unknown fault code.' };
+        }
         const div = document.createElement('div');
-        div.className = 'fault-item';
+        div.className = 'fault-item' + (f === '_PUNK' ? ' fault-item-warn' : '');
         div.innerHTML = `<div class="fault-name">${info.name}</div><div class="fault-desc">${info.desc}</div>`;
         list.appendChild(div);
     });
@@ -696,6 +1054,8 @@ function openMetricsConfig() {
     document.getElementById('cfg-pos-settle').value = TUNE_POS_SETTLE_DEG;
     document.getElementById('cfg-vel-settle').value = TUNE_VEL_SETTLE_RPM;
     document.getElementById('cfg-settle-ms').value = TUNE_SETTLE_MS;
+    const bandEl = document.getElementById('cfg-settle-band');
+    if (bandEl) bandEl.value = TUNE_SETTLE_BAND_PCT;
     document.getElementById('metrics-config-modal').classList.remove('hidden');
 }
 function saveMetricsConfig() {
@@ -703,20 +1063,27 @@ function saveMetricsConfig() {
     TUNE_POS_SETTLE_DEG = parseFloat(document.getElementById('cfg-pos-settle').value) || 2.0;
     TUNE_VEL_SETTLE_RPM = parseFloat(document.getElementById('cfg-vel-settle').value) || 3.0;
     TUNE_SETTLE_MS = parseInt(document.getElementById('cfg-settle-ms').value) || 3000;
+    const bandEl = document.getElementById('cfg-settle-band');
+    if (bandEl) TUNE_SETTLE_BAND_PCT = parseFloat(bandEl.value) || 2.0;
     localStorage.setItem('metricsCfg', JSON.stringify({
         velThresh: TUNE_VEL_THRESHOLD,
         posSettle: TUNE_POS_SETTLE_DEG,
         velSettle: TUNE_VEL_SETTLE_RPM,
         settleMs: TUNE_SETTLE_MS,
+        settleBand: TUNE_SETTLE_BAND_PCT,
     }));
     document.getElementById('metrics-config-modal').classList.add('hidden');
-    log(`Settle config saved: vel>${TUNE_VEL_THRESHOLD} pos<${TUNE_POS_SETTLE_DEG}° vel<${TUNE_VEL_SETTLE_RPM} hold=${TUNE_SETTLE_MS}ms`);
+    log(`Settle config saved: band ±${TUNE_SETTLE_BAND_PCT}% · vel>${TUNE_VEL_THRESHOLD} pos<${TUNE_POS_SETTLE_DEG}° vel<${TUNE_VEL_SETTLE_RPM} hold=${TUNE_SETTLE_MS}ms`);
 }
 document.getElementById('btn-metrics-config').addEventListener('click', openMetricsConfig);
 document.getElementById('btn-close-metrics-modal').addEventListener('click', () => {
     document.getElementById('metrics-config-modal').classList.add('hidden');
 });
 document.getElementById('btn-save-metrics-cfg').addEventListener('click', saveMetricsConfig);
+{
+    const csvBtn = document.getElementById('btn-metrics-csv');
+    if (csvBtn) csvBtn.addEventListener('click', exportMetricsCsv);
+}
 document.getElementById('metrics-config-modal').addEventListener('click', e => {
     if (e.target.id === 'metrics-config-modal') e.target.classList.add('hidden');
 });
@@ -733,24 +1100,73 @@ document.getElementById('fault-modal').addEventListener('click', (e) => {
 });
 
 const SAFETY_TOGGLES = {
-    'chk-safe-stall': 'SAFE_STALL',
-    'chk-safe-encoder': 'SAFE_ENCODER',
-    'chk-safe-overrot': 'SAFE_OVERROT',
-    'chk-safe-joy': 'SAFE_JOY',
+    'chk-safe-stall':      'SAFE_STALL',
+    'chk-safe-encoder':    'SAFE_ENCODER',
+    'chk-safe-overrot':    'SAFE_OVERROT',
+    'chk-safe-joy':        'SAFE_JOY',
+    'chk-safe-phys-estop': 'SAFE_ESTOP',
 };
+/* Editable numeric thresholds → firmware SET keys. */
+const SAFETY_THRESHOLDS = {
+    'cfg-stall-pwm': 'STALL_PWM',
+    'cfg-stall-vel': 'STALL_VEL',
+    'cfg-stall-time': 'STALL_TIME',
+    'cfg-stall-err': 'STALL_ERR',
+    'cfg-max-rot': 'MAX_ROT',
+};
+
+/* Persist toggles + thresholds so they survive page reloads. */
+function saveSafetyConfig() {
+    const data = { toggles: {}, thresholds: {} };
+    Object.keys(SAFETY_TOGGLES).forEach(id => {
+        const el = document.getElementById(id); if (el) data.toggles[id] = el.checked;
+    });
+    Object.keys(SAFETY_THRESHOLDS).forEach(id => {
+        const el = document.getElementById(id); if (el) data.thresholds[id] = el.value;
+    });
+    localStorage.setItem('safetyConfig', JSON.stringify(data));
+}
+
+function loadSafetyConfig() {
+    let data = {};
+    try { data = JSON.parse(localStorage.getItem('safetyConfig') || '{}'); } catch (e) { data = {}; }
+    Object.entries(data.toggles || {}).forEach(([id, v]) => {
+        const el = document.getElementById(id); if (el) el.checked = v;
+    });
+    Object.entries(data.thresholds || {}).forEach(([id, v]) => {
+        const el = document.getElementById(id); if (el && v !== '' && v != null) el.value = v;
+    });
+}
+
+/* Re-send the full safety config to the firmware. Called after a connection is
+ * established so the robot always matches what the dashboard shows, even if the
+ * user unchecked a box / changed a limit while disconnected. */
+function pushSafetyConfig() {
+    Object.entries(SAFETY_TOGGLES).forEach(([id, key]) => {
+        const el = document.getElementById(id); if (el) sendCommand(`SET:${key}=${el.checked ? 1 : 0}`);
+    });
+    Object.entries(SAFETY_THRESHOLDS).forEach(([id, key]) => {
+        const el = document.getElementById(id);
+        if (el && el.value !== '') sendCommand(`SET:${key}=${el.value}`);
+    });
+    log('Safety config pushed to robot.');
+}
+
 Object.entries(SAFETY_TOGGLES).forEach(([id, key]) => {
     const el = document.getElementById(id);
     el.addEventListener('change', e => {
+        saveSafetyConfig();
         sendCommand(`SET:${key}=${e.target.checked ? 1 : 0}`);
     });
-    /* Push current checkbox state to firmware once we're connected — handles
-     * the case where the user unchecked the box, reloaded the dashboard,
-     * and the firmware still has the safety check enabled. */
-    el.addEventListener('click', () => {
-        /* fires after the toggle; redundant SET ensures sync after reload */
-        sendCommand(`SET:${key}=${el.checked ? 1 : 0}`);
+});
+Object.entries(SAFETY_THRESHOLDS).forEach(([id, key]) => {
+    const el = document.getElementById(id);
+    el.addEventListener('change', () => {
+        saveSafetyConfig();
+        if (el.value !== '') sendCommand(`SET:${key}=${el.value}`);
     });
 });
+loadSafetyConfig();
 
 /**
  * triggerHoming() — shared helper used by both Fine Home and Save Offset & Home.
@@ -774,7 +1190,7 @@ async function triggerHoming() {
 }
 
 document.getElementById('btn-fine-home').addEventListener('click', () => {
-    triggerHoming();
+    requestHoming();
 });
 
 document.getElementById('btn-go-home').addEventListener('click', () => {
@@ -814,41 +1230,170 @@ document.getElementById('btn-apply-home-offset').addEventListener('click', async
     if (isNaN(v)) { log('Home offset value is invalid — enter a number first.', 'error'); return; }
     sendCommand(`SET:HOME_OFFSET=${v}`);          // 1. persist the offset in firmware
     log(`Offset saved (${v}°) → starting homing sequence…`);
-    await triggerHoming();                         // 2. clear E-stop if needed, then home
+    requestHoming();                               // 2. confirm if faulted, then home
 });
 
 document.getElementById('send-tuning-btn').addEventListener('click', () => {
-    const params = {
-        'SPEED_KP': 'input-speed-kp',
-        'SPEED_KI': 'input-speed-ki',
-        'SPEED_KD': 'input-speed-kd',
-        'K_VFF': 'input-k-vff',
-        'K_AFF': 'input-k-aff',
-        'K_TFF': 'input-k-tff',
-        /* SI-unit S-curve limits — firmware converts to RPM internally */
-        'V_MAX_RAD': 'input-vmax-rad',
-        'A_MAX_RAD': 'input-amax-rad',
-        'J_MAX_RAD': 'input-jmax-rad',
-        'POS_KP': 'input-pos-kp',
-        'POS_KI': 'input-pos-ki',
-        'POS_KD': 'input-pos-kd',
-        'MIN_PWM': 'input-min-pwm',
-        'HOME_SPEED': 'input-home-speed',
-        'HOME_OFFSET': 'input-home-offset',
-        'JOG_FINE': 'input-jog-fine',
-        'STEP_COARSE': 'input-step-coarse',
-        'STEP_FINE': 'input-step-fine',
-        'SHPWN': 'input-shaper-wn',
-        'SHPZT': 'input-shaper-zeta',
-    };
-    for (const [key, id] of Object.entries(params)) {
-        sendCommand(`SET:${key}=${document.getElementById(id).value}`);
+    for (const [key, id] of Object.entries(TUNING_FIELDS)) {
+        const el = document.getElementById(id);
+        if (el) sendCommand(`SET:${key}=${el.value}`);
     }
+    saveTuningDraft();
+    markTuningSynced();
 });
 
 document.querySelectorAll('.tuning-scroll-area input').forEach(el => {
     el.addEventListener('mousedown', () => tuningSynced = true);
+    // Autosave the draft and flag unsynced on every edit.
+    el.addEventListener('input', () => { saveTuningDraft(); markTuningUnsynced(); });
 });
+
+/* ---- Tuning persistence: autosave draft + named profiles ----------------
+ * Draft auto-saves on every edit and restores on load so ~20 fields survive a
+ * page reload. Profiles are named snapshots. Loading a profile/draft only fills
+ * the fields — nothing is sent to firmware until "Apply All Parameters". */
+function collectTuning() {
+    const out = {};
+    for (const [key, id] of Object.entries(TUNING_FIELDS)) {
+        const el = document.getElementById(id);
+        if (el) out[key] = el.value;
+    }
+    return out;
+}
+function applyTuningValues(obj) {
+    if (!obj) return;
+    for (const [key, id] of Object.entries(TUNING_FIELDS)) {
+        if (obj[key] === undefined) continue;
+        const el = document.getElementById(id);
+        if (el) el.value = obj[key];
+    }
+}
+function saveTuningDraft() {
+    try { localStorage.setItem(TUNING_DRAFT_KEY, JSON.stringify(collectTuning())); } catch (e) { }
+}
+function loadTuningDraft() {
+    try {
+        const d = JSON.parse(localStorage.getItem(TUNING_DRAFT_KEY) || 'null');
+        if (d) applyTuningValues(d);
+    } catch (e) { }
+}
+function markTuningUnsynced() {
+    const b = document.getElementById('send-tuning-btn');
+    if (b) b.classList.add('needs-apply');
+}
+function markTuningSynced() {
+    const b = document.getElementById('send-tuning-btn');
+    if (b) b.classList.remove('needs-apply');
+}
+
+function getProfiles() {
+    try { return JSON.parse(localStorage.getItem(TUNING_PROFILES_KEY) || '{}') || {}; }
+    catch (e) { return {}; }
+}
+function setProfiles(p) {
+    try { localStorage.setItem(TUNING_PROFILES_KEY, JSON.stringify(p)); } catch (e) { }
+}
+function refreshProfileSelect(selectName) {
+    const sel = document.getElementById('tuning-profile-select');
+    if (!sel) return;
+    const profiles = getProfiles();
+    const names = Object.keys(profiles).sort((a, b) => a.localeCompare(b));
+    sel.textContent = '';
+    const ph = document.createElement('option');
+    ph.value = '';
+    ph.textContent = names.length ? '— Select profile —' : '— No profiles —';
+    sel.appendChild(ph);
+    for (const n of names) {
+        const o = document.createElement('option');
+        o.value = n;
+        o.textContent = n;               // textContent → safe against HTML injection
+        sel.appendChild(o);
+    }
+    if (selectName && profiles[selectName]) sel.value = selectName;
+}
+
+(function setupTuningProfiles() {
+    const sel = document.getElementById('tuning-profile-select');
+    if (!sel) return;   // markup not present yet — skip wiring
+
+    refreshProfileSelect();
+
+    document.getElementById('btn-profile-save').addEventListener('click', () => {
+        const existing = sel.value;
+        const name = (prompt('Save tuning profile as:', existing || '') || '').trim();
+        if (!name) return;
+        const profiles = getProfiles();
+        if (profiles[name] && !confirm(`Overwrite profile "${name}"?`)) return;
+        profiles[name] = collectTuning();
+        setProfiles(profiles);
+        refreshProfileSelect(name);
+        log(`Tuning profile "${name}" saved.`);
+    });
+
+    document.getElementById('btn-profile-load').addEventListener('click', () => {
+        const name = sel.value;
+        if (!name) { log('Pick a profile to load first.', 'error'); return; }
+        const profiles = getProfiles();
+        if (!profiles[name]) { log(`Profile "${name}" not found.`, 'error'); return; }
+        applyTuningValues(profiles[name]);
+        tuningSynced = true;             // keep firmware sync from overwriting the load
+        saveTuningDraft();
+        markTuningUnsynced();            // loaded but not pushed — click Apply to send
+        log(`Profile "${name}" loaded into fields. Click "Apply All Parameters" to send.`);
+    });
+
+    document.getElementById('btn-profile-delete').addEventListener('click', () => {
+        const name = sel.value;
+        if (!name) { log('Pick a profile to delete first.', 'error'); return; }
+        if (!confirm(`Delete profile "${name}"?`)) return;
+        const profiles = getProfiles();
+        delete profiles[name];
+        setProfiles(profiles);
+        refreshProfileSelect();
+        log(`Profile "${name}" deleted.`);
+    });
+
+    document.getElementById('btn-profile-export').addEventListener('click', () => {
+        const data = JSON.stringify(getProfiles(), null, 2);
+        const blob = new Blob([data], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'robocook-tuning-profiles.json';
+        a.click();
+        URL.revokeObjectURL(url);
+    });
+
+    const fileInput = document.getElementById('profile-import-file');
+    document.getElementById('btn-profile-import').addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', e => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+            try {
+                const incoming = JSON.parse(reader.result);
+                if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming))
+                    throw new Error('not an object');
+                const profiles = getProfiles();
+                let n = 0;
+                for (const [name, vals] of Object.entries(incoming)) {
+                    if (vals && typeof vals === 'object') { profiles[name] = vals; n++; }
+                }
+                setProfiles(profiles);
+                refreshProfileSelect();
+                log(`Imported ${n} tuning profile(s).`);
+            } catch (err) {
+                log('Import failed — not a valid profiles JSON file.', 'error');
+            }
+        };
+        reader.readAsText(file);
+        fileInput.value = '';            // allow re-importing the same file
+    });
+})();
+
+// Restore the autosaved draft so a reload keeps the last-entered values.
+loadTuningDraft();
 
 // --- Simulation ---
 let simActive = false;
@@ -860,6 +1405,12 @@ document.getElementById('sim-btn').addEventListener('click', () => {
     btn.className = simActive ? "primary-btn" : "secondary-btn";
 
     if (simActive) {
+        state.connected = true;
+        state.connectTime = Date.now();
+        state.joystick = true;
+        state.current = 1.2;
+        state.reed_up = 1; state.reed_down = 0;
+        state.reed_close = 0; state.reed_open = 1;
         let t = 0;
         simInterval = setInterval(() => {
             t += 0.05;
@@ -868,7 +1419,12 @@ document.getElementById('sim-btn').addEventListener('click', () => {
             state.vel = Math.sin(t * 1.2) * 60;
             state.acc = Math.cos(t * 2) * 150;
             state.pwm = Math.abs(Math.sin(t)) * 100;
-            state.mode = "SIMULATION";
+            state.mode = "POSITION";
+            state.sysMode = "BASE";
+            state.current = 1.2 + Math.sin(t * 3) * 0.3;
+
+            // Simulate packet rate for heartbeat LINK tile
+            _hbPktCount++;
 
             updateUI();
             visualizer.update(state.currentPos, state.firmwareTarget);
@@ -878,6 +1434,9 @@ document.getElementById('sim-btn').addEventListener('click', () => {
         }, 50);
     } else {
         clearInterval(simInterval);
+        state.connected = false;
+        state.connectTime = null;
+        updateUI();
     }
 });
 
@@ -898,6 +1457,7 @@ let TUNE_VEL_THRESHOLD = 3.0;   // RPM — motor considered moving
 let TUNE_POS_SETTLE_DEG = 2.0;   // degrees — within target = settling
 let TUNE_VEL_SETTLE_RPM = 3.0;   // RPM — velocity settled
 let TUNE_SETTLE_MS = 3000;  // ms to confirm settled
+let TUNE_SETTLE_BAND_PCT = 2.0;  // % of step magnitude — textbook settling band (±2%)
 
 (function loadMetricsCfg() {
     try {
@@ -906,8 +1466,75 @@ let TUNE_SETTLE_MS = 3000;  // ms to confirm settled
         if (c.posSettle !== undefined) TUNE_POS_SETTLE_DEG = c.posSettle;
         if (c.velSettle !== undefined) TUNE_VEL_SETTLE_RPM = c.velSettle;
         if (c.settleMs !== undefined) TUNE_SETTLE_MS = c.settleMs;
+        if (c.settleBand !== undefined) TUNE_SETTLE_BAND_PCT = c.settleBand;
     } catch (e) { }
 })();
+
+/* ---- Control-response metric helpers ---------------------------------------
+ * Operate on a captured run {times[], vals[], vsets[], target}. The run is in
+ * "relative toward-target" space (start ≈ 0), exactly how tuningTick stores it.
+ * computeStepMetrics → 2nd-order step descriptors (best on the POSITION run).
+ * computeTracking    → trajectory-following error (best on the VELOCITY run,
+ *                       where vsets is the live S-curve velocity setpoint). */
+function computeStepMetrics(run, bandPct) {
+    if (!run || !run.vals || run.vals.length < 3) return null;
+    const t = run.times, y = run.vals, N = y.length;
+    const Tn = Math.abs(run.target);
+    if (Tn < 1e-6) return null;
+    const sgn = Math.sign(run.target) || 1;
+    const yn = y.map(v => v * sgn);          // normalise so target is positive
+
+    // Peak (in the toward-target direction) → peak time + % overshoot
+    let peakV = -Infinity, peakIdx = 0;
+    for (let i = 0; i < N; i++) if (yn[i] > peakV) { peakV = yn[i]; peakIdx = i; }
+    const peakTime = t[peakIdx];
+    const overshoot = Math.max(0, (peakV - Tn) / Tn * 100);
+
+    // Rise time: 10% → 90% of final target
+    let i10 = -1, i90 = -1;
+    for (let i = 0; i < N; i++) {
+        if (i10 < 0 && yn[i] >= 0.1 * Tn) i10 = i;
+        if (yn[i] >= 0.9 * Tn) { i90 = i; break; }
+    }
+    const riseTime = (i10 >= 0 && i90 >= 0) ? (t[i90] - t[i10]) : null;
+
+    // Steady-state value = mean of last 10% of samples
+    const tail = Math.max(0, Math.floor(N * 0.9));
+    let sum = 0, cnt = 0;
+    for (let i = tail; i < N; i++) { sum += yn[i]; cnt++; }
+    const yss = cnt ? sum / cnt : yn[N - 1];
+    const ess = Math.abs(Tn - yss);
+
+    // Settling time: last instant the signal is outside ±band of target
+    const band = (bandPct / 100) * Tn;
+    let settleIdx = -1;
+    for (let i = 0; i < N; i++) if (Math.abs(yn[i] - Tn) > band) settleIdx = i;
+    const settleTime = settleIdx < 0 ? 0 : t[Math.min(settleIdx + 1, N - 1)];
+
+    // 2nd-order descriptors from the overshoot (only valid if there IS overshoot)
+    let zeta = null, wn = null;
+    if (overshoot > 0.5) {
+        const lnos = Math.log(overshoot / 100);
+        zeta = -lnos / Math.sqrt(Math.PI * Math.PI + lnos * lnos);
+        if (peakTime > 0 && zeta < 1) wn = Math.PI / (peakTime * Math.sqrt(1 - zeta * zeta));
+    }
+    return { riseTime, peakTime, settleTime, overshoot, ess, zeta, wn };
+}
+
+function computeTracking(run) {
+    if (!run || !run.vals || run.vals.length < 2) return { rms: null, max: null };
+    let sq = 0, mx = 0, n = 0;
+    for (let i = 0; i < run.vals.length; i++) {
+        const e = run.vals[i] - (run.vsets[i] || 0);
+        sq += e * e; mx = Math.max(mx, Math.abs(e)); n++;
+    }
+    return { rms: Math.sqrt(sq / n), max: mx };
+}
+
+function fmtMetric(v, unit, dp) {
+    if (v === null || v === undefined || isNaN(v)) return '--';
+    return v.toFixed(dp === undefined ? 2 : dp) + (unit || '');
+}
 
 // Vel peak tracking
 let tuningVelPeak = 0;
@@ -1025,12 +1652,25 @@ function tuningFinalize(now) {
         if (lastOutIdx >= 0) velSettleSec = vTimes[lastOutIdx];
     }
 
+    // Rich metrics — compute BEFORE finalizeRun() nulls currentRun.
+    // Position run → 2nd-order step descriptors; velocity run → tracking error.
+    const stepM = computeStepMetrics(chartPos.currentRun, TUNE_SETTLE_BAND_PCT) || {};
+    const track = computeTracking(chartVel.currentRun);
+
     chartPos.finalizeRun(settleTimeSec, posOver);
     chartVel.finalizeRun(velSettleSec, velOver);
     chartAcc.finalizeRun(settleTimeSec, 0);
 
     tuningRunCount++;
-    const entry = { run: tuningRunCount, posSettle: settleTimeSec, posOver, velSettle: velSettleSec, velOver };
+    const entry = {
+        run: tuningRunCount,
+        posSettle: settleTimeSec, posOver, velSettle: velSettleSec, velOver,
+        // richer 2nd-order descriptors (position step) + tracking error (velocity)
+        rise: stepM.riseTime, peak: stepM.peakTime, ess: stepM.ess,
+        zeta: stepM.zeta, wn: stepM.wn,
+        trackRms: track.rms, trackMax: track.max,
+        band: TUNE_SETTLE_BAND_PCT,
+    };
     tuningMetricsHistory.push(entry);
     if (tuningMetricsHistory.length > 10) tuningMetricsHistory.shift();
 
@@ -1039,9 +1679,24 @@ function tuningFinalize(now) {
     document.getElementById('m-pos-over').innerText = posOver.toFixed(1) + '%';
     document.getElementById('m-vel-settle').innerText = velSettleSec.toFixed(2) + 's';
     document.getElementById('m-vel-over').innerText = velOver.toFixed(1) + '%';
+    setMetricText('m-pos-rise', fmtMetric(stepM.riseTime, 's', 2));
+    setMetricText('m-pos-peak', fmtMetric(stepM.peakTime, 's', 2));
+    setMetricText('m-pos-ess', fmtMetric(stepM.ess, '°', 2));
+    setMetricText('m-pos-zeta', fmtMetric(stepM.zeta, '', 3));
+    setMetricText('m-pos-wn', fmtMetric(stepM.wn, ' rad/s', 1));
+    setMetricText('m-vel-trms', fmtMetric(track.rms, ' rpm', 1));
+    setMetricText('m-vel-tmax', fmtMetric(track.max, ' rpm', 1));
     renderMetricsHistory();
+    if (typeof renderWorkspaceTargets === 'function') renderWorkspaceTargets();
 
-    setMetricsStatus(`Run #${tuningRunCount} done — Pos settle: ${settleTimeSec.toFixed(2)}s  OS: ${posOver.toFixed(1)}% — Trigger next move to capture again`, 'done');
+    const zStr = stepM.zeta != null ? `  ζ≈${stepM.zeta.toFixed(2)}` : '';
+    setMetricsStatus(`Run #${tuningRunCount} — settle ${settleTimeSec.toFixed(2)}s · OS ${posOver.toFixed(1)}%${zStr} · trackRMS ${fmtMetric(track.rms, '', 1)} rpm — trigger next move`, 'done');
+}
+
+/* Safe setter — new metric spans may not exist if the markup is older. */
+function setMetricText(id, text) {
+    const el = document.getElementById(id);
+    if (el) el.innerText = text;
 }
 
 function setMetricsStatus(msg, cls) {
@@ -1053,12 +1708,669 @@ function setMetricsStatus(msg, cls) {
 function renderMetricsHistory() {
     const tbody = document.getElementById('metrics-history-body');
     tbody.innerHTML = '';
+    const cell = (v, dp, suf) => (v === null || v === undefined || isNaN(v)) ? '--' : v.toFixed(dp) + (suf || '');
     [...tuningMetricsHistory].reverse().forEach(e => {
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${e.run}</td><td>${e.posSettle.toFixed(2)}</td><td>${e.posOver.toFixed(1)}%</td><td>${e.velSettle.toFixed(2)}</td><td>${e.velOver.toFixed(1)}%</td>`;
+        tr.innerHTML =
+            `<td>${e.run}</td>` +
+            `<td>${cell(e.posSettle, 2)}</td>` +
+            `<td>${cell(e.posOver, 1, '%')}</td>` +
+            `<td>${cell(e.rise, 2)}</td>` +
+            `<td>${cell(e.zeta, 3)}</td>` +
+            `<td>${cell(e.trackRms, 1)}</td>`;
         tbody.appendChild(tr);
     });
 }
+
+/* Export the full metrics history (all computed fields) as a CSV download. */
+function exportMetricsCsv() {
+    if (!tuningMetricsHistory.length) { log('No metric runs captured yet.', 'error'); return; }
+    const cols = ['run', 'band', 'posSettle', 'posOver', 'velSettle', 'velOver',
+        'rise', 'peak', 'ess', 'zeta', 'wn', 'trackRms', 'trackMax'];
+    const head = ['run', 'band_%', 'pos_settle_s', 'pos_OS_%', 'vel_settle_s', 'vel_OS_%',
+        'rise_s', 'peak_s', 'ess_deg', 'zeta', 'wn_rad_s', 'track_rms_rpm', 'track_max_rpm'];
+    const rows = tuningMetricsHistory.map(e =>
+        cols.map(c => (e[c] === null || e[c] === undefined || isNaN(e[c])) ? '' : e[c]).join(','));
+    const csv = head.join(',') + '\n' + rows.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `robocook-metrics-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    log(`Exported ${tuningMetricsHistory.length} metric run(s) to CSV.`);
+}
+
+/* ============================================================================
+ * Phase D — A/B before/after compare.
+ * Pin the latest captured run as A (baseline) then B (after a tuning change).
+ * Shows a delta table (with better/worse arrows) and overlays both response
+ * traces on the charts so improvement is visible and quantified.
+ * ==========================================================================*/
+let abSnapshot = { A: null, B: null };
+
+/* Each metric: key into the run entry, label, unit, decimals, and direction
+ * ('down' = lower is better, 'info' = no judgement, just show the delta). */
+const AB_METRICS = [
+    { key: 'posSettle', label: 'Pos settle', unit: 's', dp: 2, dir: 'down' },
+    { key: 'posOver', label: 'Pos overshoot', unit: '%', dp: 1, dir: 'down' },
+    { key: 'ess', label: 'Steady-state err', unit: '°', dp: 2, dir: 'down' },
+    { key: 'rise', label: 'Rise time', unit: 's', dp: 2, dir: 'down' },
+    { key: 'velSettle', label: 'Vel settle', unit: 's', dp: 2, dir: 'down' },
+    { key: 'velOver', label: 'Vel overshoot', unit: '%', dp: 1, dir: 'down' },
+    { key: 'trackRms', label: 'Track RMS', unit: ' rpm', dp: 1, dir: 'down' },
+    { key: 'trackMax', label: 'Track max', unit: ' rpm', dp: 1, dir: 'down' },
+    { key: 'zeta', label: 'ζ (damping)', unit: '', dp: 3, dir: 'info' },
+    { key: 'wn', label: 'ωₙ est', unit: ' rad/s', dp: 1, dir: 'info' },
+];
+
+function captureAB(slot) {
+    const m = latestRun();
+    if (!m) { log('No captured run yet — do a tuning move first, then Pin.', 'warn'); return; }
+    const lastTrace = ch => (ch.tuningRuns && ch.tuningRuns.length)
+        ? JSON.parse(JSON.stringify(ch.tuningRuns[ch.tuningRuns.length - 1])) : null;
+    abSnapshot[slot] = {
+        metrics: { ...m },
+        pos: lastTrace(chartPos),
+        vel: lastTrace(chartVel),
+    };
+    // Push the trace onto the charts as a persistent pinned overlay.
+    chartPos.pinnedRuns[slot] = abSnapshot[slot].pos;
+    chartVel.pinnedRuns[slot] = abSnapshot[slot].vel;
+    chartPos.draw(); chartVel.draw();
+    renderAB();
+    log(`Pinned run #${m.run} as ${slot} (${slot === 'A' ? 'before' : 'after'}).`);
+}
+
+function clearAB() {
+    abSnapshot = { A: null, B: null };
+    chartPos.pinnedRuns = { A: null, B: null };
+    chartVel.pinnedRuns = { A: null, B: null };
+    chartPos.draw(); chartVel.draw();
+    renderAB();
+}
+
+function renderAB() {
+    const tbody = document.getElementById('ab-table-body');
+    if (!tbody) return;
+    const A = abSnapshot.A && abSnapshot.A.metrics;
+    const B = abSnapshot.B && abSnapshot.B.metrics;
+    if (!A && !B) {
+        tbody.innerHTML = '<tr><td colspan="4" class="ab-empty">Capture a run, Pin A, tune, capture again, Pin B.</td></tr>';
+        return;
+    }
+    const fmt = (v, dp, unit) => (v === null || v === undefined || isNaN(v)) ? '--' : v.toFixed(dp) + (unit || '');
+    tbody.innerHTML = '';
+    AB_METRICS.forEach(mt => {
+        const a = A ? A[mt.key] : null;
+        const b = B ? B[mt.key] : null;
+        let deltaTxt = '--', deltaCls = '';
+        if (a !== null && a !== undefined && !isNaN(a) && b !== null && b !== undefined && !isNaN(b)) {
+            const d = b - a;
+            const arrow = d > 0 ? '▲' : (d < 0 ? '▼' : '·');
+            deltaTxt = `${arrow} ${Math.abs(d).toFixed(mt.dp)}${mt.unit || ''}`;
+            if (mt.dir === 'down' && Math.abs(d) > 1e-9) deltaCls = d < 0 ? 'ab-better' : 'ab-worse';
+        }
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+            `<td class="ab-metric">${mt.label}</td>` +
+            `<td>${fmt(a, mt.dp, mt.unit)}</td>` +
+            `<td>${fmt(b, mt.dp, mt.unit)}</td>` +
+            `<td class="${deltaCls}">${deltaTxt}</td>`;
+        tbody.appendChild(tr);
+    });
+}
+
+(function initAB() {
+    const a = document.getElementById('btn-ab-pin-a');
+    const b = document.getElementById('btn-ab-pin-b');
+    const c = document.getElementById('btn-ab-clear');
+    if (a) a.addEventListener('click', () => captureAB('A'));
+    if (b) b.addEventListener('click', () => captureAB('B'));
+    if (c) c.addEventListener('click', clearAB);
+})();
+
+/* ============================================================================
+ * Phase B — per-element Tuning Workspace
+ * A guide that focuses one control element at a time: shows the method, how to
+ * prove it, target metrics with pass/fail badges (editable thresholds), and a
+ * safe "set up test" button that puts the dashboard into the right state.
+ * It does NOT duplicate the parameter inputs — it points at the real fields.
+ * ==========================================================================*/
+
+function latestRun() {
+    return tuningMetricsHistory.length ? tuningMetricsHistory[tuningMetricsHistory.length - 1] : null;
+}
+/* Read the live Kalman RMSE-θ readout (degrees) straight from the DOM. */
+function kfRmseThetaVal() {
+    const el = document.getElementById('kf-rmse-theta');
+    if (!el) return null;
+    const v = parseFloat((el.textContent || '').replace(/[^0-9.eE+-]/g, ''));
+    return isNaN(v) ? null : v;
+}
+
+const TUNE_ELEMENTS = {
+    velocity: {
+        method: 'Bypass the position loop, drive a velocity sine/step. Raise Speed Kp for speed, add Ki to erase steady-state error, a touch of Kd to damp.',
+        prove: 'Velocity follows its setpoint with low overshoot and quick settle. Watch raw-vel vs setpoint on the VELOCITY chart.',
+        fields: ['input-speed-kp', 'input-speed-ki', 'input-speed-kd'],
+        test: 'velLoop',
+        hint: 'Sets Position Loop OFF → use the Sine generator (no motion until you press Start Sine).',
+        targets: [
+            { label: 'Overshoot', get: r => r ? r.velOver : null, cmp: 'lte', thr: 15, unit: '%', dp: 1, step: 1 },
+            { label: 'Settling', get: r => r ? r.velSettle : null, cmp: 'lte', thr: 0.5, unit: 's', dp: 2, step: 0.05 },
+        ],
+    },
+    feedforward: {
+        method: 'With the loop closed, add K_vff (velocity) and K_aff (accel) so the drive is pushed open-loop along the trajectory; K_tff cancels measured load torque.',
+        prove: 'Tracking error (actual − S-curve setpoint) shrinks. Track RMS is the headline number — lower is better.',
+        fields: ['input-k-vff', 'input-k-aff', 'input-k-tff'],
+        test: 'closedMove',
+        hint: 'Loop ON + Tuning mode. Command a Move and watch Track RMS fall as FF improves.',
+        targets: [
+            { label: 'Track RMS', get: r => r ? r.trackRms : null, cmp: 'lte', thr: 3, unit: ' rpm', dp: 1, step: 0.5 },
+            { label: 'Track max', get: r => r ? r.trackMax : null, cmp: 'lte', thr: 8, unit: ' rpm', dp: 1, step: 0.5 },
+        ],
+    },
+    position: {
+        method: 'Close the loop. Raise Pos Kp until the step is fast, add Kd to damp overshoot, small Ki to remove residual error. Inside-out: velocity loop first.',
+        prove: '2nd-order step looks clean: overshoot under target, e_ss near zero, settle quick. ζ is estimated from overshoot.',
+        fields: ['input-pos-kp', 'input-pos-ki', 'input-pos-kd'],
+        test: 'closedMove',
+        hint: 'Loop ON + Tuning mode. Command a step Move; metrics capture automatically.',
+        targets: [
+            { label: 'Overshoot', get: r => r ? r.posOver : null, cmp: 'lte', thr: 10, unit: '%', dp: 1, step: 1 },
+            { label: 'e_ss', get: r => r ? r.ess : null, cmp: 'lte', thr: 1.0, unit: '°', dp: 2, step: 0.1 },
+            { label: 'Settling', get: r => r ? r.posSettle : null, cmp: 'lte', thr: 0.8, unit: 's', dp: 2, step: 0.05 },
+        ],
+    },
+    trajectory: {
+        method: 'Shape the motion with v_max / a_max / j_max. Jerk-limited S-curves keep accel continuous so the arm does not jolt the structure.',
+        prove: 'Smooth move with little overshoot and low tracking error — the trajectory is feasible for the drive, not clipped.',
+        fields: ['input-vmax-rad', 'input-amax-rad', 'input-jmax-rad', 'input-min-pwm'],
+        test: 'closedMove',
+        hint: 'Loop ON + Tuning mode. Command a Move; if Track RMS spikes the profile is too aggressive.',
+        targets: [
+            { label: 'Track RMS', get: r => r ? r.trackRms : null, cmp: 'lte', thr: 3, unit: ' rpm', dp: 1, step: 0.5 },
+            { label: 'Overshoot', get: r => r ? r.posOver : null, cmp: 'lte', thr: 5, unit: '%', dp: 1, step: 1 },
+        ],
+    },
+    shaper: {
+        method: 'ZVD input shaper splits each command into impulses spaced by the half-period of the flexible mode (ωₙ, ζ) so the residual vibration cancels itself.',
+        prove: 'Turn the shaper ON and the residual overshoot/ringing after a move drops sharply versus OFF. Get ωₙ/ζ from a frequency sweep.',
+        fields: ['input-shaper-wn', 'input-shaper-zeta'],
+        test: 'closedMove',
+        hint: 'Loop ON + Tuning mode. Do a Move with Shaper OFF, then ON, and compare overshoot.',
+        targets: [
+            { label: 'Resid. OS', get: r => r ? r.posOver : null, cmp: 'lte', thr: 3, unit: '%', dp: 1, step: 0.5 },
+        ],
+    },
+    kalman: {
+        method: 'Tune Q/R in the Kalman section: large σ (Q) trusts the sensor, large R trusts the model. Balance so the estimate is smooth yet tracks changes.',
+        prove: 'RMSE θ̂ vs measurement stays small while ω̂ is far smoother than raw velocity. Innovation should look like white noise.',
+        fields: ['input-kf-q-theta', 'input-kf-q-omega', 'input-kf-q-tau', 'input-kf-q-i', 'input-kf-r'],
+        test: 'kalman',
+        hint: 'Enables the filter and reveals the Kalman card. Compare θ̂/ω̂ against Encoder + Model overlays.',
+        targets: [
+            { label: 'RMSE θ̂', get: () => kfRmseThetaVal(), cmp: 'lte', thr: 1.0, unit: '°', dp: 2, step: 0.1 },
+        ],
+    },
+};
+
+let wsCurrent = 'velocity';
+let tuneThr = {};
+(function loadTuneThr() {
+    try { tuneThr = JSON.parse(localStorage.getItem('tuneTargets') || '{}'); } catch (e) { tuneThr = {}; }
+})();
+function thrKey(el, i) { return el + '.' + i; }
+function getTuneThr(el, i, def) { const k = thrKey(el, i); return tuneThr[k] !== undefined ? tuneThr[k] : def; }
+function setTuneThr(el, i, v) {
+    if (isNaN(v)) return;
+    tuneThr[thrKey(el, i)] = v;
+    localStorage.setItem('tuneTargets', JSON.stringify(tuneThr));
+}
+
+function renderWorkspaceTargets() {
+    const cfg = TUNE_ELEMENTS[wsCurrent];
+    const wrap = document.getElementById('ws-targets');
+    if (!cfg || !wrap) return;
+    const run = latestRun();
+    wrap.innerHTML = '';
+    let anyData = false;
+    cfg.targets.forEach((t, i) => {
+        const val = t.get(run);
+        const thr = getTuneThr(wsCurrent, i, t.thr);
+        let cls = 'na';
+        if (val !== null && val !== undefined && !isNaN(val)) {
+            anyData = true;
+            cls = (t.cmp === 'gte' ? val >= thr : val <= thr) ? 'pass' : 'fail';
+        }
+        const div = document.createElement('div');
+        div.className = 'ws-target ' + cls;
+        const valTxt = (val === null || val === undefined || isNaN(val)) ? '--' : val.toFixed(t.dp) + (t.unit || '');
+        div.innerHTML =
+            `<span class="wt-label">${t.label}</span>` +
+            `<span class="wt-val">${valTxt}</span>` +
+            `<span class="wt-cmp">${t.cmp === 'gte' ? '≥' : '≤'}</span>` +
+            `<input class="wt-thr" type="number" step="${t.step || 0.1}" value="${thr}" title="Editable pass/fail target">`;
+        const inp = div.querySelector('.wt-thr');
+        inp.addEventListener('change', () => { setTuneThr(wsCurrent, i, parseFloat(inp.value)); renderWorkspaceTargets(); });
+        // Clicking the badge body (not the input) should not steal focus from the number field
+        wrap.appendChild(div);
+    });
+    return anyData;
+}
+
+function renderWorkspace(key) {
+    if (key) wsCurrent = key;
+    const cfg = TUNE_ELEMENTS[wsCurrent];
+    if (!cfg) return;
+    document.querySelectorAll('#ws-selector .ws-chip').forEach(c =>
+        c.classList.toggle('active', c.dataset.el === wsCurrent));
+    const mt = document.getElementById('ws-method-text');
+    const pt = document.getElementById('ws-prove-text');
+    const ht = document.getElementById('ws-hint');
+    if (mt) mt.textContent = cfg.method;
+    if (pt) pt.textContent = cfg.prove;
+    if (ht) ht.textContent = cfg.hint || '';
+    renderWorkspaceTargets();
+    // Panes are gone — sections are always visible (scrollable list)
+}
+
+/* Scroll to + pulse the real parameter fields for this element. */
+function workspaceFocus() {
+    const cfg = TUNE_ELEMENTS[wsCurrent];
+    if (!cfg || !cfg.fields) return;
+    let first = null;
+    cfg.fields.forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const grp = el.closest('.input-group') || el;
+        if (!first) first = grp;
+        grp.classList.add('ws-highlight');
+        setTimeout(() => grp.classList.remove('ws-highlight'), 2200);
+    });
+    if (first) first.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+/* Put the dashboard into the right (safe) state to test this element.
+ * No motion is ever commanded here — the user still triggers the move/sine. */
+function workspaceSetupTest() {
+    const cfg = TUNE_ELEMENTS[wsCurrent];
+    if (!cfg) return;
+    switch (cfg.test) {
+        case 'velLoop':
+            // Position loop OFF reveals the sine generator and forces Tuning mode.
+            if (posLoopEnabled) btnPosLoop.click();
+            else if (!tuningMode) setTuningMode(true);
+            log('Velocity-loop test ready — press Start Sine (or jog) to excite the loop.');
+            break;
+        case 'closedMove':
+            // Loop ON + Tuning mode so a step Move is captured by the metrics engine.
+            if (!posLoopEnabled) btnPosLoop.click();
+            if (!tuningMode) setTuningMode(true);
+            log('Closed-loop test ready — command a Move; metrics capture automatically.');
+            break;
+        case 'kalman':
+            // Enable the filter and make sure the Kalman card is visible.
+            if (!state.kfEnabled) document.getElementById('btn-kf-toggle').click();
+            if (posLoopEnabled && !tuningMode) setTuningMode(true);
+            document.querySelector('.kalman-card')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            log('Kalman test ready — filter enabled; compare θ̂/ω̂ with Encoder + Model overlays.');
+            break;
+    }
+    renderWorkspace();
+}
+
+(function initWorkspace() {
+    const sel = document.getElementById('ws-selector');
+    const scrollArea = document.getElementById('tl-scroll');
+    if (sel) {
+        sel.querySelectorAll('.ws-chip').forEach(chip => {
+            chip.addEventListener('click', () => {
+                const key = chip.dataset.el;
+                // Update active chip highlight
+                sel.querySelectorAll('.ws-chip').forEach(c => c.classList.toggle('active', c === chip));
+                wsCurrent = key;
+                // Scroll the tl-scroll area to the matching section
+                const sec = document.getElementById('tl-sec-' + key);
+                if (sec && scrollArea) {
+                    sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            });
+        });
+    }
+    const tb = document.getElementById('ws-test-btn');
+    if (tb) tb.addEventListener('click', workspaceSetupTest);
+    const gk = document.getElementById('btn-goto-kalman');
+    if (gk) gk.addEventListener('click', () => document.querySelector('.kalman-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+    // Freq Sweep — show on demand from Velocity / Shaper panes, hide via ×
+    const showSweep = () => {
+        const card = document.getElementById('freq-sweep-card');
+        if (card) { card.style.display = ''; card.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+    };
+    const hideSweep = () => {
+        const card = document.getElementById('freq-sweep-card');
+        if (card) card.style.display = 'none';
+    };
+    document.getElementById('btn-goto-sweep-vel')?.addEventListener('click', showSweep);
+    document.getElementById('btn-goto-sweep-shaper')?.addEventListener('click', showSweep);
+    document.getElementById('btn-sweep-close')?.addEventListener('click', hideSweep);
+    renderWorkspace('velocity');
+})();
+
+/* ============================================================================
+ * Phase C — Frequency Sweep (mini-Bode) for system identification.
+ * Drives the firmware velocity-loop sine at a log-spaced set of frequencies,
+ * and at each one measures the steady-state gain & phase of the actual velocity
+ * (state.vel) relative to its commanded setpoint (state.velSetpoint) using a
+ * single-bin DFT (Goertzel). From the magnitude curve we read the closed-loop
+ * bandwidth (-3 dB) and any mechanical resonance peak ωₙ, which feeds the ZVD
+ * input shaper. No motion command is issued except the sine the user opted into.
+ * ==========================================================================*/
+const bode = {
+    running: false,
+    abort: false,
+    results: [],   // [{ f, gainLin, gainDb, phaseDeg }]
+    wnRad: null,
+    zeta: null,
+};
+
+function bodeLogFreqs(fmin, fmax, n) {
+    const a = Math.log10(fmin), b = Math.log10(fmax);
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(Math.pow(10, a + (b - a) * (n === 1 ? 0 : i / (n - 1))));
+    return out;
+}
+
+/* Single-bin DFT: amplitude & phase of a sampled signal at frequency f (Hz).
+ * times[] in seconds. For s(t)=A·cos(2πft+φ):  Re→A cosφ, Im→−A sinφ. */
+function bodeDftBin(times, vals, f) {
+    let re = 0, im = 0;
+    const N = vals.length;
+    if (!N) return { amp: 0, phase: 0 };
+    for (let i = 0; i < N; i++) {
+        const th = 2 * Math.PI * f * times[i];
+        re += vals[i] * Math.cos(th);
+        im += vals[i] * Math.sin(th);
+    }
+    re *= 2 / N; im *= 2 / N;
+    return { amp: Math.hypot(re, im), phase: Math.atan2(-im, re) };
+}
+
+const bodeSleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* Sample the live velocity + setpoint for durationMs at ~stepMs spacing. */
+async function bodeCapture(durationMs, stepMs = 20) {
+    const t0 = performance.now();
+    const times = [], vel = [], vset = [];
+    while (performance.now() - t0 < durationMs) {
+        if (bode.abort) break;
+        times.push((performance.now() - t0) / 1000);
+        vel.push(state.vel || 0);
+        vset.push(state.velSetpoint || 0);
+        await bodeSleep(stepMs);
+    }
+    return { times, vel, vset };
+}
+
+function setBodeStatus(msg, cls) {
+    const el = document.getElementById('bode-status');
+    if (el) { el.textContent = msg; el.className = 'bode-status ' + (cls || ''); }
+}
+function setBodeBtn(running) {
+    const b = document.getElementById('btn-bode-start');
+    if (!b) return;
+    b.textContent = running ? '■ Stop' : '▶ Start';
+    b.classList.toggle('danger', running);
+}
+
+async function runBodeSweep() {
+    if (bode.running) { bode.abort = true; bode.running = false; return; }
+    if (!state.connected) { log('Connect the robot before a frequency sweep.', 'warn'); return; }
+
+    const fmin = parseFloat(document.getElementById('input-bode-fmin').value) || 0.3;
+    const fmax = parseFloat(document.getElementById('input-bode-fmax').value) || 8;
+    const n = Math.max(3, Math.min(40, parseInt(document.getElementById('input-bode-points').value) || 14));
+    const amp = parseFloat(document.getElementById('input-bode-amp').value) || 20;
+    const cyc = Math.max(2, parseInt(document.getElementById('input-bode-cycles').value) || 6);
+    if (fmax <= fmin) { log('Bode: f max must be greater than f min.', 'warn'); return; }
+
+    // The sine generator only runs with the position loop bypassed.
+    if (posLoopEnabled) {
+        btnPosLoop.click();
+        await bodeSleep(300);
+    }
+
+    bode.running = true; bode.abort = false; bode.results = [];
+    bode.wnRad = null; bode.zeta = null;
+    setBodeBtn(true);
+    document.getElementById('btn-bode-to-shaper').disabled = true;
+    const freqs = bodeLogFreqs(fmin, fmax, n);
+    sendCommand(`SET:SINE_AMP=${amp}`);
+
+    for (let i = 0; i < freqs.length; i++) {
+        if (bode.abort) break;
+        const f = freqs[i];
+        const period = 1000 / f;
+        setBodeStatus(`Point ${i + 1}/${n} — ${f.toFixed(2)} Hz`, 'busy');
+        sendCommand(`SET:SINE_FREQ=${f}`);
+        sendCommand('SET:SINE_EN=1');
+        // Let the loop reach steady state: ≥3 cycles, ≥1.2 s.
+        await bodeSleep(Math.max(1200, 3 * period));
+        if (bode.abort) break;
+        // Capture an integer number of cycles for a clean DFT bin.
+        const cap = await bodeCapture(Math.max(1500, cyc * period));
+        const sIn = bodeDftBin(cap.times, cap.vset, f);
+        const sOut = bodeDftBin(cap.times, cap.vel, f);
+        if (sIn.amp > 0.5) {           // ignore points with no real excitation
+            const gainLin = sOut.amp / sIn.amp;
+            let ph = (sOut.phase - sIn.phase) * 180 / Math.PI;
+            while (ph > 180) ph -= 360;
+            while (ph < -180) ph += 360;
+            bode.results.push({ f, gainLin, gainDb: 20 * Math.log10(Math.max(1e-6, gainLin)), phaseDeg: ph });
+            drawBode();
+        }
+    }
+
+    sendCommand('SET:SINE_EN=0');
+    bode.running = false;
+    setBodeBtn(false);
+    if (bode.abort) { setBodeStatus('Sweep stopped.', ''); return; }
+    finishBode();
+}
+
+/* After the sweep: find -3 dB bandwidth and the resonance peak, estimate ζ. */
+function finishBode() {
+    const R = bode.results;
+    // Reveal the results panel now that we have data
+    const fsResults = document.getElementById('fs-results');
+    if (fsResults) fsResults.classList.remove('hidden');
+    if (R.length < 3) { setBodeStatus('Sweep done — too few valid points.', ''); return; }
+
+    // Low-frequency reference gain (mean of the lowest two points).
+    const g0Db = (R[0].gainDb + R[1].gainDb) / 2;
+
+    // Resonance: the maximum-gain point, if it rises meaningfully above g0.
+    let peak = R[0];
+    R.forEach(p => { if (p.gainDb > peak.gainDb) peak = p; });
+    const hasPeak = peak.gainDb > g0Db + 0.5;
+
+    // Bandwidth: first crossing below g0 - 3 dB after the peak.
+    const startIdx = R.indexOf(peak);
+    let bwHz = null;
+    for (let i = Math.max(1, startIdx); i < R.length; i++) {
+        if (R[i].gainDb <= g0Db - 3) {
+            // linear-interpolate in log-freq for a smoother estimate
+            const a = R[i - 1], b = R[i];
+            const t = (g0Db - 3 - a.gainDb) / (b.gainDb - a.gainDb);
+            const lf = Math.log10(a.f) + t * (Math.log10(b.f) - Math.log10(a.f));
+            bwHz = Math.pow(10, lf);
+            break;
+        }
+    }
+
+    const bwEl = document.getElementById('bode-bw');
+    const wnEl = document.getElementById('bode-wn');
+    const pkEl = document.getElementById('bode-peak');
+    const zEl = document.getElementById('bode-zeta');
+
+    bwEl.textContent = bwHz ? `${bwHz.toFixed(2)} Hz · ${(2 * Math.PI * bwHz).toFixed(1)} rad/s` : 'not reached';
+
+    if (hasPeak) {
+        // Resonant-peak magnitude ratio Mr = peak/low-freq gain (linear).
+        const Mr = peak.gainLin / Math.pow(10, g0Db / 20);
+        // For a 2nd-order system Mr = 1/(2ζ√(1−ζ²)); for light damping ζ ≈ 1/(2·Mr).
+        let zeta = 1 / (2 * Mr);
+        if (zeta > 0 && zeta < 0.707) {
+            // refine: invert Mr = 1/(2ζ√(1−ζ²)) once
+            const z2 = 1 / (2 * Mr);
+            zeta = z2;  // good first-order estimate for sharp peaks
+        }
+        // ωr ≈ ωn√(1−2ζ²) → ωn ≈ ωr/√(1−2ζ²)
+        const wr = 2 * Math.PI * peak.f;
+        const corr = Math.sqrt(Math.max(0.0001, 1 - 2 * zeta * zeta));
+        bode.wnRad = wr / corr;
+        bode.zeta = zeta;
+        wnEl.textContent = `${peak.f.toFixed(2)} Hz · ${bode.wnRad.toFixed(1)} rad/s`;
+        pkEl.textContent = `${peak.gainDb.toFixed(1)} dB`;
+        zEl.textContent = zeta.toFixed(3);
+        document.getElementById('btn-bode-to-shaper').disabled = false;
+        setBodeStatus(`Done — resonance ${peak.f.toFixed(2)} Hz, ζ≈${zeta.toFixed(3)}. Send ωₙ to the shaper.`, 'done');
+    } else {
+        wnEl.textContent = 'none found';
+        pkEl.textContent = `${peak.gainDb.toFixed(1)} dB`;
+        zEl.textContent = '--';
+        setBodeStatus('Done — no resonance peak (well damped). Bandwidth shown above.', 'done');
+    }
+}
+
+/* Draw both Bode panels (magnitude + phase) on their canvases. */
+function drawBode() {
+    // Show results panel as soon as any data exists
+    if (bode.results.length > 0) {
+        const fsResults = document.getElementById('fs-results');
+        if (fsResults) fsResults.classList.remove('hidden');
+    }
+    drawBodePanel('bode-mag', r => r.gainDb, 'dB', true);
+    drawBodePanel('bode-phase', r => r.phaseDeg, '°', false);
+}
+
+function drawBodePanel(canvasId, accessor, unit, isMag) {
+    const cv = document.getElementById(canvasId);
+    if (!cv) return;
+    const w = cv.clientWidth || 300, h = cv.clientHeight || 90;
+    if (cv.width !== w) cv.width = w;
+    if (cv.height !== h) cv.height = h;
+    const ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, w, h);
+    const R = bode.results;
+    const padL = 34, padR = 8, padT = 8, padB = 16;
+    const x0 = padL, x1 = w - padR, y0 = padT, y1 = h - padB;
+
+    // Axes background
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    if (R.length < 1) {
+        ctx.fillStyle = 'rgba(255,255,255,0.3)';
+        ctx.font = '10px monospace';
+        ctx.fillText('awaiting sweep…', x0 + 8, (y0 + y1) / 2);
+        return;
+    }
+
+    const fmin = parseFloat(document.getElementById('input-bode-fmin').value) || R[0].f;
+    const fmax = parseFloat(document.getElementById('input-bode-fmax').value) || R[R.length - 1].f;
+    const lxMin = Math.log10(fmin), lxMax = Math.log10(fmax);
+    const vals = R.map(accessor);
+    let vMin = Math.min(...vals), vMax = Math.max(...vals);
+    if (isMag) { vMin = Math.min(vMin, -3); vMax = Math.max(vMax, 3); }
+    else { vMin = Math.min(vMin, -190); vMax = Math.max(vMax, 10); }
+    if (vMax - vMin < 1e-6) { vMax += 1; vMin -= 1; }
+    const pad = (vMax - vMin) * 0.1;
+    vMin -= pad; vMax += pad;
+
+    const xOf = f => x0 + (Math.log10(f) - lxMin) / (lxMax - lxMin) * (x1 - x0);
+    const yOf = v => y1 - (v - vMin) / (vMax - vMin) * (y1 - y0);
+
+    // Y gridlines / labels
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.font = '9px monospace';
+    const ticks = 4;
+    for (let i = 0; i <= ticks; i++) {
+        const v = vMin + (vMax - vMin) * i / ticks;
+        const y = yOf(v);
+        ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+        ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
+        ctx.fillText(v.toFixed(0), 2, y + 3);
+    }
+    // Decade gridlines on the log-x axis
+    for (let d = Math.ceil(lxMin); d <= Math.floor(lxMax); d++) {
+        const x = xOf(Math.pow(10, d));
+        ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+        ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke();
+        ctx.fillText(`${Math.pow(10, d)}`, x - 4, y1 + 11);
+    }
+
+    // Reference lines: -3 dB band (mag) or -90° (phase)
+    ctx.setLineDash([3, 3]);
+    if (isMag) {
+        const g0 = (R.length > 1 ? (accessor(R[0]) + accessor(R[1])) / 2 : accessor(R[0])) - 3;
+        ctx.strokeStyle = 'rgba(244,255,77,0.4)';
+        ctx.beginPath(); ctx.moveTo(x0, yOf(g0)); ctx.lineTo(x1, yOf(g0)); ctx.stroke();
+    } else {
+        ctx.strokeStyle = 'rgba(244,255,77,0.4)';
+        ctx.beginPath(); ctx.moveTo(x0, yOf(-90)); ctx.lineTo(x1, yOf(-90)); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
+    // Data trace
+    ctx.strokeStyle = isMag ? '#00f2ff' : '#ff00ff';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    R.forEach((r, i) => {
+        const x = xOf(r.f), y = yOf(accessor(r));
+        i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+    // Data points
+    ctx.fillStyle = isMag ? '#00f2ff' : '#ff00ff';
+    R.forEach(r => {
+        const x = xOf(r.f), y = yOf(accessor(r));
+        ctx.beginPath(); ctx.arc(x, y, 2, 0, 2 * Math.PI); ctx.fill();
+    });
+
+    // Mark the resonance peak on the magnitude panel
+    if (isMag && bode.wnRad) {
+        const fRes = bode.wnRad / (2 * Math.PI);
+        const x = xOf(fRes);
+        ctx.strokeStyle = 'rgba(57,255,20,0.7)';
+        ctx.setLineDash([2, 2]);
+        ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke();
+        ctx.setLineDash([]);
+    }
+}
+
+(function initBode() {
+    const start = document.getElementById('btn-bode-start');
+    if (start) start.addEventListener('click', runBodeSweep);
+    const toShaper = document.getElementById('btn-bode-to-shaper');
+    if (toShaper) toShaper.addEventListener('click', () => {
+        if (!bode.wnRad) return;
+        const wnEl = document.getElementById('input-shaper-wn');
+        const zEl = document.getElementById('input-shaper-zeta');
+        wnEl.value = bode.wnRad.toFixed(2);
+        zEl.value = Math.min(0.999, Math.max(0, bode.zeta || 0.04)).toFixed(3);
+        // Fire change handlers so the values are pushed to the firmware.
+        wnEl.dispatchEvent(new Event('change'));
+        zEl.dispatchEvent(new Event('change'));
+        if (typeof updateShaperDelayInfo === 'function') updateShaperDelayInfo();
+        log(`Shaper set from sweep: ωₙ=${bode.wnRad.toFixed(2)} rad/s, ζ=${(bode.zeta || 0).toFixed(3)}`);
+    });
+    // Redraw on resize so the canvases stay crisp.
+    window.addEventListener('resize', () => { if (bode.results.length) drawBode(); });
+})();
 
 // Show/hide individual telemetry charts
 const CHART_TOGGLES = [
@@ -1217,57 +2529,29 @@ document.getElementById('btn-kf-sanity').addEventListener('click', () => {
     }
 });
 
-document.getElementById('btn-kf-apply-noise').addEventListener('click', () => {
-    const send = (key, id) => {
-        const v = parseFloat(document.getElementById(id).value);
-        if (!isNaN(v)) sendCommand(`SET:${key}=${v}`);
-    };
-    send('KF_Q_THETA', 'input-kf-q-theta');
-    send('KF_Q_OMEGA', 'input-kf-q-omega');
-    send('KF_Q_TAU', 'input-kf-q-tau');
-    send('KF_Q_I', 'input-kf-q-i');
-    send('KF_R', 'input-kf-r');
-    log('Kalman noise parameters applied');
-});
 
-// --- Gripper Config ---
-const gripperConfig = {
-    enabled: false,
-    mode: 'sim',
-    delays: { open: 600, close: 600, up: 600, down: 600 },
-    realTimeout: 5000,
-};
+// --- Path Sequencer: gripper feedback mode ---
+// Reed Switch (sensor) → each gripper step waits for the matching reed switch
+//                        (RSUP/RSDN/RSCL/RSOP telemetry) to confirm the move.
+// Timed Delay (delay)  → each gripper step + the post-move settle wait a fixed
+//                        delay (the "Delay (ms)" input).
+const REED_TIMEOUT_MS = 3000;  // matches firmware REED_SW_TIMEOUT_MS
 
-document.getElementById('chk-use-gripper').addEventListener('change', e => {
-    gripperConfig.enabled = e.target.checked;
-});
+function seqFeedbackMode() {
+    return document.getElementById('select-feedback-mode')?.value || 'delay';
+}
+function seqDelayMs() {
+    const v = parseFloat(document.getElementById('input-seq-delay')?.value);
+    return (Number.isFinite(v) && v >= 0) ? v : 2000;
+}
 
-document.getElementById('btn-gripper-settings').addEventListener('click', () => {
-    document.getElementById('gripper-modal').classList.remove('hidden');
-});
-document.getElementById('btn-close-gripper-modal').addEventListener('click', () => {
-    document.getElementById('gripper-modal').classList.add('hidden');
-    gripperConfig.delays.open = parseInt(document.getElementById('delay-open').value) || 600;
-    gripperConfig.delays.close = parseInt(document.getElementById('delay-close').value) || 600;
-    gripperConfig.delays.up = parseInt(document.getElementById('delay-up').value) || 600;
-    gripperConfig.delays.down = parseInt(document.getElementById('delay-down').value) || 600;
-});
-document.getElementById('gripper-modal').addEventListener('click', e => {
-    if (e.target.id === 'gripper-modal') {
-        e.target.classList.add('hidden');
-        gripperConfig.delays.open = parseInt(document.getElementById('delay-open').value) || 600;
-        gripperConfig.delays.close = parseInt(document.getElementById('delay-close').value) || 600;
-        gripperConfig.delays.up = parseInt(document.getElementById('delay-up').value) || 600;
-        gripperConfig.delays.down = parseInt(document.getElementById('delay-down').value) || 600;
-    }
-});
-document.querySelectorAll('input[name="gripper-mode"]').forEach(radio => {
-    radio.addEventListener('change', e => {
-        gripperConfig.mode = e.target.value;
-        document.getElementById('sim-delays-section').style.display = gripperConfig.mode === 'sim' ? '' : 'none';
-        document.getElementById('real-sensor-info').style.display = gripperConfig.mode === 'real' ? '' : 'none';
-    });
-});
+// The delay input only applies in Timed Delay mode — hide it for Reed Switch.
+function updateFeedbackModeUI() {
+    const c = document.getElementById('seq-delay-container');
+    if (c) c.style.display = seqFeedbackMode() === 'delay' ? '' : 'none';
+}
+document.getElementById('select-feedback-mode')?.addEventListener('change', updateFeedbackModeUI);
+updateFeedbackModeUI();
 
 // --- Gripper Sequence Helpers ---
 function msDelay(ms) {
@@ -1287,129 +2571,129 @@ function waitForGripperState(predicate, timeout) {
     });
 }
 
-async function gripperStep(cmd, confirmFn, simMs) {
+async function gripperStep(cmd, confirmFn) {
     sendCommand(cmd);
-    if (gripperConfig.mode === 'real') {
-        await waitForGripperState(confirmFn, gripperConfig.realTimeout);
+    if (seqFeedbackMode() === 'sensor') {
+        await waitForGripperState(confirmFn, REED_TIMEOUT_MS);
     } else {
-        await msDelay(simMs);
+        await msDelay(seqDelayMs());
     }
-    gripperVisualizer.update(!!state.gripper_ud, !state.gripper_co);
 }
 
 async function runGripperPick() {
-    await gripperStep('CMD:CLAW_OPEN',  () => !state.gripper_co, gripperConfig.delays.open);
-    await gripperStep('CMD:GRIP_DN',    () => state.gripper_ud,  gripperConfig.delays.down);
-    await gripperStep('CMD:CLAW_CLOSE', () => state.gripper_co,  gripperConfig.delays.close);
-    await gripperStep('CMD:GRIP_UP',    () => !state.gripper_ud, gripperConfig.delays.up);
+    await gripperStep('CMD:CLAW_OPEN',  () => !state.gripper_co);
+    await gripperStep('CMD:GRIP_DN',    () => state.gripper_ud);
+    await gripperStep('CMD:CLAW_CLOSE', () => state.gripper_co);
+    await gripperStep('CMD:GRIP_UP',    () => !state.gripper_ud);
 }
 
 async function runGripperPlace() {
-    await gripperStep('CMD:GRIP_DN',    () => state.gripper_ud,  gripperConfig.delays.down);
-    await gripperStep('CMD:CLAW_OPEN',  () => !state.gripper_co, gripperConfig.delays.open);
-    await gripperStep('CMD:GRIP_UP',    () => !state.gripper_ud, gripperConfig.delays.up);
-    await gripperStep('CMD:CLAW_CLOSE', () => state.gripper_co,  gripperConfig.delays.close);
+    await gripperStep('CMD:GRIP_DN',    () => state.gripper_ud);
+    await gripperStep('CMD:CLAW_OPEN',  () => !state.gripper_co);
+    await gripperStep('CMD:GRIP_UP',    () => !state.gripper_ud);
+    await gripperStep('CMD:CLAW_CLOSE', () => state.gripper_co);
 }
 
-// --- Path Sequencer (Live mode) ---
+// --- Path Sequencer ---
+// Each waypoint is { angle, action } where action ∈ 'move' | 'pick' | 'place'.
+// '+' adds a move-only stop; PICK / PLACE add a stop that runs the gripper
+// pick or place routine once the arm has reached the angle.
 const waypointList = document.getElementById('waypoint-list');
 const btnRunSeq = document.getElementById('btn-run-seq');
-const btnLoopSeq = document.getElementById('btn-loop-seq');
 const inputNewWaypoint = document.getElementById('input-new-waypoint');
 
-document.getElementById('btn-add-waypoint').addEventListener('click', () => {
+function addWaypoint(action) {
     const val = parseFloat(inputNewWaypoint.value);
-    if (!isNaN(val)) {
-        state.waypoints.push(val);
-        inputNewWaypoint.value = "";
-        renderWaypoints();
-    }
-});
+    if (isNaN(val)) { log('Path: enter an angle before adding a waypoint.', 'error'); return; }
+    state.waypoints.push({ angle: val, action });
+    inputNewWaypoint.value = '';
+    renderWaypoints();
+}
+document.getElementById('btn-add-wp').addEventListener('click',    () => addWaypoint('move'));
+document.getElementById('btn-add-pick').addEventListener('click',  () => addWaypoint('pick'));
+document.getElementById('btn-add-place').addEventListener('click', () => addWaypoint('place'));
+
+function stopSequence() {
+    state.seqActive = false;
+    state.currentWaypointIdx = -1;
+    btnRunSeq.innerText = 'Run Sequence';
+    btnRunSeq.className = 'toggle-btn';
+    renderWaypoints();
+}
 
 btnRunSeq.addEventListener('click', () => {
-    state.seqActive = !state.seqActive;
-    btnRunSeq.innerText = state.seqActive ? 'Stop' : 'Run';
-    btnRunSeq.className = 'toggle-btn ' + (state.seqActive ? 'active' : '');
-    if (state.seqActive) {
-        state.currentWaypointIdx = 0;
-        state.gripperHasRod = false;  // start each Run with empty gripper
-        executeNextWaypoint();
-    }
+    if (state.seqActive) { stopSequence(); return; }
+    if (state.waypoints.length === 0) { log('Path: add at least one waypoint first.', 'error'); return; }
+    state.seqActive = true;
+    state.currentWaypointIdx = 0;
+    btnRunSeq.innerText = 'Stop';
+    btnRunSeq.className = 'toggle-btn active';
+    executeNextWaypoint();
 });
 
-btnLoopSeq.addEventListener('click', () => {
-    state.seqLoop = !state.seqLoop;
-    btnLoopSeq.className = 'toggle-btn ' + (state.seqLoop ? 'active' : '');
+document.getElementById('btn-clear-seq').addEventListener('click', () => {
+    state.waypoints = [];
+    stopSequence();
 });
 
 function renderWaypoints() {
     waypointList.innerHTML = '';
     state.waypoints.forEach((wp, i) => {
         const li = document.createElement('li');
-        if (i === state.currentWaypointIdx) li.className = 'active';
-        li.innerHTML = `<span>${wp}°</span><span class="remove-waypoint" onclick="removeWaypoint(${i})">×</span>`;
+        li.className = 'waypoint-item' + (i === state.currentWaypointIdx ? ' active' : '');
+        const tag = wp.action === 'pick'  ? '<span class="action-tag pick">PICK</span>'
+                  : wp.action === 'place' ? '<span class="action-tag place">PLACE</span>'
+                  : '';
+        li.innerHTML =
+            `<span class="wp-index">${i + 1}</span>${tag}` +
+            `<span class="wp-pos">${wp.angle}°</span>` +
+            `<span class="remove-waypoint" onclick="removeWaypoint(${i})">×</span>`;
         waypointList.appendChild(li);
     });
 }
 
 window.removeWaypoint = (i) => { state.waypoints.splice(i, 1); renderWaypoints(); };
 
+// Resolve once the arm is within tolerance of targetDeg and has settled, or
+// after `timeout` ms so an un-homed / E-stopped arm (firmware silently refuses
+// SET:TARGET) doesn't hang the sequence forever. Returns true if it arrived.
+const ARRIVE_TOL_DEG    = 2.0;
+const ARRIVE_TIMEOUT_MS = 8000;
+function waitForArrival(targetDeg, timeout = ARRIVE_TIMEOUT_MS) {
+    return new Promise(resolve => {
+        const t0 = Date.now();
+        const iv = setInterval(() => {
+            const settled = Math.abs(state.currentPos - targetDeg) <= ARRIVE_TOL_DEG
+                            && Math.abs(state.vel) < 5;
+            if (!state.seqActive || settled) { clearInterval(iv); resolve(true);  return; }
+            if (Date.now() - t0 >= timeout)  { clearInterval(iv); resolve(false); return; }
+        }, 50);
+    });
+}
+
 async function executeNextWaypoint() {
     if (!state.seqActive || state.waypoints.length === 0) return;
-    const target = state.waypoints[state.currentWaypointIdx];
-    sendCommand(`SET:TARGET=${target}`);
+    const wp = state.waypoints[state.currentWaypointIdx];
+    sendCommand(`SET:TARGET=${wp.angle}`);
     renderWaypoints();
 
-    const rawDelay = parseFloat(document.getElementById('input-seq-delay').value);
-    const movDelay = (Number.isFinite(rawDelay) && rawDelay >= 0) ? rawDelay * 1000 : 2000;
-    await msDelay(movDelay);
+    // Wait for the arm to actually reach + settle at the target before the
+    // gripper acts — not a blind delay. Warns (instead of flying past) if the
+    // arm never gets there, which usually means it isn't Self-Tested + Homed.
+    const arrived = await waitForArrival(wp.angle);
     if (!state.seqActive) return;
+    if (!arrived) log(`Path: arm never reached ${wp.angle}° — run Self-Test + Home (motion is gated until then).`, 'error');
 
-    if (gripperConfig.enabled) {
-        // Single-rod shuttle. Action at each waypoint depends on whether the
-        // gripper is currently holding the rod, not on waypoint index — so it
-        // works across loops without dropping the rod.
-        //
-        //   empty gripper  → PICK (grab here)
-        //   holding rod, last waypoint, no loop → PLACE (final drop)
-        //   holding rod, otherwise              → PLACE then PICK
-        const idx = state.currentWaypointIdx;
-        const isLast = (idx === state.waypoints.length - 1);
-
-        if (!state.gripperHasRod) {
-            await runGripperPick();
-            state.gripperHasRod = true;
-        } else if (isLast && !state.seqLoop) {
-            await runGripperPlace();
-            state.gripperHasRod = false;
-        } else {
-            await runGripperPlace();
-            state.gripperHasRod = false;
-            if (!state.seqActive) return;
-            await runGripperPick();
-            state.gripperHasRod = true;
-        }
-    }
+    if (wp.action === 'pick')       await runGripperPick();
+    else if (wp.action === 'place') await runGripperPlace();
     if (!state.seqActive) return;
 
     state.currentWaypointIdx++;
-    if (state.currentWaypointIdx >= state.waypoints.length) {
-        if (state.seqLoop) {
-            state.currentWaypointIdx = 0;
-        } else {
-            state.seqActive = false;
-            state.currentWaypointIdx = -1;
-            btnRunSeq.innerText = 'Run';
-            btnRunSeq.className = 'toggle-btn';
-            renderWaypoints();
-            return;
-        }
-    }
+    if (state.currentWaypointIdx >= state.waypoints.length) { stopSequence(); return; }
     executeNextWaypoint();
 }
 
 // Auto-arm capture on ghost-mode rising edge
-let _lastGhost = false;
 function checkGhostStart() {
     if (tuningMode && !_lastGhost && state.ghost && tuningState === 'IDLE') {
         tuningArmRun();
@@ -1464,4 +2748,231 @@ window.addEventListener('DOMContentLoaded', async () => {
     }
 });
 
+document.addEventListener('pointerdown', e => {
+    if (e.target.matches('input[type="number"], input[type="text"]')) {
+        const el = e.target;
+        requestAnimationFrame(() => el.select());
+    }
+});
+
 updateUI();
+
+/* ============================================================================
+ * Chart freezing toggle
+ * ========================================================================== */
+(function setupChartFreezing() {
+    const freezeBtn = document.getElementById('btn-freeze-charts');
+    if (!freezeBtn) return;
+
+    const charts = [chartPos, chartVel, chartAcc];
+    let isFrozen = false;
+
+    freezeBtn.addEventListener('click', () => {
+        isFrozen = !isFrozen;
+        
+        charts.forEach(c => c.paused = isFrozen);
+        
+        if (isFrozen) {
+            freezeBtn.innerText = 'Resume';
+            freezeBtn.classList.add('active');
+        } else {
+            freezeBtn.innerText = 'Freeze';
+            freezeBtn.classList.remove('active');
+            // Force a redraw to catch up to background data immediately
+            charts.forEach(c => c.draw());
+        }
+    });
+
+    document.getElementById('btn-run-diag').addEventListener('click', () => {
+        if (!state.connected) { log('Connect the robot before running the self-test.', 'warn'); return; }
+        readiness.diag = 'running';
+        readiness.diagText = 'Running self-test…';
+        readiness.diagHint = '';
+        updateReadinessUI();
+        sendCommand('CMD:DIAG');
+    });
+})();
+
+/* ============================================================================
+ * Mission Readiness state machine, firmware-line parsing & motion gate
+ * (RD_GATED_IDS is hoisted to the top of the file — see initial declaration —
+ *  because updateUI() runs at load before this point and reads it via the gate.)
+ * ========================================================================== */
+
+function readinessReady() {
+    return readiness.diag === 'pass' && readiness.home === 'done';
+}
+function motionAllowed() {
+    return state.override || readinessReady();
+}
+
+function setStep(id, status) {
+    const el = document.getElementById(id);
+    if (el) el.className = 'rd-step rd-' + status;
+}
+
+function applyMotionGate() {
+    const locked = !motionAllowed();
+    RD_GATED_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.disabled = locked;
+        el.classList.toggle('gate-locked', locked);
+        if (locked) el.title = 'Locked — run HW Self-Test + Home, or enable Override.';
+        else if (el.title && el.title.startsWith('Locked')) el.removeAttribute('title');
+    });
+}
+
+function updateReadinessUI() {
+    setStep('rd-step-connect', state.connected ? 'pass' : 'idle');
+    setStep('rd-step-diag', readiness.diag);
+    const homeStatus = readiness.home === 'done' ? 'pass'
+        : readiness.home === 'fail' ? 'fail'
+        : readiness.home === 'homing' ? 'running' : 'idle';
+    setStep('rd-step-home', homeStatus);
+
+    const badge = document.getElementById('rd-ready-badge');
+    if (badge) {
+        if (state.override)       { badge.textContent = 'OVERRIDE — gate bypassed'; badge.className = 'rd-ready-badge override'; }
+        else if (state.positionUnknown) { badge.textContent = 'RE-HOME REQUIRED'; badge.className = 'rd-ready-badge warn'; }
+        else if (readinessReady()) { badge.textContent = 'READY'; badge.className = 'rd-ready-badge ready'; }
+        else                       { badge.textContent = 'MOTION LOCKED'; badge.className = 'rd-ready-badge not-ready'; }
+    }
+
+    const dt = document.getElementById('rd-diag-text');
+    if (dt) dt.textContent = readiness.diagText;
+    const hintRow = document.getElementById('rd-diag-hint-row');
+    const hint = document.getElementById('rd-diag-hint');
+    if (hint) hint.textContent = readiness.diagHint;
+    if (hintRow) hintRow.style.display = readiness.diagHint ? '' : 'none';
+    const ht = document.getElementById('rd-home-text');
+    if (ht) ht.textContent = readiness.homeText;
+
+    const diagBtn = document.getElementById('btn-run-diag');
+    const homeBtn = document.getElementById('btn-readiness-home');
+    if (diagBtn) diagBtn.disabled = !state.connected || readiness.diag === 'running';
+    if (homeBtn) homeBtn.disabled = !state.connected || readiness.home === 'homing';
+
+    applyMotionGate();
+}
+
+function resetReadiness() {
+    readiness.diag = 'idle';
+    readiness.diagText = 'Not run yet.';
+    readiness.diagHint = '';
+    readiness.home = 'no';
+    readiness.homeText = 'Not homed.';
+    _faultLatched = false;
+}
+
+/* Fresh session on (re)connect — hardware must be re-verified. */
+function onSerialConnected() {
+    resetReadiness();
+    updateReadinessUI();
+}
+
+/* A new fault / E-Stop invalidates the home (encoder phase may have shifted). */
+function onFaultOrEstop() {
+    _faultLatched = true;
+    if (readiness.home === 'done' || readiness.home === 'homing') {
+        readiness.home = 'no';
+        readiness.homeText = 'Re-home required — a fault / E-Stop occurred.';
+    }
+    if (typeof updateReadinessUI === 'function') updateReadinessUI();
+}
+
+/* Parse the plain-text [DIAG] / [HOMING] firmware lines into readiness state. */
+function handleFirmwareLine(line) {
+    if (line.includes('[DIAG] Starting')) {
+        readiness.diag = 'running';
+        readiness.diagText = 'Running self-test…';
+        readiness.diagHint = '';
+        readiness._deltas = '';
+        updateReadinessUI();
+        return;
+    }
+    if (line.includes('[DIAG] Fwd Delta')) {
+        const m = line.split(']')[1];
+        readiness._deltas = m ? m.trim() : '';
+        return;
+    }
+    if (line.includes('[DIAG] RESULT:')) {
+        const r = line.split('RESULT:')[1].trim();
+        if (r.startsWith('HARDWARE OK')) {
+            readiness.diag = 'pass';
+            readiness.diagText = '✓ Hardware OK — motion matches commands.';
+            readiness.diagHint = '';
+        } else if (r.startsWith('ENCODER DEAD')) {
+            readiness.diag = 'fail';
+            readiness.diagText = '✗ Encoder dead — no movement detected during the test.';
+            readiness.diagHint = 'Check: encoder cable, TIM3 CH1/CH2 wiring, and 5 V supply to the encoder.';
+        } else if (r.startsWith('DIRECTION PIN STUCK')) {
+            readiness.diag = 'fail';
+            readiness.diagText = '✗ Direction pin stuck — motor turned the same way both times.';
+            readiness.diagHint = 'Check: H-bridge DIR/IN pins and the PWM sign in motor_controller.';
+        } else if (r.startsWith('PHASE INVERTED')) {
+            readiness.diag = 'fail';
+            readiness.diagText = '✗ Phase inverted — encoder counts opposite to PWM.';
+            readiness.diagHint = 'Fix: swap encoder A/B, or swap the two motor leads (or invert in firmware).';
+        } else {
+            readiness.diag = 'fail';
+            readiness.diagText = '✗ ' + r;
+            readiness.diagHint = '';
+        }
+        if (readiness._deltas) readiness.diagText += '  (' + readiness._deltas + ')';
+        updateReadinessUI();
+        return;
+    }
+    if (line.includes('[HOMING] SUCCESS')) {
+        readiness.home = 'done';
+        const detail = (line.split('SUCCESS.')[1] || '').trim();
+        readiness.homeText = '✓ Homed.' + (detail ? ' ' + detail : '');
+        _faultLatched = false;
+        updateReadinessUI();
+        return;
+    }
+    if (line.includes('[HOMING] ERROR') || line.includes('[HOMING] ABORTED') || line.includes('Verify abort')) {
+        readiness.home = 'fail';
+        readiness.homeText = '✗ ' + line.replace(/^\[HOMING\]\s*/, '');
+        updateReadinessUI();
+        return;
+    }
+}
+
+/* Homing entry point with the force-confirm guard (only after a fault/E-Stop). */
+function requestHoming() {
+    if (!state.connected) { log('Connect the robot before homing.', 'warn'); return; }
+    const needsConfirm = _faultLatched || state.estop || state.fault !== 'NONE';
+    if (needsConfirm) {
+        document.getElementById('home-confirm-modal').classList.remove('hidden');
+    } else {
+        triggerHoming();
+    }
+}
+
+/* Wire readiness-bar controls. */
+(function setupReadinessControls() {
+    const homeBtn = document.getElementById('btn-readiness-home');
+    if (homeBtn) homeBtn.addEventListener('click', () => requestHoming());
+
+    const detailBtn = document.getElementById('rd-detail-btn');
+    const detailPanel = document.getElementById('rd-detail-panel');
+    if (detailBtn && detailPanel) {
+        detailBtn.addEventListener('click', () => {
+            const open = detailPanel.classList.toggle('hidden') === false;
+            detailBtn.textContent = open ? 'Details ▴' : 'Details ▾';
+        });
+    }
+
+    const modal = document.getElementById('home-confirm-modal');
+    const close = () => modal.classList.add('hidden');
+    document.getElementById('btn-close-home-confirm').addEventListener('click', close);
+    document.getElementById('btn-home-confirm-cancel').addEventListener('click', close);
+    document.getElementById('btn-home-confirm-go').addEventListener('click', () => {
+        close();
+        triggerHoming();
+    });
+    modal.addEventListener('click', e => { if (e.target.id === 'home-confirm-modal') close(); });
+})();
+
+updateReadinessUI();

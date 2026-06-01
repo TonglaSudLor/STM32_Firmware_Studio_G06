@@ -1,6 +1,7 @@
 #ifndef __TELEMETRY_HUB_H
 #define __TELEMETRY_HUB_H
 
+#include <stdbool.h>
 #include "main.h"
 
 /**
@@ -19,5 +20,10 @@ void Telemetry_Update(void);
  * Should be called from HAL_UART_RxCpltCallback
  */
 void Telemetry_ProcessByte(uint8_t byte);
+
+/**
+ * @brief Returns true if at least one valid command has been received from the dashboard.
+ */
+bool Telemetry_HasReceivedCommand(void);
 
 #endif /* __TELEMETRY_HUB_H */

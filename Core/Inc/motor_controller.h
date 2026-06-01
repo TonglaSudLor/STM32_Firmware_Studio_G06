@@ -34,8 +34,27 @@ typedef enum {
     MOTOR_MODE_AUTOTUNE_SPEED,
     MOTOR_MODE_TEST,
     MOTOR_MODE_GHOST,
-    MOTOR_MODE_HOMING
+    MOTOR_MODE_HOMING,
+    MOTOR_MODE_AUTO
 } Motor_ControlMode_t;
+
+/**
+ * @brief Auto mode configuration
+ */
+typedef enum {
+    AUTO_ACTION_NONE = 0,
+    AUTO_ACTION_PICK = 1,
+    AUTO_ACTION_PLACE = 2
+} Auto_Action_t;
+
+typedef struct {
+    bool use_sensors;          /**< If true, wait for reed switches; if false, use timers */
+    uint8_t target_count;      /**< Number of targets in current sequence */
+    uint8_t current_index;     /**< Currently executing target index */
+    float positions[10];       /**< Sequence of targets in degrees */
+    Auto_Action_t actions[10]; /**< Action to perform at each target */
+    uint16_t delay_ms;         /**< Delay to use if use_sensors is false */
+} Auto_Config_t;
 
 /**
  * @brief System control modes (Base or Joystick)
@@ -60,8 +79,22 @@ typedef enum {
     FAULT_PROX_LOST         = 0x020,   /**< Proximity sensor open */
     FAULT_ESTOP_JOYSTICK    = 0x040,   /**< Joystick safety button (P/X) */
     FAULT_ESTOP_DASHBOARD   = 0x080,   /**< Dashboard EMERGENCY STOP button */
-    FAULT_ESTOP_MODBUS      = 0x100    /**< Modbus 0x25 soft-stop request */
+    FAULT_ESTOP_MODBUS      = 0x100,   /**< Modbus 0x25 soft-stop request */
+    FAULT_STARTUP_ESTOP     = 0x200,   /**< Power-on latch — cleared only when self-test passes */
+    FAULT_OVERCURRENT       = 0x400    /**< WCS1800 current exceeded OVERCURRENT_LIMIT_AMPS */
 } Motor_FaultCode_t;
+
+/* Atomic fault-bit helpers (bug 1-B). fault_code |= / &= are read-modify-write
+ * and are mutated from both thread context (main loop) and the TIM6 / UART RX
+ * ISRs. Guard each RMW with a PRIMASK save/disable/restore so a preempting
+ * context cannot lose a just-set or just-cleared bit. PRIMASK save-restore is
+ * nesting-safe (works whether called from thread or ISR context). */
+#define FAULT_SET(bits)  do { uint32_t _fpm = __get_PRIMASK(); __disable_irq(); \
+                              fault_code = (Motor_FaultCode_t)(fault_code | (bits)); \
+                              __set_PRIMASK(_fpm); } while (0)
+#define FAULT_CLR(bits)  do { uint32_t _fpm = __get_PRIMASK(); __disable_irq(); \
+                              fault_code = (Motor_FaultCode_t)(fault_code & ~(bits)); \
+                              __set_PRIMASK(_fpm); } while (0)
 
 /**
  * @brief Jog operation modes
@@ -137,6 +170,15 @@ typedef struct {
     bool encoder_check;        /**< Enable E-Stop on encoder loss/inversion */
     bool over_rotation_check;  /**< Enable E-Stop on soft limit breach */
     bool joystick_check;       /**< Enable E-Stop on joystick connection loss */
+    bool physical_estop_check; /**< Enable E-Stop from physical pin (PA5) */
+    /* Runtime-tunable thresholds (defaults seeded from params.h #defines).
+     * Settable from the dashboard via SET:MAX_ROT / STALL_PWM / STALL_VEL /
+     * STALL_TIME / STALL_ERR. */
+    float    soft_limit_deg;   /**< Over-rotation soft limit (deg from home) */
+    float    stall_pwm_pct;    /**< Min |PWM| % to consider a stall */
+    float    stall_vel_rpm;    /**< Max |RPM| to consider a stall */
+    uint32_t stall_time_ms;    /**< Sustain time before stall trips */
+    float    stall_error_deg;  /**< Min position error to allow stall trip */
 } SafetyConfig_t;
 
 /**
@@ -206,12 +248,14 @@ extern volatile float sine_amp_rpm;
 extern volatile float sine_freq_hz;
 extern volatile SafetyConfig_t safety_config;
 extern volatile Motor_FaultCode_t fault_code;
+extern volatile bool startup_estop_pending;  /**< Cleared only when self-test passes (HARDWARE OK) */
 extern volatile float target_position_deg;
 extern volatile float buffered_target_pos;   /**< Ghost target for S-curve testing */
 extern volatile bool ghost_move_active;
 extern volatile uint32_t ghost_settle_start_tick;
 extern volatile float original_home_offset_deg;
 extern volatile bool trigger_homing_sequence;
+extern volatile uint8_t gripper_seq_request;   /**< Deferred gripper sequence: 0=none, 1=pick, 2=place (bug 1-F) */
 
 extern Ghost_Buffer_t ghost_buffer[GHOST_BUFFER_MAX];
 extern volatile uint32_t ghost_buffer_idx;
@@ -271,6 +315,13 @@ void Motor_ProcessPacket(char action, char safety, char status);
 bool Motor_RunHomingSequence(void);
 
 /**
+ * @brief Drain deferred control-loop log events and gripper requests.
+ *        Call from the main loop (thread context). Prints the strings that
+ *        used to be printf'd inside the 100 Hz TIM6 ISR (bug 1-G).
+ */
+void Motor_DrainControlLog(void);
+
+/**
  * @brief Instantly declare the current encoder position as home (position 0).
  *        Equivalent to the joystick A single-click. Safe to call from
  *        telemetry or dashboard — does nothing while E-Stop is active.
@@ -302,6 +353,15 @@ void Motor_UpdateControlModeButton(bool pressed);
 void Motor_SetConnectionStatus(bool connected);
 
 /**
+ * @brief Clear the gamepad-disconnect debounce (streak + last-status latch).
+ *        Call when re-arming the joystick safety check after it was disabled
+ *        (e.g. at the end of DIAG) so a stale non-'C' streak cannot instantly
+ *        re-trip FAULT_JOYSTICK_LOST.
+ */
+void Motor_ResetJoystickDebounce(void);
+void Motor_RefreshWatchdog(void);
+
+/**
  * @brief Stream telemetry data to MATLAB
  */
 void Motor_SendDataToMatlab(void);
@@ -327,6 +387,11 @@ void Motor_ControlLoop(void);
 void Motor_ShaperRecompute(void);
 
 /**
+ * @brief Get the current delay in ticks (N) used by the ZVD shaper
+ */
+uint32_t Motor_GetShaperDelay(void);
+
+/**
  * @brief Toggle between JOYSTICK (Dashboard, LPUART1=115200 8N1)
  *        and BASE_SYSTEM (Modbus, LPUART1=19200 8E1). Defined in main.c.
  */
@@ -344,6 +409,8 @@ float Motor_GetPosition(void);
  */
 float Motor_GetSpeed(void);
 
+extern Auto_Config_t auto_config;
+
 /* --- Gripper Functions --- */
 void Gripper_Up(void);
 void Gripper_Down(void);
@@ -352,5 +419,7 @@ void Gripper_Close(void);
 void Gripper_Toggle(void);
 void Gripper_Sequence_Pick(void);
 void Gripper_Sequence_Place(void);
+void Gripper_Sequence_Pick_Timed(uint16_t ms);
+void Gripper_Sequence_Place_Timed(uint16_t ms);
 
 #endif /* MOTOR_CONTROLLER_H */
