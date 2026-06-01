@@ -464,20 +464,37 @@ header .secondary-btn {
     overflow-y: auto;
 }
 
-#waypoint-list li {
+#waypoint-list { padding: 0; margin: 0; list-style: none; }
+.waypoint-item {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    padding: 4px 8px;
+    padding: 0.4rem 0.5rem;
+    margin-bottom: 4px;
+    background: rgba(255,255,255,0.03);
+    border-radius: 4px;
     font-family: var(--font-mono);
-    font-size: 0.8rem;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    font-size: 0.75rem;
+    border: 1px solid rgba(255,255,255,0.05);
 }
+.wp-index { color: #888; width: 20px; font-size: 0.65rem; }
+.wp-pos { flex: 1; font-weight: bold; color: var(--accent-cyan); }
+.action-tag {
+    padding: 2px 5px;
+    border-radius: 3px;
+    font-size: 0.6rem;
+    font-weight: 800;
+    margin-right: 6px;
+    letter-spacing: 0.05em;
+}
+.action-tag.pick { background: #2ecc71; color: #000; }
+.action-tag.place { background: #3498db; color: #000; }
+.remove-waypoint { color: var(--accent-red); cursor: pointer; font-weight: bold; font-size: 1rem; margin-left: 4px; }
+.remove-waypoint:hover { color: #ff0000; }
 
-#waypoint-list li:last-child { border-bottom: none; }
-#waypoint-list li.active { color: var(--accent-cyan); background: rgba(0, 242, 255, 0.05); }
-
-.remove-waypoint { color: var(--accent-red); cursor: pointer; font-weight: bold; }
+.pick-btn { background: #27ae60 !important; border-color: #1e8449 !important; font-size: 0.65rem !important; padding: 4px 8px !important; }
+.place-btn { background: #2980b9 !important; border-color: #21618c !important; font-size: 0.65rem !important; padding: 4px 8px !important; }
+.pick-btn:hover { background: #2ecc71 !important; }
+.place-btn:hover { background: #3498db !important; }
 
 .path-controls {
     border-top: 1px solid var(--border-color);

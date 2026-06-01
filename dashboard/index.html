@@ -122,26 +122,28 @@
                 <h3>Path Sequencer</h3>
                 <div class="path-editor">
                     <div class="input-row">
-                        <input type="number" id="input-new-waypoint" placeholder="Angle (deg)" step="1">
-                        <button id="btn-add-waypoint" class="primary-btn">+</button>
+                        <input type="number" id="input-new-waypoint" placeholder="Angle" step="1" style="width: 60px;">
+                        <button id="btn-add-wp" class="primary-btn" title="Add Move Target">+</button>
+                        <button id="btn-add-pick" class="primary-btn pick-btn" title="Add Pick sequence">PICK</button>
+                        <button id="btn-add-place" class="primary-btn place-btn" title="Add Place sequence">PLACE</button>
                     </div>
                     <ul id="waypoint-list"></ul>
                 </div>
                 <div class="path-controls">
                     <div class="input-group">
-                        <label>Delay (s)</label>
-                        <input type="number" id="input-seq-delay" value="2" step="0.5">
+                        <label>Feedback</label>
+                        <select id="select-feedback-mode" class="tl-select">
+                            <option value="sensor">Reed Switch</option>
+                            <option value="delay">Timed Delay</option>
+                        </select>
                     </div>
-                    <div class="gripper-seq-row">
-                        <label class="checkbox-label">
-                            <input type="checkbox" id="chk-use-gripper">
-                            Use Gripper
-                        </label>
-                        <button id="btn-gripper-settings" class="info-btn" title="Gripper settings">ⓘ</button>
+                    <div class="input-group" id="seq-delay-container">
+                        <label>Delay (ms)</label>
+                        <input type="number" id="input-seq-delay" value="2000" step="100">
                     </div>
-                    <div class="toggle-group">
-                        <button id="btn-run-seq" class="toggle-btn">Run</button>
-                        <button id="btn-loop-seq" class="toggle-btn">Loop</button>
+                    <div class="toggle-group" style="margin-top: 10px;">
+                        <button id="btn-run-seq" class="toggle-btn">Run Sequence</button>
+                        <button id="btn-clear-seq" class="info-btn">Clear All</button>
                     </div>
                 </div>
             </div>
@@ -681,12 +683,15 @@
                         </div>
                     </div>
 
-                    <!-- SYSTEM MODE -->
                     <div class="mo-sec manual-extra">
                         <div class="mo-sec-head mo-head-yellow">SYSTEM MODE</div>
                         <div class="mo-btn-pair">
                             <button id="btn-sys-mode" class="toggle-btn">Mode: BASE</button>
                             <button id="btn-jog-mode" class="toggle-btn">Jog: COARSE</button>
+                        </div>
+                        <div class="mo-btn-pair" style="margin-top: 8px;">
+                            <button id="btn-mode-auto" class="toggle-btn" style="flex:1">Auto Sequence</button>
+                            <button id="btn-grip-auto" class="toggle-btn" style="flex:1" title="Enable/disable gripper during Auto">Auto Grip: ON</button>
                         </div>
                     </div>
 
@@ -908,59 +913,6 @@
                             <br><em>Note:</em> cannot be disabled in software — requires a firmware recompile to change limits.
                         </div>
                     </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Gripper Settings Modal -->
-    <div id="gripper-modal" class="modal-backdrop hidden">
-        <div class="modal-window">
-            <div class="modal-header">
-                <h3>Gripper Settings</h3>
-                <button id="btn-close-gripper-modal" class="modal-close">×</button>
-            </div>
-            <div class="modal-section">
-                <h4>Feedback Mode</h4>
-                <div class="mode-radio-group">
-                    <label class="radio-option">
-                        <input type="radio" name="gripper-mode" value="sim" id="radio-sim" checked>
-                        <span class="radio-content">
-                            <span class="radio-title">Simulation (Delay)</span>
-                            <span class="radio-desc">Uses configured delays to simulate sensor feedback</span>
-                        </span>
-                    </label>
-                    <label class="radio-option">
-                        <input type="radio" name="gripper-mode" value="real" id="radio-real">
-                        <span class="radio-content">
-                            <span class="radio-title">Real Sensor</span>
-                            <span class="radio-desc">Waits for reed switch state from STM32 telemetry</span>
-                        </span>
-                    </label>
-                </div>
-            </div>
-            <div class="modal-section" id="sim-delays-section">
-                <h4>Simulation Delays (ms)</h4>
-                <div class="input-row">
-                    <div class="input-group"><label>Open</label><input type="number" id="delay-open" value="600"
-                            step="100" min="0"></div>
-                    <div class="input-group"><label>Close</label><input type="number" id="delay-close" value="600"
-                            step="100" min="0"></div>
-                </div>
-                <div class="input-row" style="margin-top:0.5rem">
-                    <div class="input-group"><label>Up</label><input type="number" id="delay-up" value="600" step="100"
-                            min="0"></div>
-                    <div class="input-group"><label>Down</label><input type="number" id="delay-down" value="600"
-                            step="100" min="0"></div>
-                </div>
-            </div>
-            <div class="modal-section" id="real-sensor-info" style="display:none">
-                <h4>Real Sensor Info</h4>
-                <div class="real-sensor-desc">
-                    Each gripper action waits for the corresponding reed switch to confirm before proceeding.<br><br>
-                    <span class="pin-table">PB0 = Up &nbsp;|&nbsp; PA4 = Down &nbsp;|&nbsp; PA1 = Close &nbsp;|&nbsp;
-                        PA0 = Open</span><br><br>
-                    Timeout: 3000 ms (firmware <code>REED_SW_TIMEOUT_MS</code>)
                 </div>
             </div>
         </div>

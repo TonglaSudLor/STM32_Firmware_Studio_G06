@@ -18,6 +18,6 @@
 ../Core/Src/main.c:1016:5:_write	3
 ../Core/Src/main.c:1044:6:HAL_GPIO_EXTI_Callback	1
 ../Core/Src/main.c:1066:6:HAL_TIM_PeriodElapsedCallback	4
-../Core/Src/main.c:1083:6:HAL_UART_RxCpltCallback	13
-../Core/Src/main.c:1156:6:HAL_UART_ErrorCallback	3
-../Core/Src/main.c:1177:6:Error_Handler	1
+../Core/Src/main.c:1083:6:HAL_UART_RxCpltCallback	14
+../Core/Src/main.c:1159:6:HAL_UART_ErrorCallback	4
+../Core/Src/main.c:1180:6:Error_Handler	1

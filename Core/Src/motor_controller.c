@@ -32,6 +32,12 @@ volatile Motor_AutotuneTrigger_t autotune_trigger = ATUNE_IDLE;
 volatile Motor_AutotuneStatus_t autotune_status = STATUS_IDLE;
 volatile int tuning_progress = 0;
 volatile Motor_TuningParams_t tuning;
+Auto_Config_t auto_config = {
+    .use_sensors = true,
+    .target_count = 0,
+    .current_index = 0,
+    .delay_ms = 2000
+};
 
 /* Link state: assume connected until proven otherwise (watchdog only arms 
  * after first joystick packet seen). */
@@ -405,6 +411,11 @@ static void ZVD_FlushBuffer(float val)
 void Motor_ShaperRecompute(void)
 {
     ZVD_UpdateCoefficients();
+}
+
+uint32_t Motor_GetShaperDelay(void)
+{
+    return shaper_N;
 }
 
 /* Conversion helpers — firmware is in RPM/RPM/s/RPM/s², planner is in
@@ -2418,6 +2429,34 @@ void Gripper_Sequence_Pick(void)
     wait_for_reed_if_joystick(&hw.in_reed_up, "UP");
     task_pick_active = false;
     printf("Sequence PICK: Done\r\n");
+}
+
+void Gripper_Sequence_Pick_Timed(uint16_t ms)
+{
+    printf("Starting Timed Sequence: PICK (%u ms)\r\n", ms);
+    Gripper_Open();
+    HAL_Delay(ms);
+    Gripper_Down();
+    HAL_Delay(ms);
+    Gripper_Close();
+    HAL_Delay(ms);
+    Gripper_Up();
+    HAL_Delay(ms);
+    printf("Timed Sequence PICK: Done\r\n");
+}
+
+void Gripper_Sequence_Place_Timed(uint16_t ms)
+{
+    printf("Starting Timed Sequence: PLACE (%u ms)\r\n", ms);
+    Gripper_Down();
+    HAL_Delay(ms);
+    Gripper_Open();
+    HAL_Delay(ms);
+    Gripper_Up();
+    HAL_Delay(ms);
+    Gripper_Close();
+    HAL_Delay(ms);
+    printf("Timed Sequence PLACE: Done\r\n");
 }
 
 void Gripper_Sequence_Place(void)

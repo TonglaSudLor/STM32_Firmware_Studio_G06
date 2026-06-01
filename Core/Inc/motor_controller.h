@@ -34,8 +34,27 @@ typedef enum {
     MOTOR_MODE_AUTOTUNE_SPEED,
     MOTOR_MODE_TEST,
     MOTOR_MODE_GHOST,
-    MOTOR_MODE_HOMING
+    MOTOR_MODE_HOMING,
+    MOTOR_MODE_AUTO
 } Motor_ControlMode_t;
+
+/**
+ * @brief Auto mode configuration
+ */
+typedef enum {
+    AUTO_ACTION_NONE = 0,
+    AUTO_ACTION_PICK = 1,
+    AUTO_ACTION_PLACE = 2
+} Auto_Action_t;
+
+typedef struct {
+    bool use_sensors;          /**< If true, wait for reed switches; if false, use timers */
+    uint8_t target_count;      /**< Number of targets in current sequence */
+    uint8_t current_index;     /**< Currently executing target index */
+    float positions[10];       /**< Sequence of targets in degrees */
+    Auto_Action_t actions[10]; /**< Action to perform at each target */
+    uint16_t delay_ms;         /**< Delay to use if use_sensors is false */
+} Auto_Config_t;
 
 /**
  * @brief System control modes (Base or Joystick)
@@ -368,6 +387,11 @@ void Motor_ControlLoop(void);
 void Motor_ShaperRecompute(void);
 
 /**
+ * @brief Get the current delay in ticks (N) used by the ZVD shaper
+ */
+uint32_t Motor_GetShaperDelay(void);
+
+/**
  * @brief Toggle between JOYSTICK (Dashboard, LPUART1=115200 8N1)
  *        and BASE_SYSTEM (Modbus, LPUART1=19200 8E1). Defined in main.c.
  */
@@ -385,6 +409,8 @@ float Motor_GetPosition(void);
  */
 float Motor_GetSpeed(void);
 
+extern Auto_Config_t auto_config;
+
 /* --- Gripper Functions --- */
 void Gripper_Up(void);
 void Gripper_Down(void);
@@ -393,5 +419,7 @@ void Gripper_Close(void);
 void Gripper_Toggle(void);
 void Gripper_Sequence_Pick(void);
 void Gripper_Sequence_Place(void);
+void Gripper_Sequence_Pick_Timed(uint16_t ms);
+void Gripper_Sequence_Place_Timed(uint16_t ms);
 
 #endif /* MOTOR_CONTROLLER_H */

@@ -7,6 +7,8 @@
 #include <string.h>
 #include <stdlib.h>
 
+extern Auto_Config_t auto_config;
+
 extern volatile float current_pwm;
 
 /* --- Private Definitions --- */
@@ -106,7 +108,7 @@ void Telemetry_Update(void) {
         len = snprintf(tx_buffer, TX_BUFFER_SIZE,
             "$SKP:%.3f,SKI:%.3f,SKD:%.3f,KVFF:%.3f,KAFF:%.3f,KTFF:%.3f,PKP:%.3f,PKI:%.3f,PKD:%.3f,"
             "VMAX:%.2f,AMAX:%.2f,JMAX:%.1f,STEPC:%.1f,STEPF:%.1f,JOGF:%.1f,HOMES:%.1f,MINP:%.1f,PLOOP:%d,"
-            "SHPEN:%d,SHPWN:%.3f,SHPZT:%.4f,HOFS:%.2f*",
+            "SHPEN:%d,SHPWN:%.3f,SHPZT:%.4f,SHPN:%lu,GRIPS:%d,GRIPD:%u,HOFS:%.2f*",
             tuning.speed_Kp, tuning.speed_Ki, tuning.speed_Kd,
             tuning.K_vff, tuning.K_aff, tuning.K_tff,
             tuning.pos_Kp, tuning.pos_Ki, tuning.pos_Kd,
@@ -117,6 +119,9 @@ void Telemetry_Update(void) {
             tuning.shaper_enable ? 1 : 0,
             tuning.shaper_omega_n,
             tuning.shaper_zeta,
+            (unsigned long)Motor_GetShaperDelay(),
+            auto_config.use_sensors ? 1 : 0,
+            auto_config.delay_ms,
             tuning.home_offset_deg);
             
         if (len > 0) {
@@ -269,7 +274,33 @@ static void Telemetry_HandleSet(char *payload) {
             else if (strcmp(key, "STALL_VEL")    == 0) safety_config.stall_vel_rpm    = val;
             else if (strcmp(key, "STALL_TIME")   == 0) safety_config.stall_time_ms    = (uint32_t)val;
             else if (strcmp(key, "STALL_ERR")    == 0) safety_config.stall_error_deg  = val;
-            else if (strcmp(key, "SYS_MODE")     == 0) control_system_mode = (val > 0.5f) ? CONTROL_MODE_JOYSTICK : CONTROL_MODE_BASE_SYSTEM;
+            else if (strcmp(key, "SYS_MODE")     == 0) {
+                if (val > 1.5f) {
+                    current_mode = MOTOR_MODE_AUTO;
+                    auto_config.current_index = 0;
+                } else {
+                    control_system_mode = (val > 0.5f) ? CONTROL_MODE_JOYSTICK : CONTROL_MODE_BASE_SYSTEM;
+                    if (current_mode == MOTOR_MODE_AUTO) current_mode = MOTOR_MODE_STOPPED;
+                }
+            }
+            else if (strcmp(key, "WP_CLR")       == 0) {
+                auto_config.target_count = 0;
+                auto_config.current_index = 0;
+            }
+            else if (strcmp(key, "WP_ADD")       == 0) {
+                if (auto_config.target_count < 10) {
+                    auto_config.positions[auto_config.target_count] = val;
+                    auto_config.actions[auto_config.target_count] = AUTO_ACTION_NONE;
+                    auto_config.target_count++;
+                }
+            }
+            else if (strcmp(key, "WP_ACT")       == 0) {
+                if (auto_config.target_count > 0) {
+                    auto_config.actions[auto_config.target_count - 1] = (Auto_Action_t)((int)val);
+                }
+            }
+            else if (strcmp(key, "WP_SENS")      == 0) auto_config.use_sensors = (val > 0.5f);
+            else if (strcmp(key, "WP_DLY")       == 0) auto_config.delay_ms = (uint16_t)val;
             else if (strcmp(key, "JOG_MODE")     == 0) jog_mode = (val > 0.5f) ? JOG_FINE : JOG_COARSE;
             else if (strcmp(key, "SHPEN")        == 0) tuning.shaper_enable  = (val > 0.5f);
             else if (strcmp(key, "SHPWN")        == 0) { tuning.shaper_omega_n = val; Motor_ShaperRecompute(); }

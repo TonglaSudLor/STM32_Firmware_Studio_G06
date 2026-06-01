@@ -1,3 +1,5 @@
+let _lastGhost = false;
+
 // --- State ---
 const state = {
     connected: false,
@@ -69,7 +71,7 @@ let _faultLatched = false; // set when a fault/E-Stop invalidates the home
  * Declared early: updateUI() runs at load and reads this through the gate. */
 const RD_GATED_IDS = [
     'btn-set-target', 'input-target', 'range-target', 'btn-negate-target',
-    'btn-go-home', 'btn-run-seq', 'btn-loop-seq', 'btn-sine-toggle',
+    'btn-go-home', 'btn-run-seq', 'btn-sine-toggle',
 ];
 
 let tuningSynced = false;
@@ -2528,44 +2530,28 @@ document.getElementById('btn-kf-sanity').addEventListener('click', () => {
 });
 
 
-// --- Gripper Config ---
-const gripperConfig = {
-    enabled: false,
-    mode: 'sim',
-    delays: { open: 600, close: 600, up: 600, down: 600 },
-    realTimeout: 5000,
-};
+// --- Path Sequencer: gripper feedback mode ---
+// Reed Switch (sensor) → each gripper step waits for the matching reed switch
+//                        (RSUP/RSDN/RSCL/RSOP telemetry) to confirm the move.
+// Timed Delay (delay)  → each gripper step + the post-move settle wait a fixed
+//                        delay (the "Delay (ms)" input).
+const REED_TIMEOUT_MS = 3000;  // matches firmware REED_SW_TIMEOUT_MS
 
-document.getElementById('chk-use-gripper').addEventListener('change', e => {
-    gripperConfig.enabled = e.target.checked;
-});
+function seqFeedbackMode() {
+    return document.getElementById('select-feedback-mode')?.value || 'delay';
+}
+function seqDelayMs() {
+    const v = parseFloat(document.getElementById('input-seq-delay')?.value);
+    return (Number.isFinite(v) && v >= 0) ? v : 2000;
+}
 
-document.getElementById('btn-gripper-settings').addEventListener('click', () => {
-    document.getElementById('gripper-modal').classList.remove('hidden');
-});
-document.getElementById('btn-close-gripper-modal').addEventListener('click', () => {
-    document.getElementById('gripper-modal').classList.add('hidden');
-    gripperConfig.delays.open = parseInt(document.getElementById('delay-open').value) || 600;
-    gripperConfig.delays.close = parseInt(document.getElementById('delay-close').value) || 600;
-    gripperConfig.delays.up = parseInt(document.getElementById('delay-up').value) || 600;
-    gripperConfig.delays.down = parseInt(document.getElementById('delay-down').value) || 600;
-});
-document.getElementById('gripper-modal').addEventListener('click', e => {
-    if (e.target.id === 'gripper-modal') {
-        e.target.classList.add('hidden');
-        gripperConfig.delays.open = parseInt(document.getElementById('delay-open').value) || 600;
-        gripperConfig.delays.close = parseInt(document.getElementById('delay-close').value) || 600;
-        gripperConfig.delays.up = parseInt(document.getElementById('delay-up').value) || 600;
-        gripperConfig.delays.down = parseInt(document.getElementById('delay-down').value) || 600;
-    }
-});
-document.querySelectorAll('input[name="gripper-mode"]').forEach(radio => {
-    radio.addEventListener('change', e => {
-        gripperConfig.mode = e.target.value;
-        document.getElementById('sim-delays-section').style.display = gripperConfig.mode === 'sim' ? '' : 'none';
-        document.getElementById('real-sensor-info').style.display = gripperConfig.mode === 'real' ? '' : 'none';
-    });
-});
+// The delay input only applies in Timed Delay mode — hide it for Reed Switch.
+function updateFeedbackModeUI() {
+    const c = document.getElementById('seq-delay-container');
+    if (c) c.style.display = seqFeedbackMode() === 'delay' ? '' : 'none';
+}
+document.getElementById('select-feedback-mode')?.addEventListener('change', updateFeedbackModeUI);
+updateFeedbackModeUI();
 
 // --- Gripper Sequence Helpers ---
 function msDelay(ms) {
@@ -2585,128 +2571,129 @@ function waitForGripperState(predicate, timeout) {
     });
 }
 
-async function gripperStep(cmd, confirmFn, simMs) {
+async function gripperStep(cmd, confirmFn) {
     sendCommand(cmd);
-    if (gripperConfig.mode === 'real') {
-        await waitForGripperState(confirmFn, gripperConfig.realTimeout);
+    if (seqFeedbackMode() === 'sensor') {
+        await waitForGripperState(confirmFn, REED_TIMEOUT_MS);
     } else {
-        await msDelay(simMs);
+        await msDelay(seqDelayMs());
     }
 }
 
 async function runGripperPick() {
-    await gripperStep('CMD:CLAW_OPEN',  () => !state.gripper_co, gripperConfig.delays.open);
-    await gripperStep('CMD:GRIP_DN',    () => state.gripper_ud,  gripperConfig.delays.down);
-    await gripperStep('CMD:CLAW_CLOSE', () => state.gripper_co,  gripperConfig.delays.close);
-    await gripperStep('CMD:GRIP_UP',    () => !state.gripper_ud, gripperConfig.delays.up);
+    await gripperStep('CMD:CLAW_OPEN',  () => !state.gripper_co);
+    await gripperStep('CMD:GRIP_DN',    () => state.gripper_ud);
+    await gripperStep('CMD:CLAW_CLOSE', () => state.gripper_co);
+    await gripperStep('CMD:GRIP_UP',    () => !state.gripper_ud);
 }
 
 async function runGripperPlace() {
-    await gripperStep('CMD:GRIP_DN',    () => state.gripper_ud,  gripperConfig.delays.down);
-    await gripperStep('CMD:CLAW_OPEN',  () => !state.gripper_co, gripperConfig.delays.open);
-    await gripperStep('CMD:GRIP_UP',    () => !state.gripper_ud, gripperConfig.delays.up);
-    await gripperStep('CMD:CLAW_CLOSE', () => state.gripper_co,  gripperConfig.delays.close);
+    await gripperStep('CMD:GRIP_DN',    () => state.gripper_ud);
+    await gripperStep('CMD:CLAW_OPEN',  () => !state.gripper_co);
+    await gripperStep('CMD:GRIP_UP',    () => !state.gripper_ud);
+    await gripperStep('CMD:CLAW_CLOSE', () => state.gripper_co);
 }
 
-// --- Path Sequencer (Live mode) ---
+// --- Path Sequencer ---
+// Each waypoint is { angle, action } where action ∈ 'move' | 'pick' | 'place'.
+// '+' adds a move-only stop; PICK / PLACE add a stop that runs the gripper
+// pick or place routine once the arm has reached the angle.
 const waypointList = document.getElementById('waypoint-list');
 const btnRunSeq = document.getElementById('btn-run-seq');
-const btnLoopSeq = document.getElementById('btn-loop-seq');
 const inputNewWaypoint = document.getElementById('input-new-waypoint');
 
-document.getElementById('btn-add-waypoint').addEventListener('click', () => {
+function addWaypoint(action) {
     const val = parseFloat(inputNewWaypoint.value);
-    if (!isNaN(val)) {
-        state.waypoints.push(val);
-        inputNewWaypoint.value = "";
-        renderWaypoints();
-    }
-});
+    if (isNaN(val)) { log('Path: enter an angle before adding a waypoint.', 'error'); return; }
+    state.waypoints.push({ angle: val, action });
+    inputNewWaypoint.value = '';
+    renderWaypoints();
+}
+document.getElementById('btn-add-wp').addEventListener('click',    () => addWaypoint('move'));
+document.getElementById('btn-add-pick').addEventListener('click',  () => addWaypoint('pick'));
+document.getElementById('btn-add-place').addEventListener('click', () => addWaypoint('place'));
+
+function stopSequence() {
+    state.seqActive = false;
+    state.currentWaypointIdx = -1;
+    btnRunSeq.innerText = 'Run Sequence';
+    btnRunSeq.className = 'toggle-btn';
+    renderWaypoints();
+}
 
 btnRunSeq.addEventListener('click', () => {
-    state.seqActive = !state.seqActive;
-    btnRunSeq.innerText = state.seqActive ? 'Stop' : 'Run';
-    btnRunSeq.className = 'toggle-btn ' + (state.seqActive ? 'active' : '');
-    if (state.seqActive) {
-        state.currentWaypointIdx = 0;
-        state.gripperHasRod = false;  // start each Run with empty gripper
-        executeNextWaypoint();
-    }
+    if (state.seqActive) { stopSequence(); return; }
+    if (state.waypoints.length === 0) { log('Path: add at least one waypoint first.', 'error'); return; }
+    state.seqActive = true;
+    state.currentWaypointIdx = 0;
+    btnRunSeq.innerText = 'Stop';
+    btnRunSeq.className = 'toggle-btn active';
+    executeNextWaypoint();
 });
 
-btnLoopSeq.addEventListener('click', () => {
-    state.seqLoop = !state.seqLoop;
-    btnLoopSeq.className = 'toggle-btn ' + (state.seqLoop ? 'active' : '');
+document.getElementById('btn-clear-seq').addEventListener('click', () => {
+    state.waypoints = [];
+    stopSequence();
 });
 
 function renderWaypoints() {
     waypointList.innerHTML = '';
     state.waypoints.forEach((wp, i) => {
         const li = document.createElement('li');
-        if (i === state.currentWaypointIdx) li.className = 'active';
-        li.innerHTML = `<span>${wp}°</span><span class="remove-waypoint" onclick="removeWaypoint(${i})">×</span>`;
+        li.className = 'waypoint-item' + (i === state.currentWaypointIdx ? ' active' : '');
+        const tag = wp.action === 'pick'  ? '<span class="action-tag pick">PICK</span>'
+                  : wp.action === 'place' ? '<span class="action-tag place">PLACE</span>'
+                  : '';
+        li.innerHTML =
+            `<span class="wp-index">${i + 1}</span>${tag}` +
+            `<span class="wp-pos">${wp.angle}°</span>` +
+            `<span class="remove-waypoint" onclick="removeWaypoint(${i})">×</span>`;
         waypointList.appendChild(li);
     });
 }
 
 window.removeWaypoint = (i) => { state.waypoints.splice(i, 1); renderWaypoints(); };
 
+// Resolve once the arm is within tolerance of targetDeg and has settled, or
+// after `timeout` ms so an un-homed / E-stopped arm (firmware silently refuses
+// SET:TARGET) doesn't hang the sequence forever. Returns true if it arrived.
+const ARRIVE_TOL_DEG    = 2.0;
+const ARRIVE_TIMEOUT_MS = 8000;
+function waitForArrival(targetDeg, timeout = ARRIVE_TIMEOUT_MS) {
+    return new Promise(resolve => {
+        const t0 = Date.now();
+        const iv = setInterval(() => {
+            const settled = Math.abs(state.currentPos - targetDeg) <= ARRIVE_TOL_DEG
+                            && Math.abs(state.vel) < 5;
+            if (!state.seqActive || settled) { clearInterval(iv); resolve(true);  return; }
+            if (Date.now() - t0 >= timeout)  { clearInterval(iv); resolve(false); return; }
+        }, 50);
+    });
+}
+
 async function executeNextWaypoint() {
     if (!state.seqActive || state.waypoints.length === 0) return;
-    const target = state.waypoints[state.currentWaypointIdx];
-    sendCommand(`SET:TARGET=${target}`);
+    const wp = state.waypoints[state.currentWaypointIdx];
+    sendCommand(`SET:TARGET=${wp.angle}`);
     renderWaypoints();
 
-    const rawDelay = parseFloat(document.getElementById('input-seq-delay').value);
-    const movDelay = (Number.isFinite(rawDelay) && rawDelay >= 0) ? rawDelay * 1000 : 2000;
-    await msDelay(movDelay);
+    // Wait for the arm to actually reach + settle at the target before the
+    // gripper acts — not a blind delay. Warns (instead of flying past) if the
+    // arm never gets there, which usually means it isn't Self-Tested + Homed.
+    const arrived = await waitForArrival(wp.angle);
     if (!state.seqActive) return;
+    if (!arrived) log(`Path: arm never reached ${wp.angle}° — run Self-Test + Home (motion is gated until then).`, 'error');
 
-    if (gripperConfig.enabled) {
-        // Single-rod shuttle. Action at each waypoint depends on whether the
-        // gripper is currently holding the rod, not on waypoint index — so it
-        // works across loops without dropping the rod.
-        //
-        //   empty gripper  → PICK (grab here)
-        //   holding rod, last waypoint, no loop → PLACE (final drop)
-        //   holding rod, otherwise              → PLACE then PICK
-        const idx = state.currentWaypointIdx;
-        const isLast = (idx === state.waypoints.length - 1);
-
-        if (!state.gripperHasRod) {
-            await runGripperPick();
-            state.gripperHasRod = true;
-        } else if (isLast && !state.seqLoop) {
-            await runGripperPlace();
-            state.gripperHasRod = false;
-        } else {
-            await runGripperPlace();
-            state.gripperHasRod = false;
-            if (!state.seqActive) return;
-            await runGripperPick();
-            state.gripperHasRod = true;
-        }
-    }
+    if (wp.action === 'pick')       await runGripperPick();
+    else if (wp.action === 'place') await runGripperPlace();
     if (!state.seqActive) return;
 
     state.currentWaypointIdx++;
-    if (state.currentWaypointIdx >= state.waypoints.length) {
-        if (state.seqLoop) {
-            state.currentWaypointIdx = 0;
-        } else {
-            state.seqActive = false;
-            state.currentWaypointIdx = -1;
-            btnRunSeq.innerText = 'Run';
-            btnRunSeq.className = 'toggle-btn';
-            renderWaypoints();
-            return;
-        }
-    }
+    if (state.currentWaypointIdx >= state.waypoints.length) { stopSequence(); return; }
     executeNextWaypoint();
 }
 
 // Auto-arm capture on ghost-mode rising edge
-let _lastGhost = false;
 function checkGhostStart() {
     if (tuningMode && !_lastGhost && state.ghost && tuningState === 'IDLE') {
         tuningArmRun();

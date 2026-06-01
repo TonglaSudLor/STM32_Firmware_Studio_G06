@@ -105,8 +105,11 @@ void HW_RefreshIO(void)
          * During homing or diagnostic tests, high PWM commands generate 
          * significant EMI on PA5. Use a 1.5 s window (225 samples at ~150 Hz) 
          * so the startup transients are ignored. Normal running stays at 500 ms. */
+        /* Use a 1.0 s window (150 samples at ~150 Hz) for normal running,
+         * and 2.0 s (300 samples) for high-EMI modes like Homing.
+         * This prevents false FAULT_ESTOP_PHYSICAL triggers from motor noise. */
         uint16_t threshold = (motor_active_ticks > 0)
-                           ? ((current_mode == MOTOR_MODE_HOMING || current_mode == MOTOR_MODE_TEST) ? 225 : 75)
+                           ? ((current_mode == MOTOR_MODE_HOMING || current_mode == MOTOR_MODE_TEST) ? 300 : 150)
                            : 8;
 
         if (estop_raw) {
