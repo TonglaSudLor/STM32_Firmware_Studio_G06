@@ -196,6 +196,7 @@ static void Modbus_ReadHoldingRegisters(Modbus_Handle_t* hmodbus)
 /**
  * @brief Dispatch Modbus frame to appropriate function handler
  */
+#if 0 // Unused in favor of Modbus_BuildResponse
 static void Modbus_Dispatch(Modbus_Handle_t* hmodbus)
 {
     switch (hmodbus->rx_frame[0])
@@ -218,6 +219,7 @@ static void Modbus_Dispatch(Modbus_Handle_t* hmodbus)
 /**
  * @brief Emit Modbus response frame
  */
+#if 0 // Unused in favor of Modbus_BuildResponse
 static void Modbus_Emit(Modbus_Handle_t* hmodbus)
 {
     hmodbus->uart.tx_buffer[0] = hmodbus->slave_address;

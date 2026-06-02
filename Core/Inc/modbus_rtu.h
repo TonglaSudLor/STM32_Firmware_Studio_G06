@@ -15,13 +15,7 @@
 
 #define MODBUS_BUFFER_SIZE 300
 
-/**
- * @brief Modbus register representation (16-bit union)
- */
-typedef union {
-    uint16_t U16;
-    uint8_t U8[2];
-} Modbus_Register_t;
+
 
 /**
  * @brief Modbus state machine states
