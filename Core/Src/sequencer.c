@@ -9,7 +9,7 @@
 #include <stdio.h>
 
 static struct {
-    PnP_State_t state;
+    Seq_State_t state;
     uint16_t pairs_remaining;
     uint32_t wait_start_tick;
     bool grip_enabled;
@@ -17,7 +17,7 @@ static struct {
 
 void Sequencer_Init(void)
 {
-    seq.state = PNP_IDLE;
+    seq.state = SEQ_IDLE;
     seq.pairs_remaining = 0;
 }
 
@@ -25,7 +25,7 @@ void Sequencer_Start(uint16_t pairs, bool grip_enable)
 {
     seq.pairs_remaining = pairs;
     seq.grip_enabled = grip_enable;
-    seq.state = PNP_MOVE_TO_PICK;
+    seq.state = SEQ_MOVE_TO_PICK;
     printf("[SEQ] Starting sequence: %u pairs\r\n", pairs);
 }
 
@@ -35,12 +35,12 @@ void Sequencer_Tick(void)
     // For now, this is a placeholder to complete Phase B file structure.
 }
 
-PnP_State_t Sequencer_GetState(void)
+Seq_State_t Sequencer_GetState(void)
 {
     return seq.state;
 }
 
 bool Sequencer_IsDone(void)
 {
-    return seq.state == PNP_IDLE;
+    return seq.state == SEQ_IDLE;
 }

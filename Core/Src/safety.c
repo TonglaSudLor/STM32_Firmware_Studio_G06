@@ -8,6 +8,7 @@
  */
 
 #include "safety.h"
+#include "stm32g4xx_hal.h"
 
 static volatile uint32_t s_faults = 0u;
 
