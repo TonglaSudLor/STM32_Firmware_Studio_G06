@@ -1912,7 +1912,7 @@ button {
 }
 .full-width-log .debug-card {
     width: 100%;
-    max-height: 250px;
+    max-height: 150px;
 }
 
 /* --- Path Sequencer UI Fixes --- */
@@ -1954,8 +1954,8 @@ select.tl-select:hover {
 
 /* --- Increased Debug Console Height --- */
 .col-center #debug-log {
-    height: 250px; /* Increased from the implicit smaller height */
-    min-height: 250px;
+    height: 150px; /* Increased from the implicit smaller height */
+    min-height: 150px;
     margin-top: 15px; /* Add some space above it */
 }
 
