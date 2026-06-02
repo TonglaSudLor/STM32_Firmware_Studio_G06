@@ -662,6 +662,16 @@ connectBtn.addEventListener('click', () => {
     else connectSerial();
 });
 
+const saveBtn = document.getElementById('btn-save-flash');
+if (saveBtn) {
+    saveBtn.addEventListener('click', () => {
+        if (confirm('Save current tuning to STM32 Flash? (Persistent across reboots)')) {
+            sendCommand('CMD:SAVE');
+            log('Flash save requested...');
+        }
+    });
+}
+
 estopBtn.addEventListener('click', () => {
     if (state.estop) {
         sendCommand("CMD:CLEAR");

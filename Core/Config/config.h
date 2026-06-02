@@ -1,46 +1,66 @@
 /**
  * @file config.h
- * @brief Runtime Configuration — Flash save/load with CRC integrity check.
- *
- * TODO: Implement from scratch.
- *   - Load tuning params from last Flash page on boot
- *   - Fall back to params.h defaults if CRC fails or Flash is blank
- *   - Save triggered by dashboard: $CMD:SAVE* or $CMD:SAVE_CONFIG*
- *   - Reset to defaults: $CMD:RESET_CONFIG*
- *
- * Flash target: last page of STM32G474RE Flash (512 KB total)
- *   Page 127 @ 0x0807F800, size 2 KB
- *   Use HAL_FLASH_Program + HAL_FLASH_Erase (word-by-word)
- *   Or: STM32 EEPROM emulation library (X-CUBE-EEPROM)
- *
- * Problem this solves:
- *   Currently tuning values from params.h reset to defaults on every power cycle.
- *   $SET:SPEED_KP=1.5* sets RAM only — lost on reset.
- *
- * When done: add Core/Config/config.c
+ * @brief System configuration and Flash storage management.
  */
 
-#pragma once
-#include <stdint.h>
+#ifndef CONFIG_H
+#define CONFIG_H
 
+#include <stdint.h>
+#include <stdbool.h>
+
+/**
+ * @brief Configuration structure stored in Flash.
+ * @note Must be 8-byte aligned for STM32G4 Flash programming.
+ * @note Total size must be less than 2KB (one Flash page).
+ */
 typedef struct {
-    /* PID gains */
+    uint32_t magic;            /**< Magic number to verify config existence (0xDEADBEEF) */
+    uint32_t version;          /**< Config structure version for migration */
+    
+    // PID Gains
     float speed_Kp, speed_Ki, speed_Kd;
     float pos_Kp,   pos_Ki,   pos_Kd;
-    /* Feedforward */
+    
+    // Feedforward Gains
     float k_vff, k_aff, k_tff;
-    /* Motion limits */
-    float max_accel, max_jerk;
+    
+    // Motion Limits
     float move_speed_coarse;
-    /* Input shaper */
-    float shaper_omega_n, shaper_zeta;
-    /* Homing */
+    float max_accel;
+    float max_jerk;
+    
+    // System Settings
     float home_offset_deg;
-    /* Integrity */
-    uint32_t crc32;
-} SystemConfig_t;
+    float min_pwm;
+    
+    // ZVD Shaper
+    float shaper_omega_n;
+    float shaper_zeta;
+    bool  shaper_enable;
+    
+    uint32_t crc32;            /**< CRC32 integrity check (must be the last field) */
+} __attribute__((aligned(8))) SystemConfig_t;
 
-void             Config_Init(void);          /* load from Flash, fallback params.h */
-void             Config_Save(void);          /* write to Flash */
-void             Config_Reset(void);         /* back to params.h defaults */
-SystemConfig_t  *Config_Get(void);           /* pointer to live config */
+/**
+ * @brief Initialize configuration system.
+ *        Loads from Flash if valid, otherwise falls back to defaults.
+ */
+void Config_Init(void);
+
+/**
+ * @brief Save current system parameters to Flash.
+ */
+bool Config_Save(void);
+
+/**
+ * @brief Restore parameters to compiled-in defaults (factory reset).
+ */
+void Config_ResetDefaults(void);
+
+/**
+ * @brief Get pointer to the active runtime configuration.
+ */
+SystemConfig_t* Config_Get(void);
+
+#endif /* CONFIG_H */

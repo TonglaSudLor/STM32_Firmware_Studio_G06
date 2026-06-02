@@ -27,6 +27,7 @@
 #include "hw_io.h"
 #include "kalman.h"
 #include "params.h"
+#include "config.h"
 #include "current_sensor.h"
 #include <string.h>
 #include <stdio.h>
@@ -288,6 +289,7 @@ int main(void)
 		}
 	}
 
+	Config_Init(); // Load tuning from Flash
 	Motor_Init();
 	HW_Init();
 	CurrentSensor_Init(&hadc1);
@@ -369,6 +371,13 @@ int main(void)
 			 * debounce/ADC state. The ISR already refreshes hw at 100 Hz. */
 			Telemetry_Update();
 			last_matlab_tick = HAL_GetTick();
+		}
+
+		// Flash Save Check (Triggered from Dashboard via Telemetry CMD)
+		extern volatile bool flash_save_requested;
+		if (flash_save_requested) {
+			flash_save_requested = false;
+			Config_Save();
 		}
 
 		/* Slide-switch debounce and mode sync — runs entirely in the main loop.

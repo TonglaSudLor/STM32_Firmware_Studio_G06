@@ -33,6 +33,7 @@ static void Telemetry_HandleCmd(char *payload);
 /* --- Public Implementation --- */
 
 static bool has_received_command = false;
+volatile bool flash_save_requested = false;
 
 bool Telemetry_HasReceivedCommand(void) {
     return has_received_command;
@@ -272,5 +273,7 @@ static void Telemetry_HandleCmd(char *payload) {
     else if (strcmp(payload, "CLAW_STOP") == 0) { hw.out_gripper_down = 0; }
     else if (strcmp(payload, "TOGGLE_MODE") == 0) { Mode_Toggle(); }
     else if (strcmp(payload, "DIAG") == 0 || strcmp(payload, "Z") == 0) { Motor_ProcessCommand('Z'); }
+    else if (strcmp(payload, "SAVE") == 0) { flash_save_requested = true; printf("[SYSTEM] Flash Save Requested
+"); }
     else if (strcmp(payload, "SET_HOME") == 0) { Motor_SetHomeHere(); }
 }
