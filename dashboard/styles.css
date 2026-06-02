@@ -1954,7 +1954,7 @@ select.tl-select:hover {
 
 /* --- Increased Debug Console Height --- */
 .col-center #debug-log {
-    height: 350px; /* Increased from the implicit smaller height */
+    height: 250px; /* Increased from the implicit smaller height */
     min-height: 250px;
     margin-top: 15px; /* Add some space above it */
 }
