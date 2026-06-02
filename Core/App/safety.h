@@ -2,17 +2,13 @@
  * @file safety.h
  * @brief Fault Manager — centralised E-Stop and fault code handling.
  *
- * TODO: Extract from Core/Inc/motor_controller.h + Core/Src/motor_controller.c
- *   - Motor_FaultCode_t enum
- *   - FAULT_SET / FAULT_CLR macros (PRIMASK-guarded RMW)
- *   - fault_code volatile variable
- *   - emergency_stop volatile variable
- *   - All safety check logic in Motor_ControlLoop():
- *       stall detection, encoder check, over-rotation, overcurrent
+ * All fault bit operations MUST go through Safety_SetFault/ClearFault.
+ * These are ISR-safe (PRIMASK-guarded). Never write fault_code directly.
  *
- * When done: add Core/App/safety.c
- *   Rule: all fault bit operations must go through Safety_SetFault/ClearFault.
- *         Never write fault_code directly from outside this module.
+ * PRIMASK intrinsics (__get_PRIMASK, __disable_irq, __set_PRIMASK) must be
+ * provided by the build:
+ *   - Firmware  : stm32g4xx_hal.h (included upstream)
+ *   - Unit tests : -include mock_hal.h (see tests/Makefile)
  */
 
 #pragma once
@@ -29,12 +25,16 @@ typedef enum {
     FAULT_PROX_LOST         = 0x020,
     FAULT_ESTOP_JOYSTICK    = 0x040,
     FAULT_ESTOP_DASHBOARD   = 0x080,
-    FAULT_ESTOP_MODBUS      = 0x100
+    FAULT_ESTOP_MODBUS      = 0x100,
+    FAULT_STARTUP_ESTOP     = 0x200,   /* power-on latch — cleared by self-test */
+    FAULT_OVERCURRENT       = 0x400,
 } FaultCode_t;
 
-void       Safety_Init(void);
-void       Safety_SetFault(FaultCode_t bits);    /* ISR-safe */
-void       Safety_ClearFault(FaultCode_t bits);  /* ISR-safe */
+void        Safety_Init(void);
+void        Safety_SetFault(FaultCode_t bits);   /* ISR-safe (PRIMASK) */
+void        Safety_ClearFault(FaultCode_t bits); /* ISR-safe (PRIMASK) */
 FaultCode_t Safety_GetFaults(void);
-bool       Safety_IsEStop(void);
-void       Safety_CheckAll(void);                /* call at 100 Hz */
+bool        Safety_IsEStop(void);                /* true if ANY fault is active */
+
+/* TODO: implement when extracting stall/over-rot/joystick checks from motor_controller.c */
+void        Safety_CheckAll(void);               /* call at 100 Hz */

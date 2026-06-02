@@ -126,6 +126,53 @@ static void fc06_write(Modbus_Frame_Ctx_t *ctx,
     append_crc(tx_buf, 6, tx_len);
 }
 
+/* FC16 — Write Multiple Registers */
+static void fc16_write_multiple(Modbus_Frame_Ctx_t *ctx,
+                                const uint8_t *pdu, uint16_t pdu_len,
+                                uint8_t *tx_buf, uint16_t *tx_len)
+{
+    /* Minimum: FC(1) + start_addr(2) + quantity(2) + byte_count(1) = 6 bytes */
+    if (pdu_len < 6) {
+        build_exception(ctx->slave_address, 0x10, EX_ILLEGAL_DATA_VALUE, tx_buf, tx_len);
+        return;
+    }
+
+    uint16_t addr     = ((uint16_t)pdu[1] << 8) | pdu[2];
+    uint16_t quantity = ((uint16_t)pdu[3] << 8) | pdu[4];
+    uint8_t  byte_cnt = pdu[5];
+
+    if (quantity < 1 || quantity > 0x7B) {
+        build_exception(ctx->slave_address, 0x10, EX_ILLEGAL_DATA_VALUE, tx_buf, tx_len);
+        return;
+    }
+    if (byte_cnt != (uint8_t)(quantity * 2)) {
+        build_exception(ctx->slave_address, 0x10, EX_ILLEGAL_DATA_VALUE, tx_buf, tx_len);
+        return;
+    }
+    if ((uint16_t)(6u + byte_cnt) > pdu_len) {
+        build_exception(ctx->slave_address, 0x10, EX_ILLEGAL_DATA_VALUE, tx_buf, tx_len);
+        return;
+    }
+    if (addr + quantity > ctx->register_count) {
+        build_exception(ctx->slave_address, 0x10, EX_ILLEGAL_DATA_ADDRESS, tx_buf, tx_len);
+        return;
+    }
+
+    for (uint16_t i = 0; i < quantity; i++) {
+        ctx->registers[addr + i].U8[1] = pdu[6 + i * 2];     /* hi byte */
+        ctx->registers[addr + i].U8[0] = pdu[6 + i * 2 + 1]; /* lo byte */
+    }
+
+    /* Response: slave + FC + start_addr(2) + quantity(2) + CRC(2) = 8 bytes */
+    tx_buf[0] = ctx->slave_address;
+    tx_buf[1] = 0x10;
+    tx_buf[2] = pdu[1];
+    tx_buf[3] = pdu[2];
+    tx_buf[4] = pdu[3];
+    tx_buf[5] = pdu[4];
+    append_crc(tx_buf, 6, tx_len);
+}
+
 /* -------------------------------------------------------------------------
  * Public API
  * ---------------------------------------------------------------------- */
@@ -162,10 +209,12 @@ bool Modbus_BuildResponse(Modbus_Frame_Ctx_t *ctx,
     if (rx_buf[0] != ctx->slave_address) return false;
 
     /* Dispatch on function code (PDU starts at rx_buf[1]) */
-    const uint8_t *pdu = &rx_buf[1];
+    const uint8_t *pdu     = &rx_buf[1];
+    uint16_t       pdu_len = rx_len - 3u; /* strip slave_addr(1) + CRC(2) */
     switch (pdu[0]) {
-        case 0x03: fc03_read (ctx, pdu, tx_buf, tx_len); break;
-        case 0x06: fc06_write(ctx, pdu, tx_buf, tx_len); break;
+        case 0x03: fc03_read          (ctx, pdu,          tx_buf, tx_len); break;
+        case 0x06: fc06_write         (ctx, pdu,          tx_buf, tx_len); break;
+        case 0x10: fc16_write_multiple(ctx, pdu, pdu_len, tx_buf, tx_len); break;
         default:
             build_exception(ctx->slave_address, pdu[0],
                             EX_ILLEGAL_FUNCTION, tx_buf, tx_len);

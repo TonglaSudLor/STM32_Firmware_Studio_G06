@@ -180,8 +180,8 @@ static void test_errors(void)
     TEST("count=0 returns true (exception)", ok);
     TEST("count=0 exception code 0x03",      tx[2] == 0x03);
 
-    /* Unknown function code → exception 0x01 */
-    uint8_t pdu_unk[] = {0x10, 0x00, 0x00, 0x00, 0x01};
+    /* Unknown function code (0x08 = Diagnostics, not implemented) → exception 0x01 */
+    uint8_t pdu_unk[] = {0x08, 0x00, 0x00, 0x00, 0x01};
     rx_len = make_frame(rx, 21, pdu_unk, sizeof(pdu_unk));
     ok = Modbus_BuildResponse(&ctx, rx, rx_len, tx, &tx_len);
     TEST("unknown FC returns true (exception)", ok);
@@ -192,6 +192,65 @@ static void test_errors(void)
     rx_len = make_frame(rx, 21, pdu_w_oor, sizeof(pdu_w_oor));
     ok = Modbus_BuildResponse(&ctx, rx, rx_len, tx, &tx_len);
     TEST("FC06 OOR exception 0x02", tx[2] == 0x02);
+}
+
+/* -------------------------------------------------------------------------
+ * Test: FC16 Write Multiple Registers
+ * ---------------------------------------------------------------------- */
+static void test_fc16(void)
+{
+    printf("\n[FC16 Write Multiple Registers]\n");
+
+    Modbus_Register_t regs[8] = {0};
+    Modbus_Frame_Ctx_t ctx = {.slave_address = 1,
+                               .registers     = regs,
+                               .register_count = 8};
+    uint8_t rx[32], tx[64];
+    uint16_t rx_len, tx_len;
+
+    /* Write 2 registers: reg[1]=0x1234, reg[2]=0x5678 */
+    uint8_t pdu[] = {0x10, 0x00, 0x01, 0x00, 0x02, 0x04, 0x12, 0x34, 0x56, 0x78};
+    rx_len = make_frame(rx, 1, pdu, sizeof(pdu));
+    bool ok = Modbus_BuildResponse(&ctx, rx, rx_len, tx, &tx_len);
+
+    TEST("FC16 returns true",          ok);
+    TEST("FC16 reg[1] = 0x1234",       regs[1].U16 == 0x1234);
+    TEST("FC16 reg[2] = 0x5678",       regs[2].U16 == 0x5678);
+    TEST("FC16 response FC",           tx[1] == 0x10);
+    TEST("FC16 response start_addr hi", tx[2] == 0x00);
+    TEST("FC16 response start_addr lo", tx[3] == 0x01);
+    TEST("FC16 response qty hi",       tx[4] == 0x00);
+    TEST("FC16 response qty lo",       tx[5] == 0x02);
+    TEST("FC16 response length",       tx_len == 8); /* addr+FC+addr2+qty2+CRC2 */
+
+    /* Single register write: reg[4]=0xABCD */
+    uint8_t pdu2[] = {0x10, 0x00, 0x04, 0x00, 0x01, 0x02, 0xAB, 0xCD};
+    rx_len = make_frame(rx, 1, pdu2, sizeof(pdu2));
+    ok = Modbus_BuildResponse(&ctx, rx, rx_len, tx, &tx_len);
+    TEST("FC16 single reg ok",         ok);
+    TEST("FC16 single reg = 0xABCD",   regs[4].U16 == 0xABCD);
+
+    /* Address out of range (reg[7] + qty=2 overflows 8 regs) → exception 0x02 */
+    uint8_t pdu_oor[] = {0x10, 0x00, 0x07, 0x00, 0x02, 0x04, 0x00, 0x01, 0x00, 0x02};
+    rx_len = make_frame(rx, 1, pdu_oor, sizeof(pdu_oor));
+    ok = Modbus_BuildResponse(&ctx, rx, rx_len, tx, &tx_len);
+    TEST("FC16 OOR returns true (ex)", ok);
+    TEST("FC16 OOR exception code",    tx[2] == 0x02);
+
+    /* byte_count mismatch (qty=2 → need 4 bytes, but byte_cnt=3) → exception 0x03 */
+    uint8_t pdu_bc[] = {0x10, 0x00, 0x00, 0x00, 0x02, 0x03, 0x00, 0x01, 0x00};
+    rx_len = make_frame(rx, 1, pdu_bc, sizeof(pdu_bc));
+    ok = Modbus_BuildResponse(&ctx, rx, rx_len, tx, &tx_len);
+    TEST("FC16 bad byte_count ex",     ok);
+    TEST("FC16 bad byte_count code",   tx[2] == 0x03);
+
+    /* Verify response CRC is valid */
+    uint8_t pdu3[] = {0x10, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x42};
+    rx_len = make_frame(rx, 1, pdu3, sizeof(pdu3));
+    Modbus_BuildResponse(&ctx, rx, rx_len, tx, &tx_len);
+    uint16_t exp_crc = Modbus_CRC16(tx, tx_len - 2);
+    Modbus_Register_t got; got.U8[0] = tx[tx_len-2]; got.U8[1] = tx[tx_len-1];
+    TEST("FC16 response CRC valid",    exp_crc == got.U16);
 }
 
 /* -------------------------------------------------------------------------
@@ -229,6 +288,7 @@ int main(void)
     test_crc16();
     test_fc03();
     test_fc06();
+    test_fc16();
     test_errors();
     test_response_crc();
 

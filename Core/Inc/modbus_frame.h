@@ -6,6 +6,7 @@
  *   - CRC-16 calculation
  *   - FC03 Read Holding Registers
  *   - FC06 Write Single Register
+ *   - FC16 Write Multiple Registers
  *   - Exception responses
  *
  * It knows nothing about UARTs, timers, or STM32. Unit-testable on any host.

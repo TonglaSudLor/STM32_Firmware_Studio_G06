@@ -1,1 +1,4 @@
-tests/test_modbus_frame
+test_modbus_frame
+test_pid
+test_encoder
+test_safety

@@ -79,6 +79,8 @@ controller                       bridge.c    hub.c
 
 ## 4. Module Map (ไฟล์ไหนทำอะไร)
 
+### Existing Modules (build-tested on STM32)
+
 | ไฟล์ | หน้าที่ | แก้เมื่อ |
 |------|---------|---------|
 | `Core/Inc/params.h` | **ค่าตั้งต้นทุกอย่าง** PID gains, S-curve limits, Kalman noise, motor model | tune ค่า |
@@ -86,11 +88,33 @@ controller                       bridge.c    hub.c
 | `Core/Inc/motor_controller.h` | enum modes, fault codes, structs, FAULT_SET/CLR macros | เพิ่ม fault code |
 | `Core/Src/kalman.c` | 4-state Kalman filter (θ, ω, τ_L, i_a) รัน 1 kHz | แก้ motor model |
 | `Core/Src/modbus_bridge.c` | Register map + heartbeat + PnP state machine | เพิ่ม/แก้ register |
-| `Core/Src/modbus_rtu.c` | Modbus RTU protocol: CRC16, FC03/FC06, state machine | แก้ protocol |
+| `Core/Src/modbus_rtu.c` | Modbus RTU protocol: CRC16, FC03/FC06/FC16, state machine | แก้ protocol |
+| `Core/Src/modbus_frame.c` | **ใหม่** Pure C99 Modbus framer: CRC16 + FC03/FC06/FC16 — unit-testable | แก้ framing |
 | `Core/Src/telemetry_hub.c` | Dashboard serial protocol (50 Hz fast + 1 Hz slow) | เพิ่ม telemetry field |
 | `Core/Src/hw_io.c` | GPIO relay/opto: gripper relay, reed sensors, proximity | เพิ่ม I/O |
 | `Core/Src/current_sensor.c` | WCS1800 ADC: auto-calibrate zero, get amps | แก้ sensor |
 | `dashboard/` | Web Serial HTML/JS dashboard (Chrome/Edge เท่านั้น) | แก้ UI |
+
+### New Layers — Pure Logic (unit-testable on PC)
+
+| ไฟล์ | หน้าที่ | สถานะ |
+|------|---------|-------|
+| `Core/Lib/pid.c/.h` | PID controller: P+I+D, anti-windup, derivative filter | ✅ implement + 19 tests |
+| `Core/Lib/scurve.h` | S-curve trajectory planner | 🔲 stub (ดูใน motor_controller.c) |
+| `Core/Lib/input_shaper.h` | ZVD input shaper | 🔲 stub |
+| `Core/Drivers/encoder.c/.h` | Encoder math: delta, rollover, RPM filter (no HAL) | ✅ implement + 26 tests |
+| `Core/Drivers/encoder_hal.c` | HAL adapter: อ่าน TIM3 → calls encoder.c | ✅ implement |
+| `Core/Drivers/pwm_output.c/.h` | TIM1 PWM + direction GPIO wrapper | ✅ implement |
+| `Core/App/safety.c/.h` | Fault manager: SetFault/ClearFault/IsEStop (PRIMASK-safe) | ✅ implement + 21 tests |
+| `Core/App/gripper.c/.h` | Gripper relay: Up/Down/Open/Close + Pick/Place sequences | ✅ implement |
+| `Core/App/sequencer.h` | Pick-and-place state machine | 🔲 stub |
+| `Core/Middleware/joystick.h` | ESP32 USART3 packet parser | 🔲 stub |
+| `Core/Config/config.h` | Flash config save/load | 🔲 stub |
+
+**ModbusBridge เพิ่มใหม่ (จาก remote merge):**
+- `ModbusBridge_IsBaseAlive()` — ตรวจว่า heartbeat จาก Base System ยังมาอยู่
+- `ModbusBridge_GetPnPState()` — อ่าน PnP task state จาก remote register
+- `ModbusBridge_UartErrorRecovery()` — เรียก `Modbus_UartErrorRecovery()` เมื่อ UART error
 
 ---
 
@@ -141,13 +165,19 @@ FAULT_PROX_LOST       = 0x020  // proximity sensor เปิด
 FAULT_ESTOP_JOYSTICK  = 0x040  // joystick กด P/X
 FAULT_ESTOP_DASHBOARD = 0x080  // dashboard กด EMERGENCY STOP
 FAULT_ESTOP_MODBUS    = 0x100  // Modbus reg 0x25 bit0
+FAULT_STARTUP_ESTOP   = 0x200  // power-on latch — cleared by self-test (DIAG)
+FAULT_OVERCURRENT     = 0x400  // WCS1800 > OVERCURRENT_LIMIT_AMPS
 ```
 
-Set/Clear ต้องใช้ macro เสมอ (ISR-safe):
+**ใช้ Safety API ใหม่ (Core/App/safety.c):**
 ```c
-FAULT_SET(FAULT_MOTOR_STALLED);
-FAULT_CLR(FAULT_MOTOR_STALLED);
+Safety_SetFault(FAULT_MOTOR_STALLED);   // ISR-safe, PRIMASK-guarded
+Safety_ClearFault(FAULT_MOTOR_STALLED);
+if (Safety_IsEStop()) { /* ห้ามขยับ */ }
+FaultCode_t f = Safety_GetFaults();     // อ่านทั้ง bitmask
 ```
+
+*(เดิม: ใช้ FAULT_SET/FAULT_CLR macros ใน motor_controller.h ก็ยังใช้ได้อยู่)*
 
 ---
 
@@ -218,14 +248,26 @@ register_frame[0xXX].U16 = (uint16_t)(some_value * 10);
 
 ```bash
 cd tests/
-make test          # build + run ทุก test
+make test          # build + run ทุก test (117 tests total)
 make clean         # ล้าง binary
 ```
 
 **Test files:**
-- `test_modbus_frame.c` — CRC16, FC03 read, FC06 write, bad CRC, wrong address
 
-ต้องการแค่ `gcc` บน Mac/Linux — **ไม่ต้องมี board**
+| ไฟล์ | ครอบคลุม | จำนวน test |
+|------|----------|-----------|
+| `test_modbus_frame.c` | CRC16, FC03, FC06, **FC16**, bad CRC, exceptions | 51 |
+| `test_pid.c` | P/I/D terms, anti-windup, clamping, reset, dt=0 | 19 |
+| `test_encoder.c` | position, rollover, noise filter, RPM filter | 26 |
+| `test_safety.c` | SetFault, ClearFault, IsEStop, bitmask groups | 21 |
+| **รวม** | | **117** |
+
+ต้องการแค่ `gcc` + `libm` บน Mac/Linux — **ไม่ต้องมี board**
+
+**Modules ที่ยังไม่มี test** (HAL-dependent):
+- `pwm_output.c` — TIM1 + GPIO, ทดสอบบน hardware
+- `gripper.c` — relay + reed switch timeout, ทดสอบบน hardware
+- `encoder_hal.c` — TIM3 read, ทดสอบบน hardware
 
 ---
 
@@ -234,14 +276,22 @@ make clean         # ล้าง binary
 ตามลำดับ priority:
 
 ```
-1. [ ] ย้าย dashboard ไป USB CDC (แก้ปัญหา LPUART1 sharing)
-2. [ ] เพิ่ม UART error recovery ใน modbus_rtu.c
-3. [ ] Rewrite dashboard เป็น Python + PyQt6
-4. [ ] Flash config save (tune แล้วรอด reset)
-5. [ ] แยก pure logic ออกเป็น Lib/ (pid, scurve, input_shaper, kalman)
-       → ดูแผนเต็มได้ที่ Second Brain: projects/pickplace-full-refactor-plan.md
-6. [ ] FreeRTOS (เมื่อ module แยกครบแล้ว)
+✅ UART error recovery — Modbus_UartErrorRecovery() + mode-aware HAL_UART_ErrorCallback
+✅ FC16 Write Multiple Registers — modbus_frame.c + 16 tests pass
+✅ Pure modules — pid, encoder, safety, gripper แยกออกจาก motor_controller.c แล้ว
+✅ Unit tests — 117 tests, 0 fail
+
+🔲 1. ย้าย dashboard ไป USB CDC (แก้ปัญหา LPUART1 sharing root cause)
+🔲 2. Rewrite dashboard เป็น Python + PyQt6 (ออกจาก Chrome-only)
+🔲 3. Flash config save — implement Core/Config/config.c (tune แล้วรอด reset)
+🔲 4. scurve.c — extract scurve_plan/eval จาก motor_controller.c → Core/Lib/scurve.c
+🔲 5. input_shaper.c — extract ZVD shaper → Core/Lib/input_shaper.c
+🔲 6. sequencer.c — extract PnP state machine → Core/App/sequencer.c
+🔲 7. joystick.c — extract USART3 parser → Core/Middleware/joystick.c
+🔲 8. FreeRTOS (เมื่อ module แยกครบแล้ว เพื่อ deterministic scheduling)
 ```
+
+แผนเต็ม: Second Brain → `projects/pickplace-full-refactor-plan.md`
 
 ---
 
