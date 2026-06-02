@@ -107,17 +107,6 @@
                 </div>
 
 
-                <div class="hw-io-grid">
-                    <div class="io-item" id="io-prox">
-                        <div class="led"></div>
-                        <label>Prox</label>
-                    </div>
-                    <div class="io-item" id="io-estop">
-                        <div class="led"></div>
-                        <label>E-Stop</label>
-                    </div>
-                </div>
-            
                 <!-- Integrated Heartbeat -->
                 <div class="hb-integrated">
 <!-- Sensor + STM32 Heartbeat (compact horizontal) -->
@@ -131,6 +120,19 @@
                         <span id="hb-rate" class="hb-rate">-- Hz</span>
                     </div>
                     <div class="hb-tiles-row">
+                        <!-- RAW I/O TILES -->
+                        <div class="hb-tile" id="hbt-raw-prox" data-status="idle">
+                            <div class="hb-dot"></div>
+                            <div class="hb-name">PROX(Raw)</div>
+                            <div class="hb-val">--</div>
+                        </div>
+                        <div class="hb-tile" id="hbt-raw-estop" data-status="idle">
+                            <div class="hb-dot"></div>
+                            <div class="hb-name">ESTOP(Raw)</div>
+                            <div class="hb-val">--</div>
+                        </div>
+                        <div class="hb-group-sep"></div>
+
                         <!-- SENSOR TILES -->
                         <div class="hb-tile" id="hbt-encoder" data-status="idle">
                             <div class="hb-dot"></div>

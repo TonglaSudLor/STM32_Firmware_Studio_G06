@@ -442,8 +442,8 @@ function updateUI() {
         bjm.className = 'toggle-btn ' + (state.jogMode === 'FINE' ? 'active' : '');
     }
 
-    ioProx.className = "io-item " + (state.prox ? "active" : "");
-    ioEstop.className = "io-item " + (state.estop ? "active" : "");
+    // ioProx removed
+    // ioEstop removed
 
     btnGripperUD.innerText = "Gripper: " + (state.gripper_ud ? "DOWN" : "UP");
     btnGripperUD.className = "toggle-btn " + (state.gripper_ud ? "active" : "active-green");
@@ -496,6 +496,11 @@ function updateHeartbeat() {
     }
 
     const f = state.fault;
+
+    
+    // RAW I/O
+    setHbTile('hbt-raw-prox', state.prox ? 'ok' : 'idle', state.prox ? 'TRIP' : 'CLR');
+    setHbTile('hbt-raw-estop', state.estop ? 'fault' : 'ok', state.estop ? 'PRESS' : 'SAFE');
 
     // ENCODER
     setHbTile('hbt-encoder',
