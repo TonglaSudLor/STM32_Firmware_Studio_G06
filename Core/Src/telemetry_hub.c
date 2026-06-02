@@ -3,6 +3,7 @@
 #include "hw_io.h"
 #include "kalman.h"
 #include "modbus_bridge.h"
+#include "params.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -275,8 +276,7 @@ static void Telemetry_HandleCmd(char *payload) {
         trajectory.current_setpoint_vel = 0.0f;
         pid_position.integral = 0.0f;
         pid_speed.integral = 0.0f;
-        printf("[SYSTEM] Safety Release: Trajectory Synced to %.2f deg
-", trajectory.target_pos);
+        printf("[SYSTEM] Safety Release: Trajectory Synced to %.2f deg\r\n", trajectory.target_pos);
     }
     else if (strcmp(payload, "HOME") == 0) { trigger_homing_sequence = true; }
     else if (strcmp(payload, "GRIP_UP") == 0) { Gripper_Up(); }
@@ -287,7 +287,6 @@ static void Telemetry_HandleCmd(char *payload) {
     else if (strcmp(payload, "CLAW_STOP") == 0) { hw.out_gripper_down = 0; }
     else if (strcmp(payload, "TOGGLE_MODE") == 0) { Mode_Toggle(); }
     else if (strcmp(payload, "DIAG") == 0 || strcmp(payload, "Z") == 0) { Motor_ProcessCommand('Z'); }
-    else if (strcmp(payload, "SAVE") == 0) { flash_save_requested = true; printf("[SYSTEM] Flash Save Requested
-"); }
+    else if (strcmp(payload, "SAVE") == 0) { flash_save_requested = true; printf("[SYSTEM] Flash Save Requested\r\n"); }
     else if (strcmp(payload, "SET_HOME") == 0) { Motor_SetHomeHere(); }
 }
