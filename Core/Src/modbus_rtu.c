@@ -238,78 +238,94 @@ static void Modbus_Emit(Modbus_Handle_t* hmodbus)
 }
 #endif
 
-void Modbus_Process(Modbus_Handle_t* hmodbus)
+void Modbus_RxCpltCallback(Modbus_Handle_t* hmodbus, uint8_t data)
 {
-    switch (hmodbus->state)
-    {
-    case MODBUS_STATE_IDLE:
-        if (hmodbus->flag_t35_timeout == 1)
-        {
-            hmodbus->flag_t35_timeout = 0;
-            hmodbus->state = MODBUS_STATE_PROCESSING;
-        }
-        break;
-        
-    case MODBUS_STATE_RECEPTION:
-        if (hmodbus->flag_t35_timeout == 1)
-        {
-            hmodbus->flag_t35_timeout = 0;
-            hmodbus->state = MODBUS_STATE_PROCESSING;
-        }
-        break;
-        
-    case MODBUS_STATE_PROCESSING:
-    {
-        if (hmodbus->uart.rx_tail < 4)
-        {
-            modbus_frame_errors++;
-            hmodbus->uart.rx_tail = 0;
-            hmodbus->state = MODBUS_STATE_IDLE;
-            break;
-        }
-
-        /* Delegate all frame parsing + response building to modbus_frame */
-        Modbus_Frame_Ctx_t fctx = {
-            .slave_address  = hmodbus->slave_address,
-            .registers      = hmodbus->registers,
-            .register_count = hmodbus->register_count,
-        };
-        uint16_t tx_len = 0;
-        bool respond = Modbus_BuildResponse(&fctx,
-                                            hmodbus->uart.rx_buffer,
-                                            hmodbus->uart.rx_tail,
-                                            hmodbus->uart.tx_buffer,
-                                            &tx_len);
-        hmodbus->uart.rx_tail = 0;
-
-        if (!respond)
-        {
-            /* Bad CRC or wrong slave address — count and stay silent */
-            modbus_crc_errors++;
-            hmodbus->state = MODBUS_STATE_IDLE;
-            break;
-        }
-
-        hmodbus->uart.tx_tail = tx_len;
-        hmodbus->state = MODBUS_STATE_EMISSION;
-        HAL_UART_Transmit_IT(hmodbus->huart,
-                             hmodbus->uart.tx_buffer,
-                             hmodbus->uart.tx_tail);
-        break;
+    /* Always accept data if there is space in the buffer. 
+     * Modbus RTU is half-duplex, but the Master might send the next 
+     * frame before our TX is fully finished at the hardware level. */
+    if (hmodbus->uart.rx_tail < MODBUS_BUFFER_SIZE) {
+        hmodbus->uart.rx_buffer[hmodbus->uart.rx_tail++] = data;
+    } else {
+        modbus_rx_overruns++;
     }
-        
-    case MODBUS_STATE_EMISSION:
-        if (hmodbus->huart->gState == HAL_UART_STATE_READY)
-        {
-            hmodbus->state = MODBUS_STATE_IDLE;
-            hmodbus->uart.tx_tail = 0;
-            hmodbus->uart.rx_tail = 0;
-            HAL_UART_Receive_IT(hmodbus->huart, &modbus_rx_byte, 1);
-        }
-        break;
+    
+    hmodbus->state = MODBUS_STATE_RECEPTION;
+    
+    /* Reset T3.5 timer */
+    __HAL_TIM_SET_COUNTER(hmodbus->htim, 0);
+    HAL_TIM_Base_Start_IT(hmodbus->htim);
+}
 
-    default:
+void Modbus_TimerCallback(Modbus_Handle_t* hmodbus)
+{
+    HAL_TIM_Base_Stop_IT(hmodbus->htim);
+    
+    /* Process the frame IMMEDIATELY in ISR context to minimize jitter */
+    if (hmodbus->uart.rx_tail < 4) {
+        modbus_frame_errors++;
+        hmodbus->uart.rx_tail = 0;
         hmodbus->state = MODBUS_STATE_IDLE;
-        break;
+        return;
+    }
+
+    Modbus_Frame_Ctx_t fctx = {
+        .slave_address  = hmodbus->slave_address,
+        .registers      = hmodbus->registers,
+        .register_count = hmodbus->register_count,
+    };
+    uint16_t tx_len = 0;
+    uint16_t current_rx_len = hmodbus->uart.rx_tail;
+    
+    bool respond = Modbus_BuildResponse(&fctx,
+                                        hmodbus->uart.rx_buffer,
+                                        current_rx_len,
+                                        hmodbus->uart.tx_buffer,
+                                        &tx_len);
+    
+    /* Reset RX buffer */
+    hmodbus->uart.rx_tail = 0;
+
+    if (!respond) {
+        modbus_crc_errors++;
+        hmodbus->state = MODBUS_STATE_IDLE;
+        return;
+    }
+
+    hmodbus->uart.tx_tail = tx_len;
+    /* Retry a few times if the UART is busy (e.g. finishing a previous heartbeat) */
+    uint32_t retry = 1000;
+    while (HAL_UART_Transmit_IT(hmodbus->huart,
+                                hmodbus->uart.tx_buffer,
+                                hmodbus->uart.tx_tail) == HAL_BUSY && retry--) {
+        __NOP();
+    }
+    
+    if (retry > 0) {
+        hmodbus->state = MODBUS_STATE_EMISSION;
+        hmodbus->uart.emission_start_tick = HAL_GetTick();
+    } else {
+        /* Only drop if absolutely stuck */
+        hmodbus->state = MODBUS_STATE_IDLE;
     }
 }
+
+void Modbus_TxCpltCallback(Modbus_Handle_t* hmodbus)
+{
+    if (hmodbus->state == MODBUS_STATE_EMISSION) {
+        hmodbus->state = MODBUS_STATE_IDLE;
+        hmodbus->uart.tx_tail = 0;
+    }
+}
+
+void Modbus_Process(Modbus_Handle_t* hmodbus)
+{
+    /* Main loop side now only handles the safety timeout for emission 
+     * in case the TxCplt interrupt never fires (hardware glitch). */
+    if (hmodbus->state == MODBUS_STATE_EMISSION) {
+        if (HAL_GetTick() - hmodbus->uart.emission_start_tick > 100) {
+            hmodbus->state = MODBUS_STATE_IDLE;
+            hmodbus->uart.tx_tail = 0;
+        }
+    }
+}
+

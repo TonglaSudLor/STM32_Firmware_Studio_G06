@@ -289,6 +289,32 @@ int main(void)
 		}
 	}
 
+	/* Log reset cause BEFORE Motor_Init clears the IWDG flags with its own
+	 * activity.  Multiple flags can be set simultaneously (e.g. BOD+PIN on a
+	 * clean power-on), so we log every set bit rather than early-exit. */
+	{
+		uint32_t csr = RCC->CSR;
+		RCC->CSR |= RCC_CSR_RMVF;   /* clear all reset flags for the next boot */
+		if (csr & RCC_CSR_IWDGRSTF)
+			HAL_UART_Transmit(&hlpuart1,
+				(uint8_t*)"[BOOT] Reset: IWDG watchdog timeout\r\n", 37, 200);
+		if (csr & RCC_CSR_WWDGRSTF)
+			HAL_UART_Transmit(&hlpuart1,
+				(uint8_t*)"[BOOT] Reset: Window watchdog\r\n", 31, 200);
+		if (csr & RCC_CSR_SFTRSTF)
+			HAL_UART_Transmit(&hlpuart1,
+				(uint8_t*)"[BOOT] Reset: Software (NVIC_SystemReset)\r\n", 43, 200);
+		if (csr & RCC_CSR_BORRSTF)
+			HAL_UART_Transmit(&hlpuart1,
+				(uint8_t*)"[BOOT] Reset: Brown-out (supply voltage drop!)\r\n", 48, 200);
+		if ((csr & RCC_CSR_PINRSTF) && !(csr & RCC_CSR_BORRSTF))
+			HAL_UART_Transmit(&hlpuart1,
+				(uint8_t*)"[BOOT] Reset: NRST pin (button or debugger)\r\n", 45, 200);
+		if (csr & RCC_CSR_LPWRRSTF)
+			HAL_UART_Transmit(&hlpuart1,
+				(uint8_t*)"[BOOT] Reset: Low-power exit\r\n", 30, 200);
+	}
+
 	Config_Init(); // Load tuning from Flash
 	Motor_Init();
 	HW_Init();
@@ -1074,6 +1100,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 	} else if (htim->Instance == TIM16) {
 		/* Modbus RTU T3.5 silence timeout — signal that a frame has ended */
 		ModbusBridge_TimerCallback();
+	}
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+	if (huart->Instance == LPUART1) {
+		ModbusBridge_TxCallback();
 	}
 }
 

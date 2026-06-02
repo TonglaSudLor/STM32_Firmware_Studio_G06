@@ -136,7 +136,9 @@ static void PnP_StateMachine(void)
     switch (pnp_state) {
         case PNP_MOVE_TO_PICK: {
             int16_t pos = (int16_t)register_frame[0x12 + 2 * pnp_current_pair].U16;
-            Motor_MoveToPosition(-(float)pos);  /* flip sign for Base System convention */
+            /* Empirical: Base System sends direct degrees (1:1) for PnP sequence.
+             * Keep sign inversion to match feedback convention. */
+            Motor_MoveToPosition(-(float)pos);
             pnp_state = PNP_WAIT_PICK_ARRIVAL;
             pnp_step_start_tick = HAL_GetTick();
             break;
@@ -167,7 +169,9 @@ static void PnP_StateMachine(void)
 
         case PNP_MOVE_TO_PLACE: {
             int16_t pos = (int16_t)register_frame[0x12 + 2 * pnp_current_pair + 1].U16;
-            Motor_MoveToPosition(-(float)pos);  /* flip sign for Base System convention */
+            /* Empirical: Base System sends direct degrees (1:1) for PnP sequence.
+             * Keep sign inversion to match feedback convention. */
+            Motor_MoveToPosition(-(float)pos);
             pnp_state = PNP_WAIT_PLACE_ARRIVAL;
             pnp_step_start_tick = HAL_GetTick();
             break;
@@ -232,6 +236,10 @@ static void ModbusBridge_HandleCommands(void)
         last_hb_ack_tick = HAL_GetTick();
         base_system_alive = true;
         register_frame[0x00].U16 = HB_YA;   /* reset to YA for next ping */
+    } else if (register_frame[0x00].U16 != HB_YA) {
+        /* Proactive reset: if the register is neither HI nor YA, ensure it
+         * becomes YA so the Base System can see it and start the loop. */
+        register_frame[0x00].U16 = HB_YA;
     }
     /* Detect liveness timeout (3 seconds without HI reply) */
     if (base_system_alive && (HAL_GetTick() - last_hb_ack_tick > 3000)) {
@@ -327,7 +335,18 @@ static void ModbusBridge_HandleCommands(void)
 
     /* 0x24: Point-to-Point Target (sign inverted to match firmware direction) */
     if (register_frame[0x24].U16 != 0) {
-        if (base_active) Motor_MoveToPosition(-(float)((int16_t)register_frame[0x24].U16));
+        if (base_active) {
+            int16_t raw_val = (int16_t)register_frame[0x24].U16;
+            bool is_index = (register_frame[0x23].U16 & 0x01) ? true : false;
+            
+            if (is_index) {
+                /* If index, convert to degrees (assuming 18 degree pitch as per common robot spec) */
+                Motor_MoveToPosition(-(float)raw_val * 18.0f);
+            } else {
+                /* For Point-to-Point, the UI usually sends direct integer degrees. */
+                Motor_MoveToPosition(-(float)raw_val);
+            }
+        }
         register_frame[0x24].U16 = 0;
     }
 
@@ -359,12 +378,10 @@ void ModbusBridge_Init(void)
 {
     /* CubeMX generates TIM16 with Period=49 (5 ms at 10 kHz timer clock).
      * Modbus RTU spec for baud > 19200: T3.5 = 1.75 ms (fixed).
-     * At 230400 baud the true T3.5 is only 166 µs; the 5 ms window is so long
-     * that adjacent frames from the base system (separated by the standard
-     * 166 µs inter-frame gap) get merged into one corrupt frame → CRC fail
-     * → no response → "abnormal heartbeat".  2 ms is safely above the 1.75 ms
-     * spec minimum while being short enough to distinguish consecutive frames. */
-    htim16.Init.Period = 19;    /* 10 kHz clock → (19+1) ticks = 2 ms */
+     * At 230400 baud the true T3.5 is only 166 µs.
+     * We use 1 ms to be tight and avoid heartbeat jitter while still
+     * being safely above the spec minimum. */
+    htim16.Init.Period = 9;    /* 10 kHz clock → (9+1) ticks = 1 ms */
     HAL_TIM_Base_Init(&htim16);
 
     memset(register_frame, 0, sizeof(register_frame));
@@ -390,7 +407,7 @@ void ModbusBridge_Process(void)
     /* 2. Run Pick & Place state machine (non-blocking) */
     PnP_StateMachine();
 
-    /* 3. Run Modbus Protocol Engine */
+    /* 3. Run Modbus Protocol Engine background worker */
     Modbus_Process(&hmodbus);
 }
 
@@ -454,21 +471,17 @@ void ModbusBridge_RxCallback(uint8_t data)
     debug_rx_log[debug_rx_idx % 8] = data;
     debug_rx_idx++;
 
-    if (hmodbus.uart.rx_tail < MODBUS_BUFFER_SIZE) {
-        hmodbus.uart.rx_buffer[hmodbus.uart.rx_tail++] = data;
-    }
-    
-    hmodbus.state = MODBUS_STATE_RECEPTION;
-    
-    // Reset T3.5 Timer
-    __HAL_TIM_SET_COUNTER(hmodbus.htim, 0);
-    HAL_TIM_Base_Start_IT(hmodbus.htim);
+    Modbus_RxCpltCallback(&hmodbus, data);
+}
+
+void ModbusBridge_TxCallback(void)
+{
+    Modbus_TxCpltCallback(&hmodbus);
 }
 
 void ModbusBridge_TimerCallback(void)
 {
-    hmodbus.flag_t35_timeout = 1;
-    HAL_TIM_Base_Stop_IT(hmodbus.htim);
+    Modbus_TimerCallback(&hmodbus);
 }
 
 bool ModbusBridge_IsBaseAlive(void)

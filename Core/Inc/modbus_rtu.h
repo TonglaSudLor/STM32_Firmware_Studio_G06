@@ -58,6 +58,7 @@ typedef struct {
     uint16_t rx_tail;
     uint8_t tx_buffer[MODBUS_BUFFER_SIZE];
     uint16_t tx_tail;
+    uint32_t emission_start_tick;
 } Modbus_Uart_t;
 
 /**
@@ -100,7 +101,28 @@ extern volatile uint32_t modbus_uart_errors;   /* HAL UART error callbacks    */
 void Modbus_Init(Modbus_Handle_t* hmodbus, Modbus_Register_t* reg_start);
 
 /**
- * @brief Main protocol processing worker — call from main loop
+ * @brief Call from HAL_UART_RxCpltCallback when a byte arrives.
+ * @param hmodbus Pointer to handle
+ * @param data    The received byte
+ */
+void Modbus_RxCpltCallback(Modbus_Handle_t* hmodbus, uint8_t data);
+
+/**
+ * @brief Call from HAL_UART_TxCpltCallback when transmission finishes.
+ * @param hmodbus Pointer to handle
+ */
+void Modbus_TxCpltCallback(Modbus_Handle_t* hmodbus);
+
+/**
+ * @brief Call from HAL_TIM_PeriodElapsedCallback on T3.5 timeout.
+ *        Starts the response processing immediately in ISR context.
+ * @param hmodbus Pointer to handle
+ */
+void Modbus_TimerCallback(Modbus_Handle_t* hmodbus);
+
+/**
+ * @brief Main protocol processing worker — call from main loop.
+ *        Now primarily handles safety timeouts and background maintenance.
  * @param hmodbus Pointer to handle
  */
 void Modbus_Process(Modbus_Handle_t* hmodbus);
