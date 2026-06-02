@@ -14,23 +14,49 @@
         rel="stylesheet">
 </head>
 
-<body class="dark-theme" data-mode="operator">
+<body class="dark-theme">
     <header>
         <div class="logo">
             <span class="brand">ROBO-COOK</span>
             <span class="model">PRO DASHBOARD</span>
         </div>
 
-        <div class="mode-toggle-group">
-            <button id="mode-btn-operator" class="mode-btn active">🟢 OPERATOR</button>
-            <button id="mode-btn-tuning" class="mode-btn">🟠 TUNING</button>
+        <!-- Mission Readiness — inline in navbar -->
+        <div id="readiness-bar" class="readiness-bar rd-header-inline">
+            <div class="rd-steps">
+                <div class="rd-step rd-idle" id="rd-step-connect">
+                    <span class="rd-dot"></span>
+                    <span class="rd-label">1 · Connect</span>
+                </div>
+                <span class="rd-arrow">→</span>
+                <div class="rd-step rd-idle" id="rd-step-diag">
+                    <span class="rd-dot"></span>
+                    <span class="rd-label">2 · Self-Test</span>
+                    <button id="btn-run-diag" class="rd-action-btn" title="Run the open-loop hardware diagnostic (checks encoder + direction)">Run</button>
+                </div>
+                <span class="rd-arrow">→</span>
+                <div class="rd-step rd-idle" id="rd-step-home">
+                    <span class="rd-dot"></span>
+                    <span class="rd-label">3 · Home</span>
+                    <button id="btn-readiness-home" class="rd-action-btn" title="Run the homing sequence">Home</button>
+                </div>
+            </div>
+            <div class="rd-status">
+                <button id="rd-detail-btn" class="rd-detail-btn" title="Show self-test / homing details">Details ▾</button>
+                <span id="rd-ready-badge" class="rd-ready-badge not-ready">MOTION LOCKED</span>
+            </div>
+            <div id="rd-detail-panel" class="rd-detail-panel hidden">
+                <div class="rd-detail-row"><strong>Self-Test:</strong> <span id="rd-diag-text">Not run yet.</span></div>
+                <div class="rd-detail-row rd-hint" id="rd-diag-hint-row" style="display:none"><span id="rd-diag-hint"></span></div>
+                <div class="rd-detail-row"><strong>Homing:</strong> <span id="rd-home-text">Not homed.</span></div>
+            </div>
         </div>
 
         <div class="header-controls">
             <div id="serial-status" class="status-indicator disconnected">Disconnected</div>
             <button id="connect-btn" class="primary-btn">Connect Robot</button>
-            
-            
+            <button id="sim-btn" class="secondary-btn">Simulate Data</button>
+            <button id="btn-save-flash" class="secondary-btn">Save to Flash</button>
             <button id="estop-btn" class="danger-btn">EMERGENCY STOP</button>
         </div>
     </header>
@@ -462,8 +488,8 @@
         </div>
 
         <!-- Column 3: Controls -->
-        <div class="col-right tuning-only">
-            <div class="card control-card tuning-only">
+        <div class="col-right">
+            <div class="card control-card">
                 <!-- Fixed top: title + profile bar + jump chips -->
                 <div class="tl-top">
                     <div class="tl-titlebar">
