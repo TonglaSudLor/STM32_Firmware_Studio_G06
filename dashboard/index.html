@@ -90,7 +90,7 @@
                     </div>
                     <div class="status-item">
                         <label>System Mode</label>
-                        <span id="stat-sysmode" class="value">BASE</span>
+                        <span id="stat-sysmode" class="value">Base Modbus</span>
                     </div>
                     <div class="status-item">
                         <label>Base Sys</label>
@@ -123,12 +123,12 @@
                         <!-- RAW I/O TILES -->
                         <div class="hb-tile" id="hbt-raw-prox" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">PROX(Raw)</div>
+                            <div class="hb-name">Raw Prox</div>
                             <div class="hb-val">--</div>
                         </div>
                         <div class="hb-tile" id="hbt-raw-estop" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">ESTOP(Raw)</div>
+                            <div class="hb-name">Raw E-Stop</div>
                             <div class="hb-val">--</div>
                         </div>
                         <div class="hb-group-sep"></div>
@@ -136,43 +136,43 @@
                         <!-- SENSOR TILES -->
                         <div class="hb-tile" id="hbt-encoder" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">ENC</div>
+                            <div class="hb-name">Encoder</div>
                             <div class="hb-val">--</div>
                         </div>
                         <div class="hb-tile" id="hbt-current" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">CURR</div>
+                            <div class="hb-name">Current</div>
                             <div class="hb-val">--</div>
                         </div>
                         <div class="hb-tile" id="hbt-prox" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">PROX</div>
+                            <div class="hb-name">Proximity</div>
                             <div class="hb-val">--</div>
                         </div>
                         <div class="hb-tile" id="hbt-joy" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">JOY</div>
+                            <div class="hb-name">Joystick</div>
                             <div class="hb-val">--</div>
                         </div>
                         <div class="hb-tile" id="hbt-estop" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">ESTOP</div>
+                            <div class="hb-name">E-Stop</div>
                             <div class="hb-val">--</div>
                         </div>
                         <div class="hb-tile" id="hbt-motor" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">MOTOR</div>
+                            <div class="hb-name">Motor</div>
                             <div class="hb-val">--</div>
                         </div>
                         <!-- Reed switch tiles -->
                         <div class="hb-tile" id="hbt-grip" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">GRIP↕</div>
+                            <div class="hb-name">Gripper Z</div>
                             <div class="hb-val">--</div>
                         </div>
                         <div class="hb-tile" id="hbt-claw" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">CLAW</div>
+                            <div class="hb-name">Claw</div>
                             <div class="hb-val">--</div>
                         </div>
                         <!-- Divider between sensor and STM32 groups -->
@@ -180,22 +180,22 @@
                         <!-- STM32 STATUS TILES -->
                         <div class="hb-tile hb-stm-tile" id="hbt-link" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">LINK</div>
+                            <div class="hb-name">Serial Link</div>
                             <div class="hb-val">--</div>
                         </div>
                         <div class="hb-tile hb-stm-tile" id="hbt-ctrl" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">CTRL</div>
+                            <div class="hb-name">Control Loop</div>
                             <div class="hb-val">--</div>
                         </div>
                         <div class="hb-tile hb-stm-tile" id="hbt-sys" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">SYS</div>
+                            <div class="hb-name">System State</div>
                             <div class="hb-val">--</div>
                         </div>
                         <div class="hb-tile hb-stm-tile" id="hbt-base" data-status="idle">
                             <div class="hb-dot"></div>
-                            <div class="hb-name">BASE</div>
+                            <div class="hb-name">Base Modbus</div>
                             <div class="hb-val">--</div>
                         </div>
                     </div>
@@ -789,15 +789,13 @@
                 </div>
             </div>
         </div>
-            <!-- Full Width Debug Console -->
-        <div class="full-width-log">
-<!-- Debug Console -->
-                <div id="debug-log" class="card debug-card">
+                <!-- Debug Console moved to col-right -->
+                <div id="debug-log" class="card debug-card tuning-only">
                     <div class="log-header">Debug Console</div>
                     <div id="log-content"></div>
-                
-        </div>
-    </main>
+                </div>
+            </div>
+            </main>
 
 
     <!-- Fault / Safety Modal -->
