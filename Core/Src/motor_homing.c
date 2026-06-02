@@ -58,6 +58,8 @@ static int   h_direction             = 1;
 static bool  h_verify_overshot       = false;
 static uint32_t h_wiggle_start_ms    = 0u;
 
+bool Motor_Homing_IsWiggling(void) { return h_state == H_WIGGLE_SEARCH; }
+
 bool Motor_RunHomingSequence(void)
 {
     if (emergency_stop) {

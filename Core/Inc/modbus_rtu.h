@@ -10,6 +10,7 @@
 #define MODBUS_RTU_H
 
 #include "stm32g4xx_hal.h"
+#include "modbus_frame.h"
 #include <stdint.h>
 #include <string.h>
 

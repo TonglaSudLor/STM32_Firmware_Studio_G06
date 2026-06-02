@@ -392,10 +392,12 @@ void Motor_ShaperRecompute(void);
 uint32_t Motor_GetShaperDelay(void);
 
 /* ---- Exposed from trajectory.c ---- */
-/** @brief Flush ZVD shaper delay lines with a fixed value (call on mode change). */
-void ZVD_FlushBuffer(float val);
 /** @brief Advance the S-curve trajectory by one control tick. Call from Motor_ControlLoop(). */
 void Trajectory_Generator_Update(void);
+
+/* ---- Exposed from motor_homing.c ---- */
+/** @brief Returns true while homing is in the wiggle-search phase (bypass S-curve during this phase). */
+bool Motor_Homing_IsWiggling(void);
 
 /* ---- Exposed from motor_controller.c for homing ---- */
 /** @brief Recalculate encoder.current_position_deg from absolute_counts and sync count_prev. */

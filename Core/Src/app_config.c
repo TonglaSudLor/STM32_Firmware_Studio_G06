@@ -3,7 +3,7 @@
  * @brief Implementation of Flash-based configuration storage.
  */
 
-#include "config.h"
+#include "app_config.h"
 #include "params.h"
 #include "motor_controller.h"
 #include "main.h"

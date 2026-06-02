@@ -27,7 +27,7 @@
 #include "hw_io.h"
 #include "kalman.h"
 #include "params.h"
-#include "config.h"
+#include "app_config.h"
 #include "current_sensor.h"
 #include <string.h>
 #include <stdio.h>

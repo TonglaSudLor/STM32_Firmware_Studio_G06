@@ -1707,8 +1707,7 @@ void Motor_ControlLoop(void)
         /* Bypass the S-curve planner during wiggle search — the sine wave
          * is already smooth, and the profiler constantly resetting its
          * internal state every tick is what caused the jerking. */
-        if (1) // Fix: h_state missing after refactor
-        if (current_mode != MOTOR_MODE_HOMING) {
+        if (!(current_mode == MOTOR_MODE_HOMING && Motor_Homing_IsWiggling())) {
             Trajectory_Generator_Update();
         }
 
