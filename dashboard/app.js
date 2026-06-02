@@ -139,6 +139,7 @@ const btnOverride = document.getElementById('btn-override');
 
 // --- Serial ---
 let port = null;
+let worker = null;
 let reader = null;
 let inputBuffer = "";
 
@@ -157,10 +158,13 @@ async function connectSerial(existingPort = null) {
         pushSafetyConfig();
         if (typeof onSerialConnected === 'function') onSerialConnected();
 
-        const textDecoder = new TextDecoderStream();
-        port.readable.pipeTo(textDecoder.writable);
-        reader = textDecoder.readable.getReader();
-        readLoop();
+        worker = new Worker('worker.js');
+        worker.onmessage = (e) => {
+            if (e.data.type === 'packet') processPacket(e.data.data);
+            else if (e.data.type === 'log') { log('STM: ' + e.data.data, 'info'); handleFirmwareLine(e.data.data); }
+            else if (e.data.type === 'error') log('Worker error: ' + e.data.data, 'error');
+        };
+        worker.postMessage({ type: 'start', readable: port.readable }, [port.readable]);
     } catch (err) {
         log("Connection failed: " + err.message, "error");
         state.connected = false;
@@ -170,7 +174,7 @@ async function connectSerial(existingPort = null) {
 
 async function disconnectSerial() {
     try {
-        if (reader) { await reader.cancel(); reader = null; }
+        if (worker) { worker.terminate(); worker = null; }
         if (port) { await port.close(); port = null; }
     } catch (e) { /* ignore */ }
     state.connected = false;
@@ -180,10 +184,7 @@ async function disconnectSerial() {
     log("Disconnected.");
 }
 
-async function readLoop() {
-    while (true) {
-        try {
-            const { value, done } = await reader.read();
+ = await reader.read();
             if (done) { log("Port closed."); break; }
 
             inputBuffer += value;
@@ -2433,9 +2434,11 @@ function setViewMode(mode) {
     const _kf = document.querySelector('.kalman-card');
     if (_kf) _kf.style.display = !posLoopEnabled ? '' : 'none';
 
-    if (mode === 'tuning') {
+        if (mode === 'tuning') {
+        sendCommand('SET:TLM_RATE=20'); // 50 Hz for tuning
         setMetricsStatus('IDLE — Send Move / Go Home / Ghost start to begin capture', '');
     } else if (mode === 'live') {
+        sendCommand('SET:TLM_RATE=50'); // 20 Hz for demo stability
         setMetricsStatus('IDLE — Switch to Tuning Mode and move motor', '');
     }
 }

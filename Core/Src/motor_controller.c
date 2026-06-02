@@ -92,7 +92,7 @@ volatile bool trigger_homing_sequence = false;
 volatile uint8_t gripper_seq_request = 0;
 
 /* Deferred control-loop logging (bug 1-G). printf blocks for milliseconds and
- * must not run inside the 100 Hz TIM6 ISR. The ISR sets an event bit (and
+ * must not run inside the 1 kHz TIM6 ISR. The ISR sets an event bit (and
  * latches any value the message needs); the main loop calls
  * Motor_DrainControlLog() to emit the strings at thread level. Only the TIM6
  * ISR sets bits (single producer → plain |= is safe); the main loop snapshots
@@ -120,7 +120,10 @@ Ghost_Buffer_t ghost_buffer[GHOST_BUFFER_MAX];
 volatile uint32_t ghost_buffer_idx = 0;
 volatile bool ghost_dump_requested = false;
 
-static float control_dt = 0.01f;
+/* inner_rpm_cmd / inner_ff_cmd: written by outer position loop (100 Hz),
+ * consumed by inner speed loop (1 kHz) every TIM6 tick. */
+static volatile float inner_rpm_cmd = 0.0f;
+static volatile float inner_ff_cmd  = 0.0f;
 static uint32_t open_loop_test_tick = 0;
 static uint32_t m_button_hold_tick = 0;
 static bool m_button_active = false;
@@ -167,7 +170,7 @@ Trajectory_State_t trajectory;
 /* ============================================================================
  * Private Function Prototypes
  * ============================================================================ */
-static float PID_Compute(PID_Controller_t *pid, float setpoint, float feedback);
+static float PID_Compute(PID_Controller_t *pid, float setpoint, float feedback, float dt);
 static float PWM_Apply(float duty_cycle);
 static float Motor_DriveWithAntiWindup(float pid_out, float ff);
 static void Encoder_Update(void);
@@ -181,37 +184,34 @@ void Motor_SendAudioCommand(char sound_code);
 /**
  * @brief Compute PID output
  */
-static float PID_Compute(PID_Controller_t *pid, float setpoint, float feedback)
+static float PID_Compute(PID_Controller_t *pid, float setpoint, float feedback, float dt)
 {
     float error = setpoint - feedback;
     float p_term = pid->Kp * error;
-    
-    pid->integral += error * control_dt;
+
+    pid->integral += error * dt;
     if (pid->integral > pid->integral_max) pid->integral = pid->integral_max;
     else if (pid->integral < -pid->integral_max) pid->integral = -pid->integral_max;
-    
+
     float i_term = pid->Ki * pid->integral;
-    float d_input = (feedback - pid->error_prev); 
-    float d_term_raw = (pid->Kd * d_input) / control_dt;
-    
-    // Low-pass filter for derivative term
-    pid->d_filt = (0.8f * pid->d_filt) + (0.2f * d_term_raw); 
+    float d_input = (feedback - pid->error_prev);
+    float d_term_raw = (pid->Kd * d_input) / dt;
+
+    pid->d_filt = (0.8f * pid->d_filt) + (0.2f * d_term_raw);
     pid->error_prev = feedback;
-    
+
     float output = p_term + i_term - pid->d_filt;
-    
-    // Output clamping with anti-windup
+
     if (pid->output_max > 0.0f || pid->output_min < 0.0f) {
         if (output > pid->output_max) {
             output = pid->output_max;
-            // Anti-windup: stop integrating in the saturated direction
-            if (error > 0) pid->integral -= error * control_dt;
+            if (error > 0) pid->integral -= error * dt;
         } else if (output < pid->output_min) {
             output = pid->output_min;
-            if (error < 0) pid->integral -= error * control_dt;
+            if (error < 0) pid->integral -= error * dt;
         }
     }
-    
+
     return output;
 }
 
@@ -312,8 +312,9 @@ static void Encoder_Update(void)
     float counts_per_rev = MOTOR_ENCODER_PPR * 4 * MOTOR_GEAR_RATIO;
     encoder.current_position_deg = ((float)encoder.absolute_counts / counts_per_rev) * 360.0f;
     
-    float instant_rpm = ((float)delta / counts_per_rev / control_dt) * 60.0f;
-    encoder.filtered_rpm = (0.15f * instant_rpm) + (0.85f * encoder.filtered_rpm);
+    float instant_rpm = ((float)delta / counts_per_rev / SPEED_LOOP_DT) * 60.0f;
+    /* IIR alpha tuned for τ ≈ 20 ms at 1 kHz: α = 1 − exp(−dt/τ) = 1 − exp(−0.001/0.020) ≈ 0.049 */
+    encoder.filtered_rpm = (0.049f * instant_rpm) + (0.951f * encoder.filtered_rpm);
 }
 
 /* ============================================================================
@@ -354,7 +355,7 @@ static void ZVD_UpdateCoefficients(void)
     shaper_A3 = K2        / denom;
 
     float    T_d = 3.14159265f / (wn * sqrt1z2);
-    uint32_t N   = (uint32_t)(T_d * (float)MOTOR_CONTROL_FREQ_HZ + 0.5f);
+    uint32_t N   = (uint32_t)(T_d * (float)POSITION_LOOP_FREQ_HZ + 0.5f);
     if (N < 1u) N = 1u;
     if (2u * N >= (uint32_t)SHAPER_BUF_SIZE) N = ((uint32_t)SHAPER_BUF_SIZE - 1u) / 2u;
     shaper_N = N;
@@ -966,11 +967,45 @@ void Motor_ProcessCommand(char cmd)
 
 void Motor_ControlLoop(void)
 {
-    static float current_applied_pwm = 0.0f;
-    static bool last_emergency_stop = false;
+    static float   current_applied_pwm = 0.0f;
+    static bool    last_emergency_stop  = false;
+    static uint8_t outer_div            = 0;
 
-    HW_RefreshIO();  // Sync all hardware I/O with debug struct
+    /* =========================================================
+     * INNER LOOP — 1 kHz (every TIM6 tick)
+     * Encoder update + speed PID.
+     * ========================================================= */
     Encoder_Update();
+
+    if (emergency_stop || current_mode == MOTOR_MODE_STOPPED) {
+        /* Zero motor immediately; outer loop will sync trajectory state. */
+        current_applied_pwm = 0.0f;
+        inner_rpm_cmd = 0.0f;
+        inner_ff_cmd  = 0.0f;
+        PWM_Apply(0.0f);
+    } else if (current_mode == MOTOR_MODE_SPEED   ||
+               current_mode == MOTOR_MODE_POSITION ||
+               current_mode == MOTOR_MODE_GHOST    ||
+               current_mode == MOTOR_MODE_HOMING) {
+        /* Normal cascade modes: run speed PID at 1 kHz using setpoint
+         * produced by the 100 Hz position loop. */
+        float pid_out = PID_Compute(&pid_speed,
+                                    inner_rpm_cmd,
+                                    encoder.filtered_rpm,
+                                    SPEED_LOOP_DT);
+        current_applied_pwm = Motor_DriveWithAntiWindup(pid_out, inner_ff_cmd);
+    }
+    /* Autotune / Test modes: outer loop calls PWM_Apply directly;
+     * inner loop does nothing so it cannot fight those direct commands. */
+
+    /* =========================================================
+     * OUTER LOOP — 100 Hz (every 10th TIM6 tick)
+     * HW I/O, safety, trajectory, position PID.
+     * ========================================================= */
+    if (++outer_div < 10) return;
+    outer_div = 0;
+
+    HW_RefreshIO();
 
     // --- Real-time Parameter Sync (Allows Live Expressions Tuning) ---
     pid_speed.Kp = tuning.speed_Kp;
@@ -1406,28 +1441,21 @@ void Motor_ControlLoop(void)
         emergency_stop = false;
     }
 
-    // Stop motor if e-stop or stopped mode
+    /* Outer-loop E-stop / stopped cleanup.
+     * PWM_Apply(0) is already issued every inner tick while estop/stopped;
+     * this block handles trajectory sync, gripper safe-state, and PID reset. */
     if (emergency_stop || current_mode == MOTOR_MODE_STOPPED) {
         if (ghost_move_active) {
             ghost_move_active = false;
             ghost_dump_requested = true;
         }
-        PWM_Apply(0.0f);
-        /* On E-Stop: release gripper relays to safe rest state.
-         * Spring returns gripper DOWN (out_gripper_up=0) and claw OPEN (out_gripper_down=0).
-         * Once E-Stop is cleared the user must explicitly re-command the gripper. */
+        /* Ensure inner loop commands stay zeroed for the next outer period. */
+        inner_rpm_cmd = 0.0f;
+        inner_ff_cmd  = 0.0f;
         if (emergency_stop) {
             hw.out_gripper_up   = 0;
             hw.out_gripper_down = 0;
         }
-        /* CRITICAL: also reset the module-level PWM monitor variable. Without
-         * this, current_applied_pwm holds the last large value commanded just
-         * before the fault (e.g. -80% from the corrective brake), the early-
-         * return below skips the PID compute that would normally overwrite
-         * it, and every subsequent tick the safety checks above see a stale
-         * "high PWM" alongside zero RPM → encoder-signal-loss timer arms
-         * → FAULT_ENCODER_ERROR re-fires within 1 s → user can never clear
-         * the emergency. */
         current_applied_pwm = 0.0f;
         current_pwm = 0.0f;
 
@@ -1481,18 +1509,18 @@ void Motor_ControlLoop(void)
         }
         if (encoder.current_position_deg > atune.peak_max) atune.peak_max = encoder.current_position_deg;
         if (encoder.current_position_deg < atune.peak_min) atune.peak_min = encoder.current_position_deg;
-        PWM_Apply((atune.direction ? atune.relay_output : -atune.relay_output) * atune.motor_sign);
-        if (atune.cycle_count >= 10) { 
-            float avg_A = (atune.amplitude_sum / (atune.cycle_count - 2)) / 2.0f; 
-            if (avg_A > 0.1f) { 
+        current_applied_pwm = PWM_Apply((atune.direction ? atune.relay_output : -atune.relay_output) * atune.motor_sign);
+        if (atune.cycle_count >= 10) {
+            float avg_A = (atune.amplitude_sum / (atune.cycle_count - 2)) / 2.0f;
+            if (avg_A > 0.1f) {
                 float Ku = (4.0f * atune.relay_output) / (3.14159f * avg_A);
-                tuning.pos_Kp = 0.20f * Ku; 
-                tuning.pos_Ki = 0.10f * tuning.pos_Kp; 
+                tuning.pos_Kp = 0.20f * Ku;
+                tuning.pos_Ki = 0.10f * tuning.pos_Kp;
                 tuning.pos_Kd = 0.01f;
-                if (tuning.pos_Kp > 2.5f) tuning.pos_Kp = 2.5f; 
+                if (tuning.pos_Kp > 2.5f) tuning.pos_Kp = 2.5f;
                 autotune_status = STATUS_SUCCESS;
-            } else { 
-                autotune_status = STATUS_ERROR_LIMIT_EXCEEDED; 
+            } else {
+                autotune_status = STATUS_ERROR_LIMIT_EXCEEDED;
             }
             current_mode = MOTOR_MODE_STOPPED;
         }
@@ -1531,7 +1559,7 @@ void Motor_ControlLoop(void)
         }
         if (encoder.filtered_rpm > atune.peak_max) atune.peak_max = encoder.filtered_rpm;
         if (encoder.filtered_rpm < atune.peak_min) atune.peak_min = encoder.filtered_rpm;
-        PWM_Apply((atune.direction ? atune.relay_output : -atune.relay_output) * atune.motor_sign);
+        current_applied_pwm = PWM_Apply((atune.direction ? atune.relay_output : -atune.relay_output) * atune.motor_sign);
         if (atune.cycle_count >= 15) { 
             float avg_A = (atune.amplitude_sum / (atune.cycle_count - 2)) / 2.0f; 
             if (avg_A > 0.5f) {
@@ -1656,8 +1684,8 @@ void Motor_ControlLoop(void)
         float ff_dist_s  = tuning.K_tff * (tau_L_s * MOT_R_ARM / (MOT_N_GEAR * MOT_ETA_GB * MOT_K_T)) * V_TO_PWM;
         float ff_volts   = tuning.K_vff * v_ref_rads;
         float ff = ff_volts * V_TO_PWM + ff_dist_s;
-        float pid_out = PID_Compute(&pid_speed, trajectory.target_vel, encoder.filtered_rpm);
-        current_applied_pwm = Motor_DriveWithAntiWindup(pid_out, ff);
+        inner_rpm_cmd = trajectory.target_vel;
+        inner_ff_cmd  = ff;
         trajectory.target_pos = encoder.current_position_deg;
         trajectory.current_setpoint_pos = encoder.current_position_deg;
     }
@@ -1733,7 +1761,8 @@ void Motor_ControlLoop(void)
         if (position_loop_enabled) {
             target_rpm = PID_Compute(&pid_position,
                                      shaped_pos,
-                                     encoder.current_position_deg);
+                                     encoder.current_position_deg,
+                                     POSITION_LOOP_DT);
         } else {
             /* Position loop bypassed — tune the velocity loop in isolation. */
             if (sine_test_enabled) {
@@ -1767,8 +1796,8 @@ void Motor_ControlLoop(void)
         float ff_volts   = tuning.K_vff * v_ref_rads + tuning.K_aff * a_ref_rads;
         float ff = ff_volts * V_TO_PWM + ff_dist;
 
-        float pid_out = PID_Compute(&pid_speed, target_rpm, encoder.filtered_rpm);
-        current_applied_pwm = Motor_DriveWithAntiWindup(pid_out, ff);
+        inner_rpm_cmd = target_rpm;
+        inner_ff_cmd  = ff;
 
         // Ghost Mode settle check: Must be within 0.5 deg AND < 1.0 RPM for 3 seconds
         if (ghost_move_active) {

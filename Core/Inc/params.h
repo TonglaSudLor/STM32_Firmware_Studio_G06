@@ -81,6 +81,16 @@
 #define SOFT_LIMIT_DEG           720.0f  /**< 2 full rounds limit from home */
 
 /* ============================================================================
+ * CONTROL LOOP FREQUENCIES
+ * Inner speed loop (TIM6): 1 kHz — 10:1 ratio over position loop.
+ * Outer position loop:    100 Hz — also governs ZVD shaper tick count.
+ * ============================================================================ */
+#define SPEED_LOOP_FREQ_HZ      1000    /**< Inner speed loop frequency (Hz) */
+#define SPEED_LOOP_DT           0.001f  /**< Inner loop time step (s) */
+#define POSITION_LOOP_FREQ_HZ   100     /**< Outer position / ZVD loop frequency (Hz) */
+#define POSITION_LOOP_DT        0.01f   /**< Outer loop time step (s) */
+
+/* ============================================================================
  * SYSTEM TIMING & HOMING
  * ============================================================================ */
 #define HOME_HOLD_TIME_MS   1000
@@ -132,5 +142,11 @@
 #define KF_SIGMA_OMEGA_DEF  1.0e-1f      /**< sqrt(Qc[1,1]) — unmodeled friction (rad/s/sqrt(s)) */
 #define KF_SIGMA_TAU_DEF    5.0e-1f      /**< sqrt(Qc[2,2]) — load-torque random walk (N·m/sqrt(s)) */
 #define KF_SIGMA_I_DEF      5.0e-1f      /**< sqrt(Qc[3,3]) — voltage/PWM imperfections (A/sqrt(s)) */
+
+/* ============================================================================
+ * TELEMETRY SETTINGS
+ * ============================================================================ */
+#define TELEMETRY_DEMO_RATE_MS   50      /**< 20 Hz for demo stability */
+#define TELEMETRY_TUNING_RATE_MS 20      /**< 50 Hz for precision tuning */
 
 #endif /* PARAMS_H */

@@ -19,7 +19,7 @@
 /* --- Hardware Configuration --- */
 #define MOTOR_ENCODER_PPR           2048    /**< Encoder pulses per revolution */
 #define MOTOR_GEAR_RATIO            1.0f    /**< Motor gear ratio */
-#define MOTOR_CONTROL_FREQ_HZ       100     /**< Control loop frequency (Hz) */
+#define MOTOR_CONTROL_FREQ_HZ       100     /**< Outer (position) loop frequency (Hz). Alias for POSITION_LOOP_FREQ_HZ. */
 
 /* --- Control Structures --- */
 
