@@ -343,10 +343,6 @@ int main(void)
 		hw.dbg_loop_top++;   /* DIAG: proves the main loop is alive and iterating */
 		IWDG->KR = 0xAAAAU;  /* kick watchdog — loop is alive */
 
-		// Dummy usage to force linker to keep these symbols for Live Expressions
-		if (debug_idx > 100)
-			rx_debug_log[0] = 0;
-
 		USART3_DrainTx();   /* flush deferred ESP32 echo/audio bytes (bug 0-C) */
 
 		/* Emit strings deferred by the 100 Hz control ISR (bug 1-G). */

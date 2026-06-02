@@ -224,6 +224,20 @@ async function disconnectSerial() {
     updateUI();
 }
 
+// RAF render gate — UI + visualizer updates are batched to one render per frame.
+// Multiple packets arriving in the same 16 ms window share a single DOM update.
+let _renderPending = false;
+function scheduleRender() {
+    if (_renderPending) return;
+    _renderPending = true;
+    requestAnimationFrame(() => {
+        _renderPending = false;
+        updateUI();
+        visualizer.update(state.currentPos, state.firmwareTarget);
+        updateKalmanCard();
+    });
+}
+
 let _dbgPacketCount = 0;
 let _hbPktCount = 0, _hbPktWindowStart = Date.now();
 
@@ -395,36 +409,40 @@ function processPacket(packet) {
     });
 
     lockTuningAfterSync();
-    updateUI();
-    visualizer.update(state.currentPos, state.firmwareTarget);
+
+    // Chart data — pushed every packet (cheap array ops only; uPlot render is RAF-batched)
     chartPos.addData(state.currentPos);
     chartPos.addTarget(state.firmwareTarget);
     chartVel.addData(state.vel);
     chartVel.addTarget(state.velSetpoint);
     chartAcc.addData(state.acc);
     chartAcc.addTarget(state.accSetpoint);
-
-    // KF overlays (always pushed; rendering on each chart is unconditional
-    // because the chart class hides empty arrays). When KF is disabled the
-    // estimate is just the open-loop integration with corrections.
     chartPos.addEstimate(state.kfTheta);
     chartVel.addEstimate(state.kfOmega);
     if (state.kfSanityShow) {
         chartPos.addSanity(state.kfSanityTheta);
         chartVel.addSanity(state.kfSanityOmega);
     }
-    updateKalmanCard();
+
+    // DOM + canvas updates — deferred to next animation frame so multiple
+    // packets in one 16 ms window share a single browser layout pass.
+    scheduleRender();
     checkGhostStart();
     tuningTick();
     if (window.TestSuite) window.TestSuite.onPacket(state, packet);
 }
 
+// Shared encoder — avoids allocating a new object on every send.
+const _cmdEncoder = new TextEncoder();
+
 async function sendCommand(cmd) {
     if (!state.connected || !port || port.writable.locked) return;
     const writer = port.writable.getWriter();
     try {
-        await writer.write(new TextEncoder().encode(`$${cmd}*`));
-        log("Sent: $" + cmd + "*");
+        await writer.write(_cmdEncoder.encode(`$${cmd}*`));
+        // Only log outside active sequences — "Sent:" spam during gripper steps
+        // triggers log() 10+ times/second, each forcing a layout reflow.
+        if (!state.seqActive) log("Sent: $" + cmd + "*");
     } catch (e) {
         log("Send error: " + e);
     } finally {
@@ -607,9 +625,10 @@ function log(msg, type = "info") {
     div.innerHTML = `<span style="color:#555">[${time}]</span> ${msg}`;
     if (type === "error") div.style.color = "#ff3131";
     logContent.appendChild(div);
-    // Keep at most 200 entries
     while (logContent.children.length > 200) logContent.removeChild(logContent.firstChild);
-    logContent.scrollTop = logContent.scrollHeight;
+    // Defer scroll — scrollTop=scrollHeight forces synchronous layout and freezes
+    // the UI when called rapidly (e.g. during a gripper sequence).
+    requestAnimationFrame(() => { logContent.scrollTop = logContent.scrollHeight; });
 }
 
 let _tuningReceivedFromFirmware = false;
@@ -2585,7 +2604,7 @@ function waitForGripperState(predicate, timeout) {
 }
 
 async function gripperStep(cmd, confirmFn) {
-    sendCommand(cmd);
+    await sendCommand(cmd);
     if (seqFeedbackMode() === 'sensor') {
         await waitForGripperState(confirmFn, REED_TIMEOUT_MS);
     } else {
@@ -2594,13 +2613,14 @@ async function gripperStep(cmd, confirmFn) {
 }
 
 async function runGripperPick() {
-    await gripperStep('CMD:CLAW_OPEN',  () => !state.gripper_co);
+    // AT pick target: lower → grab → lift
     await gripperStep('CMD:GRIP_DN',    () => state.gripper_ud);
     await gripperStep('CMD:CLAW_CLOSE', () => state.gripper_co);
     await gripperStep('CMD:GRIP_UP',    () => !state.gripper_ud);
 }
 
 async function runGripperPlace() {
+    // AT place target: lower → release → lift → close (safe travel state)
     await gripperStep('CMD:GRIP_DN',    () => state.gripper_ud);
     await gripperStep('CMD:CLAW_OPEN',  () => !state.gripper_co);
     await gripperStep('CMD:GRIP_UP',    () => !state.gripper_ud);
@@ -2637,10 +2657,13 @@ function stopSequence() {
 btnRunSeq.addEventListener('click', () => {
     if (state.seqActive) { stopSequence(); return; }
     if (state.waypoints.length === 0) { log('Path: add at least one waypoint first.', 'error'); return; }
+    if (state.estop) { log('Path: E-Stop active — clear fault before running sequence.', 'error'); return; }
+    if (state.positionUnknown) { log('Path: position unknown — home the arm first.', 'error'); return; }
     state.seqActive = true;
     state.currentWaypointIdx = 0;
     btnRunSeq.innerText = 'Stop';
     btnRunSeq.className = 'toggle-btn active';
+    log(`Sequence started — ${state.waypoints.length} waypoint(s).`);
     executeNextWaypoint();
 });
 
@@ -2687,22 +2710,37 @@ function waitForArrival(targetDeg, timeout = ARRIVE_TIMEOUT_MS) {
 async function executeNextWaypoint() {
     if (!state.seqActive || state.waypoints.length === 0) return;
     const wp = state.waypoints[state.currentWaypointIdx];
+
+    // Pre-travel prep for PICK: ensure gripper UP + claw OPEN before moving.
+    // Full cycle per pair: GRIP_UP→CLAW_OPEN → travel → GRIP_DN→CLAW_CLOSE→GRIP_UP
+    //                      → travel → GRIP_DN→CLAW_OPEN→GRIP_UP→CLAW_CLOSE → ...
+    if (wp.action === 'pick') {
+        await gripperStep('CMD:GRIP_UP',   () => !state.gripper_ud);
+        if (!state.seqActive) return;
+        await gripperStep('CMD:CLAW_OPEN', () => !state.gripper_co);
+        if (!state.seqActive) return;
+    }
+
     sendCommand(`SET:TARGET=${wp.angle}`);
     renderWaypoints();
 
-    // Wait for the arm to actually reach + settle at the target before the
-    // gripper acts — not a blind delay. Warns (instead of flying past) if the
-    // arm never gets there, which usually means it isn't Self-Tested + Homed.
     const arrived = await waitForArrival(wp.angle);
     if (!state.seqActive) return;
-    if (!arrived) log(`Path: arm never reached ${wp.angle}° — run Self-Test + Home (motion is gated until then).`, 'error');
+    if (!arrived) log(`Path: arm never reached ${wp.angle}° — is the robot Self-Tested + Homed?`, 'error');
 
     if (wp.action === 'pick')       await runGripperPick();
     else if (wp.action === 'place') await runGripperPlace();
     if (!state.seqActive) return;
 
     state.currentWaypointIdx++;
-    if (state.currentWaypointIdx >= state.waypoints.length) { stopSequence(); return; }
+    if (state.currentWaypointIdx >= state.waypoints.length) {
+        // All waypoints done — return to home position
+        log('Sequence complete — returning home.');
+        sendCommand('SET:TARGET=0');
+        await waitForArrival(0);
+        stopSequence();
+        return;
+    }
     executeNextWaypoint();
 }
 

@@ -64,6 +64,9 @@ class TelemetryChart {
         // ── Responsive resize via ResizeObserver ─────────────────────────────
         this._ro = new ResizeObserver(() => this._onResize());
         this._ro.observe(this._mountEl);
+
+        // RAF batching — avoids redundant uPlot redraws within the same frame
+        this._rafPending = false;
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
@@ -160,9 +163,24 @@ class TelemetryChart {
         }
 
         if (!this.paused && !this.tuningMode) {
-            this._setUplotData();
-            this._valLabel.textContent = isNaN(val) ? '--' : val.toFixed(1);
+            this._pendingVal = val;   // consumed by the RAF render, not written here
+            this._scheduleUplotRender();
         }
+    }
+
+    // Defers uPlot.setData to the next animation frame. Multiple addData() calls
+    // within the same 16 ms frame collapse into a single render.
+    _scheduleUplotRender() {
+        if (this._rafPending) return;
+        this._rafPending = true;
+        requestAnimationFrame(() => {
+            this._rafPending = false;
+            if (!this.paused && !this.tuningMode) {
+                this._setUplotData();
+                const v = this._pendingVal;
+                this._valLabel.textContent = (v === undefined || isNaN(v)) ? '--' : v.toFixed(1);
+            }
+        });
     }
 
     addTarget(val) {
