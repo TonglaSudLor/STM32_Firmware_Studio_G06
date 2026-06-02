@@ -1,38 +1,61 @@
 /**
  * @file scurve.h
- * @brief S-Curve Trajectory Generator — pure math, zero HAL dependency.
- *
- * TODO: Extract from Core/Src/motor_controller.c
- *   - Trajectory_State_t struct (already in motor_controller.h)
- *   - S-curve step logic inside Motor_ControlLoop()
- *   - Jerk-limited 7-segment profile
- *
- * Params used (from params.h):
- *   MOVE_SPEED_COARSE  → v_max
- *   DEFAULT_MAX_ACCEL  → a_max
- *   DEFAULT_MAX_JERK   → j_max
- *
- * When done: add Core/Lib/scurve.c + tests/test_scurve.c
+ * @brief 7-segment S-Curve Trajectory Generator — Pure C99, Zero HAL.
  */
 
-#pragma once
+#ifndef SCURVE_H
+#define SCURVE_H
+
+#include <stdint.h>
 #include <stdbool.h>
 
+/**
+ * @brief S-Curve planner state
+ */
 typedef struct {
+    // Limits
     float v_max;
     float a_max;
     float j_max;
-    float target_pos;
-    float target_vel;
-    float pos;
-    float vel;
-    float accel;
+
+    // Targets
+    float pos_start;
+    float pos_target;
+    float distance;
+    int8_t direction;
+
+    // Timings (phases)
+    float t_elapsed;
+    float T_j, T_a, T_v;
+    float t1, t2, t3, t4, t5, t6, t7;
+
+    // Phase anchor values
+    float a_peak;
+    float v_peak;
+    float v1, v2;
+    float p1, p2, p3, p4, p5, p6;
+
+    bool active;
 } SCurve_t;
 
-void  SCurve_Init(SCurve_t *sc, float v_max, float a_max, float j_max);
-void  SCurve_SetTarget(SCurve_t *sc, float pos, float vel);
-void  SCurve_Step(SCurve_t *sc, float dt);
-float SCurve_GetPos(SCurve_t *sc);
-float SCurve_GetVel(SCurve_t *sc);
-float SCurve_GetAccel(SCurve_t *sc);
-bool  SCurve_IsDone(SCurve_t *sc);
+/**
+ * @brief Initialize S-curve structure with motion limits
+ */
+void SCurve_Init(SCurve_t *sc, float v_max, float a_max, float j_max);
+
+/**
+ * @brief Start a new move to target position from current position
+ */
+void SCurve_Plan(SCurve_t *sc, float current_pos, float target_pos);
+
+/**
+ * @brief Advance trajectory by one time step
+ */
+void SCurve_Step(SCurve_t *sc, float dt, float *p_out, float *v_out, float *a_out);
+
+/**
+ * @brief Force-stop the trajectory at current output
+ */
+void SCurve_Stop(SCurve_t *sc);
+
+#endif /* SCURVE_H */

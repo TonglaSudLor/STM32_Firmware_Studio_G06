@@ -3,7 +3,7 @@ CFLAGS  = -std=c99 -Wall -Wextra -Wpedantic -I. -I../Core/Inc -I../Core/Lib
 LDFLAGS = -lm
 
 # Add all test binaries here
-TESTS   = test_modbus_frame test_pid test_encoder test_safety
+TESTS   = test_modbus_frame test_pid test_encoder test_safety test_scurve test_input_shaper test_kalman
 
 .PHONY: test clean
 
@@ -30,3 +30,14 @@ test_safety: test_safety.c ../Core/App/safety.c
 
 clean:
 	rm -f $(TESTS)
+
+test_scurve: test_scurve.c ../Core/Lib/scurve.c
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+
+
+test_input_shaper: test_input_shaper.c ../Core/Lib/input_shaper.c
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+test_kalman: test_kalman.c ../Core/Lib/kalman_lib.c
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
