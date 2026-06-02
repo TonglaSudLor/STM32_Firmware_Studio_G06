@@ -497,7 +497,7 @@ header .secondary-btn {
 .place-btn:hover { background: #3498db !important; }
 
 .path-controls {
-    border-top: 1px solid var(--border-color);
+    /* border-top removed for cleaner look */
     padding-top: 0.5rem;
 }
 
@@ -591,7 +591,7 @@ header .secondary-btn {
 .tl-link-btn { background: transparent; border: 1px dashed rgba(0,242,255,0.25); border-radius: 5px; color: var(--accent-cyan); font-size: 0.62rem; padding: 5px 8px; cursor: pointer; text-align: left; width: 100%; transition: background 0.15s, border-color 0.15s; }
 .tl-link-btn:hover { background: rgba(0,242,255,0.06); border-color: rgba(0,242,255,0.5); }
 /* Sticky apply bar */
-.tl-apply-bar { flex-shrink: 0; padding: 0.5rem 0.75rem; border-top: 1px solid var(--border-color); }
+.tl-apply-bar { flex-shrink: 0; padding: 0.5rem 0.75rem; /* border-top removed for cleaner look */ }
 .tl-apply-btn { width: 100%; }
 
 /* Legacy compat stubs */
@@ -729,7 +729,7 @@ header .secondary-btn {
 }
 .bode-status.busy { color: var(--accent-yellow); border-color: var(--accent-yellow); }
 .bode-status.done { color: var(--accent-green); border-color: var(--accent-green); }
-.fs-results { display: flex; flex-direction: column; gap: 0.4rem; border-top: 1px solid var(--border-color); padding-top: 0.4rem; }
+.fs-results { display: flex; flex-direction: column; gap: 0.4rem; /* border-top removed for cleaner look */ padding-top: 0.4rem; }
 .fs-results.hidden { display: none; }
 .bode-plot-wrap { position: relative; }
 .bode-plot-label { font-size: 0.52rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-secondary); margin-bottom: 2px; }
@@ -742,7 +742,7 @@ header .secondary-btn {
 .fs-shaper-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ===== Phase D — A/B Compare ===== */
-.ab-compare-section { margin-top: 0.7rem; border-top: 1px solid var(--border-color); padding-top: 0.5rem; }
+.ab-compare-section { margin-top: 0.7rem; /* border-top removed for cleaner look */ padding-top: 0.5rem; }
 .ab-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem; gap: 6px; }
 .ab-head h4 { margin: 0; font-size: 0.7rem; text-transform: uppercase; color: var(--accent-cyan); }
 .ab-sub { font-size: 0.58rem; color: var(--text-secondary); text-transform: none; font-weight: 400; margin-left: 4px; }
@@ -1784,21 +1784,21 @@ button {
 /* Horizontal tile strip */
 .hb-tiles-row {
     display: flex;
-    flex: 1 1 auto;
-    gap: 2px;
+    flex-wrap: wrap; /* Allow tiles to flow to next line if too wide */
+    gap: 4px;
     align-items: stretch;
     min-height: 0;
 }
 
 .hb-tile {
-    flex: 1 1 0;
-    min-width: 34px;
+    flex: 1 1 calc(20% - 4px); /* Attempt 5 per row max */
+    min-width: 45px;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     gap: 2px;
-    padding: 3px 1px;
+    padding: 4px 1px;
     border: 1px solid rgba(255,255,255,0.07);
     border-radius: 4px;
     background: rgba(0,0,0,0.22);
@@ -1898,7 +1898,7 @@ button {
 .hb-integrated {
     margin-top: 15px;
     padding-top: 15px;
-    border-top: 1px solid var(--border-color);
+    /* border-top removed for cleaner look */
 }
 .hb-inner-card {
     background: transparent;
