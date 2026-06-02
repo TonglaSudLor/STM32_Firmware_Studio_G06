@@ -1951,3 +1951,15 @@ select.tl-select {
 select.tl-select:hover {
     border-color: var(--primary-color);
 }
+
+/* --- Increased Debug Console Height --- */
+.col-center #debug-log {
+    height: 350px; /* Increased from the implicit smaller height */
+    min-height: 250px;
+    margin-top: 15px; /* Add some space above it */
+}
+
+#log-content {
+    flex: 1;
+    overflow-y: auto;
+}
