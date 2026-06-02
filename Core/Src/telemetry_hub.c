@@ -263,7 +263,21 @@ static void Telemetry_HandleSet(char *payload) {
 
 static void Telemetry_HandleCmd(char *payload) {
     if (strcmp(payload, "ESTOP=1") == 0 || strcmp(payload, "ESTOP") == 0) { emergency_stop = true; FAULT_SET(FAULT_ESTOP_DASHBOARD); }
-    else if (strcmp(payload, "CLEAR") == 0) { startup_estop_pending = false; FAULT_CLR(FAULT_STARTUP_ESTOP); fault_code = FAULT_NONE; emergency_stop = false; }
+    else if (strcmp(payload, "CLEAR") == 0) {
+        startup_estop_pending = false;
+        FAULT_CLR(FAULT_STARTUP_ESTOP);
+        fault_code = FAULT_NONE;
+        emergency_stop = false;
+        
+        // CRITICAL: Prevent jump by syncing trajectory to current physical reality
+        trajectory.target_pos = encoder.current_position_deg;
+        trajectory.current_setpoint_pos = encoder.current_position_deg;
+        trajectory.current_setpoint_vel = 0.0f;
+        pid_position.integral = 0.0f;
+        pid_speed.integral = 0.0f;
+        printf("[SYSTEM] Safety Release: Trajectory Synced to %.2f deg
+", trajectory.target_pos);
+    }
     else if (strcmp(payload, "HOME") == 0) { trigger_homing_sequence = true; }
     else if (strcmp(payload, "GRIP_UP") == 0) { Gripper_Up(); }
     else if (strcmp(payload, "GRIP_DN") == 0) { Gripper_Down(); }

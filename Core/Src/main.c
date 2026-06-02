@@ -308,15 +308,7 @@ int main(void)
 	HAL_UART_Receive_IT(&hlpuart1, (uint8_t*) &modbus_rx_byte, 1);
 	HAL_UART_Receive_IT(&huart3, (uint8_t*) &rx_byte, 1);
 
-	/* --- Skip startup menu, use current position as home --- */
-	{
-		extern volatile bool emergency_stop;
-		extern volatile bool startup_estop_pending;
-		emergency_stop = false;
-		startup_estop_pending = false;
-		FAULT_CLR(FAULT_STARTUP_ESTOP);
-		printf("\r\n>>> System Ready (skipped startup menu) <<<\r\n");
-	}
+	
 
 	/* IWDG — 15-second independent hardware watchdog.
 	 * If the firmware hangs, TIM1 keeps generating PWM in hardware (motor runs
