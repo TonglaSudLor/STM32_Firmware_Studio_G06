@@ -361,7 +361,7 @@ static void ZVD_UpdateCoefficients(void)
     shaper_N = N;
 }
 
-static void ZVD_FlushBuffer(float val)
+void ZVD_FlushBuffer(float val)
 {
     for (int i = 0; i < SHAPER_BUF_SIZE; i++) {
         shaper_buf[i]   = val;

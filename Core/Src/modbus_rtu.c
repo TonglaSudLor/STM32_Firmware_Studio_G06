@@ -215,6 +215,7 @@ static void Modbus_Dispatch(Modbus_Handle_t* hmodbus)
         break;
     }
 }
+#endif
 
 /**
  * @brief Emit Modbus response frame
@@ -224,17 +225,18 @@ static void Modbus_Emit(Modbus_Handle_t* hmodbus)
 {
     hmodbus->uart.tx_buffer[0] = hmodbus->slave_address;
     memcpy(&hmodbus->uart.tx_buffer[1], hmodbus->tx_frame, hmodbus->tx_count);
-    
+
     Modbus_Register_t crc;
     crc.U16 = CRC16(hmodbus->uart.tx_buffer, hmodbus->tx_count + 1);
-    
+
     hmodbus->uart.tx_buffer[hmodbus->tx_count + 1] = crc.U8[0];
     hmodbus->uart.tx_buffer[hmodbus->tx_count + 2] = crc.U8[1];
-    
+
     hmodbus->uart.tx_tail = hmodbus->tx_count + 3;
-    
+
     HAL_UART_Transmit_IT(hmodbus->huart, hmodbus->uart.tx_buffer, hmodbus->uart.tx_tail);
 }
+#endif
 
 void Modbus_Process(Modbus_Handle_t* hmodbus)
 {

@@ -14,6 +14,7 @@
 #include "main.h"
 #include "stm32g4xx_hal.h"
 #include <math.h>
+#include <stdbool.h>
 
 extern TIM_HandleTypeDef htim1;
 

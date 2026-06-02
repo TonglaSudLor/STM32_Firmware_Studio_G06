@@ -392,6 +392,8 @@ void Motor_ShaperRecompute(void);
 uint32_t Motor_GetShaperDelay(void);
 
 /* ---- Exposed from trajectory.c ---- */
+/** @brief Flush ZVD shaper delay lines with a fixed value (call on mode change). */
+void ZVD_FlushBuffer(float val);
 /** @brief Advance the S-curve trajectory by one control tick. Call from Motor_ControlLoop(). */
 void Trajectory_Generator_Update(void);
 
