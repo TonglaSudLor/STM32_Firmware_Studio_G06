@@ -1893,3 +1893,32 @@ button {
 @keyframes hb-ok    { 0%,100%{transform:scale(1);opacity:1;}   50%{transform:scale(1.6);opacity:0.65;} }
 @keyframes hb-warn  { 0%,100%{transform:scale(1);opacity:1;}   50%{transform:scale(1.7);opacity:0.55;} }
 @keyframes hb-fault { 0%,100%{transform:scale(1);opacity:1;}   50%{transform:scale(2.0);opacity:0.4;} }
+
+/* --- Refactored UI Adjustments --- */
+.hb-integrated {
+    margin-top: 15px;
+    padding-top: 15px;
+    border-top: 1px solid var(--border-color);
+}
+
+.hb-tiles-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: flex-start;
+}
+
+.hb-tile {
+    flex: 1 1 auto;
+    min-width: 60px;
+}
+
+.full-width-log {
+    grid-column: 1 / -1; /* Stretch across all columns in the grid */
+    width: 100%;
+}
+
+.full-width-log .debug-card {
+    width: 100%;
+    max-height: 250px; /* Give it a reasonable height so it doesn't take over the screen */
+}
