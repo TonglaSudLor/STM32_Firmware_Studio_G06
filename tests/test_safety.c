@@ -10,7 +10,7 @@
 
 #include <stdio.h>
 #include <stdbool.h>
-#include "../Core/App/safety.h"
+#include "../Core/Inc/safety.h"
 
 static int g_passed = 0;
 static int g_failed = 0;

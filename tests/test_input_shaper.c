@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
-#include "../Core/Lib/input_shaper.h"
+#include "../Core/Inc/input_shaper.h"
 
 void test_shaper_sum_to_one() {
     Shaper_t s;

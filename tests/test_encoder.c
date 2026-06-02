@@ -13,7 +13,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <stdbool.h>
-#include "../Core/Drivers/encoder.h"
+#include "../Core/Inc/encoder.h"
 
 static int g_passed = 0;
 static int g_failed = 0;

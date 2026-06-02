@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
-#include "../Core/Lib/scurve.h"
+#include "../Core/Inc/scurve.h"
 
 void test_scurve_basic() {
     SCurve_t sc;

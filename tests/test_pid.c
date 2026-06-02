@@ -9,7 +9,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <stdbool.h>
-#include "../Core/Lib/pid.h"
+#include "../Core/Inc/pid.h"
 
 static int g_passed = 0;
 static int g_failed = 0;

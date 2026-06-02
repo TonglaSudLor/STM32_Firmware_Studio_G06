@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
-#include "../Core/Lib/kalman_lib.h"
+#include "../Core/Inc/kalman_lib.h"
 
 void test_kalman_steady_state() {
     Kalman_t k;
