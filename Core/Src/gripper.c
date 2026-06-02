@@ -33,42 +33,6 @@ void Gripper_Toggle(void)
     is_open = !is_open;
 }
 
-/* ---- Reed switch helpers ----
- *
- * Reads the cached hw.in_reed_* values (written by HW_RefreshIO inside the
- * TIM6 ISR). Kicks the IWDG so a long gripper travel doesn't trigger a reset.
- */
-static void wait_for_reed(volatile uint8_t *reed, const char *name)
-{
-    uint32_t t0 = HAL_GetTick();
-    while (!(*reed)) {
-        IWDG->KR = 0xAAAAU;
-        if ((HAL_GetTick() - t0) >= REED_SW_TIMEOUT_MS) {
-            printf("Reed SW timeout: %s\r\n", name);
-            return;
-        }
-    }
-    printf("Reed SW OK: %s\r\n", name);
-}
-
-/* ---- Sequences ---- */
-
-void Gripper_Sequence_Pick(void)
-{
-    printf("Sequence: PICK\r\n");
-    Gripper_Open();  wait_for_reed(&hw.in_reed_open,  "OPEN");
-    Gripper_Down();  wait_for_reed(&hw.in_reed_down,  "DOWN");
-    Gripper_Close(); wait_for_reed(&hw.in_reed_close, "CLOSE");
-    Gripper_Up();    wait_for_reed(&hw.in_reed_up,    "UP");
-    printf("Sequence PICK: Done\r\n");
-}
-
-void Gripper_Sequence_Place(void)
-{
-    printf("Sequence: PLACE\r\n");
-    Gripper_Down();  wait_for_reed(&hw.in_reed_down,  "DOWN");
-    Gripper_Open();  wait_for_reed(&hw.in_reed_open,  "OPEN");
-    Gripper_Up();    wait_for_reed(&hw.in_reed_up,    "UP");
-    Gripper_Close(); wait_for_reed(&hw.in_reed_close, "CLOSE");
-    printf("Sequence PLACE: Done\r\n");
-}
+/* Gripper_Sequence_Pick / Gripper_Sequence_Place live in motor_controller.c
+ * because they need task_pick_active / task_place_active flags that
+ * modbus_bridge.c reads, and the conditional wait_for_reed_if_joystick logic. */

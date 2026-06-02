@@ -14,9 +14,9 @@ static void mat_eye(float m[4][4], float val) {
     for(int i=0; i<4; i++) m[i][i] = val;
 }
 
-void Kalman_Init(Kalman_t *k, float initial_theta_rad)
+void KalmanLib_Init(Kalman_t *k, float initial_theta_rad)
 {
-    Kalman_Reset(k, initial_theta_rad);
+    KalmanLib_Reset(k, initial_theta_rad);
     k->sigma_theta = KF_SIGMA_THETA_DEF;
     k->sigma_omega = KF_SIGMA_OMEGA_DEF;
     k->sigma_tau   = KF_SIGMA_TAU_DEF;
@@ -25,7 +25,7 @@ void Kalman_Init(Kalman_t *k, float initial_theta_rad)
     k->enabled     = true;
 }
 
-void Kalman_Reset(Kalman_t *k, float theta_rad)
+void KalmanLib_Reset(Kalman_t *k, float theta_rad)
 {
     memset(k->x, 0, sizeof(k->x));
     k->x[0] = theta_rad;

@@ -5,7 +5,7 @@
 
 void test_kalman_steady_state() {
     Kalman_t k;
-    Kalman_Init(&k, 0.0f);
+    KalmanLib_Init(&k, 0.0f);
     
     // Constant measurement 10.0 rad
     float z = 10.0f * (M_PI / 180.0f);
@@ -21,7 +21,7 @@ void test_kalman_steady_state() {
 
 void test_kalman_dynamic_response() {
     Kalman_t k;
-    Kalman_Init(&k, 0.0f);
+    KalmanLib_Init(&k, 0.0f);
     
     // Apply 24V step, simulate simple movement
     float u = 24.0f;

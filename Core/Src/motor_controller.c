@@ -1863,21 +1863,8 @@ void Motor_DrainControlLog(void)
 }
 
 /* ============================================================================
- * Gripper & Sequence Functions
+ * Gripper Sequence Functions (primitives live in gripper.c)
  * ============================================================================ */
-
-void Gripper_Up(void)    { hw.out_gripper_up = 1; printf("Gripper: UP\r\n"); }
-void Gripper_Down(void)  { hw.out_gripper_up = 0; printf("Gripper: DOWN\r\n"); }
-void Gripper_Open(void)  { hw.out_gripper_down = 0; printf("Claw: OPEN\r\n"); }
-void Gripper_Close(void) { hw.out_gripper_down = 1; printf("Claw: CLOSE\r\n"); }
-
-void Gripper_Toggle(void)
-{
-    static bool is_open = true;
-    if (is_open) Gripper_Close();
-    else Gripper_Open();
-    is_open = !is_open;
-}
 
 /* Wait for a reed switch to read 1, or bail out after REED_SW_TIMEOUT_MS.
  * Runs at thread level (main loop) after bug 1-F. Reads the cached *reed value,

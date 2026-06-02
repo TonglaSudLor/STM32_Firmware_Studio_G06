@@ -32,7 +32,7 @@ typedef struct {
 /**
  * @brief Initialize Kalman filter with system-identified parameters
  */
-void Kalman_Init(Kalman_t *k, float initial_theta_rad);
+void KalmanLib_Init(Kalman_t *k, float initial_theta_rad);
 
 /**
  * @brief Prediction and Update step (call at fixed dt)
@@ -45,6 +45,6 @@ void Kalman_Step(Kalman_t *k, float u, float z, float dt);
 /**
  * @brief Reset states and covariance
  */
-void Kalman_Reset(Kalman_t *k, float theta_rad);
+void KalmanLib_Reset(Kalman_t *k, float theta_rad);
 
 #endif /* KALMAN_LIB_H */
