@@ -119,6 +119,37 @@ const chartPos = new TelemetryChart('chart-pos', 'cyan', -360, 360, 0, 400, true
 const chartVel = new TelemetryChart('chart-vel', 'magenta', -100, 100, 0, 100, false);
 const chartAcc = new TelemetryChart('chart-acc', 'yellow', -200, 200);
 
+
+// --- Dual Mode Logic ---
+const modeBtnOperator = document.getElementById('mode-btn-operator');
+const modeBtnTuning = document.getElementById('mode-btn-tuning');
+
+function setDashboardMode(mode) {
+    document.body.dataset.mode = mode;
+    if (mode === 'operator') {
+        modeBtnOperator.classList.add('active');
+        modeBtnTuning.classList.remove('active');
+        if (state.connected) {
+            sendCommand('SET:TLM_RATE=50'); // 20Hz for stability
+            log('Mode: Operator (Telemetry: 20Hz)');
+        }
+    } else {
+        modeBtnTuning.classList.add('active');
+        modeBtnOperator.classList.remove('active');
+        if (state.connected) {
+            sendCommand('SET:TLM_RATE=20'); // 50Hz for tuning
+            log('Mode: Tuning (Telemetry: 50Hz)');
+            // Force redraw charts when they become visible
+            setTimeout(() => { if(typeof charts !== 'undefined') charts.forEach(c => c.draw()); }, 100);
+        }
+    }
+}
+
+if (modeBtnOperator && modeBtnTuning) {
+    modeBtnOperator.addEventListener('click', () => setDashboardMode('operator'));
+    modeBtnTuning.addEventListener('click', () => setDashboardMode('tuning'));
+}
+
 // --- UI Elements ---
 const connectBtn = document.getElementById('connect-btn');
 const estopBtn = document.getElementById('estop-btn');
@@ -179,7 +210,7 @@ async function disconnectSerial() {
     } catch (e) { /* ignore */ }
     state.connected = false;
     inputBuffer = "";
-    if (typeof resetReadiness === 'function') resetReadiness();
+    
     updateUI();
     log("Disconnected.");
 }
@@ -469,7 +500,7 @@ function updateUI() {
     btnSysMode.innerText = "Mode: " + state.sysMode;
     btnSysMode.className = "toggle-btn " + (state.sysMode === 'JOYSTICK' ? "active" : "");
 
-    if (typeof updateReadinessUI === 'function') updateReadinessUI();
+    
     updateHeartbeat();
     // Keep the fault modal live while it's open
     if (!document.getElementById('fault-modal')?.classList.contains('hidden')) refreshFaultModal();
@@ -2814,186 +2845,6 @@ updateUI();
     });
 })();
 
-/* ============================================================================
- * Mission Readiness state machine, firmware-line parsing & motion gate
- * (RD_GATED_IDS is hoisted to the top of the file — see initial declaration —
- *  because updateUI() runs at load before this point and reads it via the gate.)
- * ========================================================================== */
 
-function readinessReady() {
-    return readiness.diag === 'pass' && readiness.home === 'done';
-}
-function motionAllowed() {
-    return state.override || readinessReady();
-}
-
-function setStep(id, status) {
-    const el = document.getElementById(id);
-    if (el) el.className = 'rd-step rd-' + status;
-}
-
-function applyMotionGate() {
-    const locked = !motionAllowed();
-    RD_GATED_IDS.forEach(id => {
-        const el = document.getElementById(id);
-        if (!el) return;
-        el.disabled = locked;
-        el.classList.toggle('gate-locked', locked);
-        if (locked) el.title = 'Locked — run HW Self-Test + Home, or enable Override.';
-        else if (el.title && el.title.startsWith('Locked')) el.removeAttribute('title');
-    });
-}
-
-function updateReadinessUI() {
-    setStep('rd-step-connect', state.connected ? 'pass' : 'idle');
-    setStep('rd-step-diag', readiness.diag);
-    const homeStatus = readiness.home === 'done' ? 'pass'
-        : readiness.home === 'fail' ? 'fail'
-        : readiness.home === 'homing' ? 'running' : 'idle';
-    setStep('rd-step-home', homeStatus);
-
-    const badge = document.getElementById('rd-ready-badge');
-    if (badge) {
-        if (state.override)       { badge.textContent = 'OVERRIDE — gate bypassed'; badge.className = 'rd-ready-badge override'; }
-        else if (state.positionUnknown) { badge.textContent = 'RE-HOME REQUIRED'; badge.className = 'rd-ready-badge warn'; }
-        else if (readinessReady()) { badge.textContent = 'READY'; badge.className = 'rd-ready-badge ready'; }
-        else                       { badge.textContent = 'MOTION LOCKED'; badge.className = 'rd-ready-badge not-ready'; }
-    }
-
-    const dt = document.getElementById('rd-diag-text');
-    if (dt) dt.textContent = readiness.diagText;
-    const hintRow = document.getElementById('rd-diag-hint-row');
-    const hint = document.getElementById('rd-diag-hint');
-    if (hint) hint.textContent = readiness.diagHint;
-    if (hintRow) hintRow.style.display = readiness.diagHint ? '' : 'none';
-    const ht = document.getElementById('rd-home-text');
-    if (ht) ht.textContent = readiness.homeText;
-
-    const diagBtn = document.getElementById('btn-run-diag');
-    const homeBtn = document.getElementById('btn-readiness-home');
-    if (diagBtn) diagBtn.disabled = !state.connected || readiness.diag === 'running';
-    if (homeBtn) homeBtn.disabled = !state.connected || readiness.home === 'homing';
-
-    applyMotionGate();
-}
-
-function resetReadiness() {
-    readiness.diag = 'idle';
-    readiness.diagText = 'Not run yet.';
-    readiness.diagHint = '';
-    readiness.home = 'no';
-    readiness.homeText = 'Not homed.';
-    _faultLatched = false;
-}
-
-/* Fresh session on (re)connect — hardware must be re-verified. */
-function onSerialConnected() {
-    resetReadiness();
-    updateReadinessUI();
-}
-
-/* A new fault / E-Stop invalidates the home (encoder phase may have shifted). */
-function onFaultOrEstop() {
-    _faultLatched = true;
-    if (readiness.home === 'done' || readiness.home === 'homing') {
-        readiness.home = 'no';
-        readiness.homeText = 'Re-home required — a fault / E-Stop occurred.';
-    }
-    if (typeof updateReadinessUI === 'function') updateReadinessUI();
-}
-
-/* Parse the plain-text [DIAG] / [HOMING] firmware lines into readiness state. */
-function handleFirmwareLine(line) {
-    if (line.includes('[DIAG] Starting')) {
-        readiness.diag = 'running';
-        readiness.diagText = 'Running self-test…';
-        readiness.diagHint = '';
-        readiness._deltas = '';
-        updateReadinessUI();
-        return;
-    }
-    if (line.includes('[DIAG] Fwd Delta')) {
-        const m = line.split(']')[1];
-        readiness._deltas = m ? m.trim() : '';
-        return;
-    }
-    if (line.includes('[DIAG] RESULT:')) {
-        const r = line.split('RESULT:')[1].trim();
-        if (r.startsWith('HARDWARE OK')) {
-            readiness.diag = 'pass';
-            readiness.diagText = '✓ Hardware OK — motion matches commands.';
-            readiness.diagHint = '';
-        } else if (r.startsWith('ENCODER DEAD')) {
-            readiness.diag = 'fail';
-            readiness.diagText = '✗ Encoder dead — no movement detected during the test.';
-            readiness.diagHint = 'Check: encoder cable, TIM3 CH1/CH2 wiring, and 5 V supply to the encoder.';
-        } else if (r.startsWith('DIRECTION PIN STUCK')) {
-            readiness.diag = 'fail';
-            readiness.diagText = '✗ Direction pin stuck — motor turned the same way both times.';
-            readiness.diagHint = 'Check: H-bridge DIR/IN pins and the PWM sign in motor_controller.';
-        } else if (r.startsWith('PHASE INVERTED')) {
-            readiness.diag = 'fail';
-            readiness.diagText = '✗ Phase inverted — encoder counts opposite to PWM.';
-            readiness.diagHint = 'Fix: swap encoder A/B, or swap the two motor leads (or invert in firmware).';
-        } else {
-            readiness.diag = 'fail';
-            readiness.diagText = '✗ ' + r;
-            readiness.diagHint = '';
-        }
-        if (readiness._deltas) readiness.diagText += '  (' + readiness._deltas + ')';
-        updateReadinessUI();
-        return;
-    }
-    if (line.includes('[HOMING] SUCCESS')) {
-        readiness.home = 'done';
-        const detail = (line.split('SUCCESS.')[1] || '').trim();
-        readiness.homeText = '✓ Homed.' + (detail ? ' ' + detail : '');
-        _faultLatched = false;
-        updateReadinessUI();
-        return;
-    }
-    if (line.includes('[HOMING] ERROR') || line.includes('[HOMING] ABORTED') || line.includes('Verify abort')) {
-        readiness.home = 'fail';
-        readiness.homeText = '✗ ' + line.replace(/^\[HOMING\]\s*/, '');
-        updateReadinessUI();
-        return;
-    }
-}
-
-/* Homing entry point with the force-confirm guard (only after a fault/E-Stop). */
-function requestHoming() {
-    if (!state.connected) { log('Connect the robot before homing.', 'warn'); return; }
-    const needsConfirm = _faultLatched || state.estop || state.fault !== 'NONE';
-    if (needsConfirm) {
-        document.getElementById('home-confirm-modal').classList.remove('hidden');
-    } else {
-        triggerHoming();
-    }
-}
-
-/* Wire readiness-bar controls. */
-(function setupReadinessControls() {
-    const homeBtn = document.getElementById('btn-readiness-home');
-    if (homeBtn) homeBtn.addEventListener('click', () => requestHoming());
-
-    const detailBtn = document.getElementById('rd-detail-btn');
-    const detailPanel = document.getElementById('rd-detail-panel');
-    if (detailBtn && detailPanel) {
-        detailBtn.addEventListener('click', () => {
-            const open = detailPanel.classList.toggle('hidden') === false;
-            detailBtn.textContent = open ? 'Details ▴' : 'Details ▾';
-        });
-    }
-
-    const modal = document.getElementById('home-confirm-modal');
-    const close = () => modal.classList.add('hidden');
-    document.getElementById('btn-close-home-confirm').addEventListener('click', close);
-    document.getElementById('btn-home-confirm-cancel').addEventListener('click', close);
-    document.getElementById('btn-home-confirm-go').addEventListener('click', () => {
-        close();
-        triggerHoming();
-    });
-    modal.addEventListener('click', e => { if (e.target.id === 'home-confirm-modal') close(); });
-})();
 
 updateReadinessUI();
