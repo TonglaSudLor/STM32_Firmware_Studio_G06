@@ -177,32 +177,49 @@
 
             <div class="card path-card">
                 <h3>Path Sequencer</h3>
+                
                 <div class="path-editor">
-                    <div class="input-row">
-                        <input type="number" id="input-new-waypoint" placeholder="Angle" step="1" style="width: 60px;">
-                        <button id="btn-add-wp" class="primary-btn" title="Add Move Target">+</button>
-                        <button id="btn-add-pick" class="primary-btn pick-btn" title="Add Pick sequence">PICK</button>
-                        <button id="btn-add-place" class="primary-btn place-btn" title="Add Place sequence">PLACE</button>
+                    <div class="path-input-grid">
+                        <div class="input-group" style="flex: 1;">
+                            <label>Target Angle (°)</label>
+                            <div class="mo-target-row" style="margin-top: 2px;">
+                                <input type="number" id="input-new-waypoint" placeholder="0" step="1" class="mo-target-input" style="width:100%">
+                                <button id="btn-add-wp" class="secondary-btn" title="Add Move Target">+ ADD</button>
+                            </div>
+                        </div>
                     </div>
-                    <ul id="waypoint-list"></ul>
+                    
+                    <div class="path-action-row">
+                        <button id="btn-add-pick" class="primary-btn pick-btn" title="Add Pick sequence">+ PICK</button>
+                        <button id="btn-add-place" class="primary-btn place-btn" title="Add Place sequence">+ PLACE</button>
+                    </div>
+                    
+                    <div class="waypoint-container">
+                        <ul id="waypoint-list"></ul>
+                    </div>
                 </div>
+
                 <div class="path-controls">
-                    <div class="input-group">
-                        <label>Feedback</label>
-                        <select id="select-feedback-mode" class="tl-select">
-                            <option value="sensor">Reed Switch</option>
-                            <option value="delay">Timed Delay</option>
-                        </select>
+                    <div class="path-config-row">
+                        <div class="input-group">
+                            <label>Feedback Sync</label>
+                            <select id="select-feedback-mode" class="tl-select">
+                                <option value="sensor">Reed Switch (Sensors)</option>
+                                <option value="delay">Timed Delay (Open Loop)</option>
+                            </select>
+                        </div>
+                        <div class="input-group" id="seq-delay-container">
+                            <label>Delay (ms)</label>
+                            <input type="number" id="input-seq-delay" value="2000" step="100">
+                        </div>
                     </div>
-                    <div class="input-group" id="seq-delay-container">
-                        <label>Delay (ms)</label>
-                        <input type="number" id="input-seq-delay" value="2000" step="100">
-                    </div>
-                    <div class="toggle-group" style="margin-top: 10px;">
-                        <button id="btn-run-seq" class="toggle-btn">Run Sequence</button>
-                        <button id="btn-clear-seq" class="info-btn">Clear All</button>
+                    
+                    <div class="path-exec-row">
+                        <button id="btn-clear-seq" class="danger-btn sm">Clear List</button>
+                        <button id="btn-run-seq" class="primary-btn">▶ Run Sequence</button>
                     </div>
                 </div>
+            </div>
             </div>
 
             <div class="card metrics-card" style="display: none;">

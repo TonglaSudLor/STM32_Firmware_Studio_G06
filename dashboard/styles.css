@@ -1963,3 +1963,77 @@ select.tl-select:hover {
     flex: 1;
     overflow-y: auto;
 }
+
+/* --- Path Sequencer Redesign --- */
+.path-input-grid {
+    margin-bottom: 8px;
+}
+
+.path-action-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+.path-action-row button {
+    flex: 1;
+}
+
+.waypoint-container {
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    min-height: 100px;
+    max-height: 200px;
+    overflow-y: auto;
+    margin-bottom: 15px;
+    padding: 4px;
+}
+
+#waypoint-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+#waypoint-list li {
+    background: var(--bg-dark);
+    margin-bottom: 4px;
+    padding: 6px 10px;
+    border-radius: 4px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    border-left: 3px solid var(--primary-color);
+}
+#waypoint-list li.wp-pick { border-left-color: var(--accent-green); }
+#waypoint-list li.wp-place { border-left-color: var(--accent-yellow); }
+
+.path-config-row {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 15px;
+    background: rgba(0,0,0,0.1);
+    padding: 10px;
+    border-radius: 6px;
+}
+
+.path-exec-row {
+    display: flex;
+    gap: 10px;
+    justify-content: space-between;
+}
+.path-exec-row #btn-run-seq {
+    flex: 2;
+    font-weight: bold;
+    letter-spacing: 1px;
+}
+.path-exec-row #btn-clear-seq {
+    flex: 1;
+    background: transparent;
+    border: 1px solid var(--accent-red);
+    color: var(--accent-red);
+}
+.path-exec-row #btn-clear-seq:hover {
+    background: rgba(255,49,49,0.1);
+}
