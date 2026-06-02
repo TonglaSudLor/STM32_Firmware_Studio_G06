@@ -2058,3 +2058,17 @@ select.tl-select:hover {
 .path-input-grid .input-group {
     margin-bottom: 5px;
 }
+
+/* --- Path Sequencer Config Row Fix --- */
+.path-config-row {
+    align-items: flex-end; /* Align inputs by their bottom edges so labels sit evenly above */
+    justify-content: space-between;
+}
+.path-config-row .input-group {
+    flex: 1; /* Make both input groups take equal space */
+}
+.path-config-row select, .path-config-row input {
+    width: 100%;
+    box-sizing: border-box; /* Ensure padding doesn't stretch width */
+    height: 32px; /* Force identical heights */
+}
