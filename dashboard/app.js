@@ -184,46 +184,6 @@ async function disconnectSerial() {
     log("Disconnected.");
 }
 
- = await reader.read();
-            if (done) { log("Port closed."); break; }
-
-            inputBuffer += value;
-
-            if (inputBuffer.length > 1000) {
-                const lastDollar = inputBuffer.lastIndexOf('$');
-                inputBuffer = lastDollar !== -1 ? inputBuffer.substring(lastDollar) : "";
-            }
-
-            let s = inputBuffer.indexOf('$');
-            let e = inputBuffer.indexOf('*');
-            while (s !== -1 && e !== -1 && e > s) {
-                processPacket(inputBuffer.substring(s + 1, e));
-                inputBuffer = inputBuffer.substring(e + 1);
-                s = inputBuffer.indexOf('$');
-                e = inputBuffer.indexOf('*');
-            }
-
-            // Display plain-text firmware debug output ([DIAG], [SAFETY], [SYSTEM], etc.)
-            // Only shows lines that start with '[' to ignore high-frequency CSV/numeric data.
-            const dollarPos = inputBuffer.indexOf('$');
-            const plainPart = dollarPos !== -1 ? inputBuffer.substring(0, dollarPos) : inputBuffer;
-            const lastNewline = plainPart.lastIndexOf('\n');
-            if (lastNewline !== -1) {
-                plainPart.substring(0, lastNewline).split('\n').forEach(line => {
-                    const clean = line.replace(/\r/g, '').trim();
-                    if (clean.startsWith('[')) { log('STM: ' + clean, 'info'); handleFirmwareLine(clean); }
-                });
-                inputBuffer = inputBuffer.substring(lastNewline + 1);
-            }
-        } catch (err) {
-            log("Read error: " + err.message, "error");
-            break;
-        }
-    }
-    state.connected = false;
-    updateUI();
-}
-
 // RAF render gate — UI + visualizer updates are batched to one render per frame.
 // Multiple packets arriving in the same 16 ms window share a single DOM update.
 let _renderPending = false;
@@ -492,8 +452,18 @@ function updateUI() {
     gripperVisualizer.update(!!state.gripper_ud, !state.gripper_co);
     btnOverride.innerText = "Override: " + (state.override ? "ON" : "OFF");
     btnOverride.className = "toggle-btn warning " + (state.override ? "active" : "");
-    estopBtn.innerText = state.estop ? "CLEAR FAULT / RESUME" : "EMERGENCY STOP";
-    estopBtn.className = state.estop ? "danger-btn active" : "danger-btn";
+    
+    const isStartupLock = (state.fault && state.fault.includes('STARTUP_ESTOP'));
+    if (isStartupLock) {
+        estopBtn.innerText = 'INITIALIZE SYSTEM';
+        estopBtn.className = 'warning-btn';
+        estopBtn.style.backgroundColor = '#f39c12';
+    } else {
+        estopBtn.innerText = state.estop ? 'CLEAR FAULT / RESUME' : 'EMERGENCY STOP';
+        estopBtn.className = state.estop ? 'danger-btn active' : 'danger-btn';
+        estopBtn.style.backgroundColor = '';
+    }
+
 
     const btnSysMode = document.getElementById('btn-sys-mode');
     btnSysMode.innerText = "Mode: " + state.sysMode;
